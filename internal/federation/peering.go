@@ -314,14 +314,14 @@ func (pm *PeerManager) handleRelayInventory(peer *Peer, frame *model.RelayInvent
 		return
 	}
 
-	// Compute diff: what we have that peer doesn't
-	missingFromPeer := diff(localIDs, messageIDs)
+	// Compute diff: what peer has that we don't
+	missingFromLocal := diff(messageIDs, localIDs)
 
-	if len(missingFromPeer) > 0 {
-		// Request missing messages
+	if len(missingFromLocal) > 0 {
+		// Request missing messages from peer
 		request := model.RelayRequestFrame{
 			Type:       model.FrameTypeRelayRequest,
-			MessageIDs: missingFromPeer,
+			MessageIDs: missingFromLocal,
 		}
 		data, _ := json.Marshal(request)
 		select {
