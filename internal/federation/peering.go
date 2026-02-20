@@ -36,6 +36,7 @@ const (
 type Peer struct {
 	ID            string
 	URL           string
+	Outbound      bool
 	Conn          *websocket.Conn
 	Send          chan []byte
 	LastInventory time.Time
@@ -65,22 +66,27 @@ type PeerManager struct {
 	inbound    chan *Peer
 	outbound   chan string
 	disconnect chan *Peer
+	// dialingURLs tracks URLs for which a dialPeer goroutine is already running
+	// to prevent duplicate concurrent dials to the same peer.
+	dialingURLs map[string]struct{}
+	dialingMu   sync.Mutex
 }
 
 // NewPeerManager creates a new peer manager.
 func NewPeerManager(relayID string, store store.Store, clients *model.ClientRegistry, maxTTL time.Duration) *PeerManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PeerManager{
-		relayID:    relayID,
-		peers:      make(map[string]*Peer),
-		store:      store,
-		clients:    clients,
-		maxTTL:     maxTTL,
-		ctx:        ctx,
-		cancel:     cancel,
-		inbound:    make(chan *Peer),
-		outbound:   make(chan string),
-		disconnect: make(chan *Peer),
+		relayID:     relayID,
+		peers:       make(map[string]*Peer),
+		store:       store,
+		clients:     clients,
+		maxTTL:      maxTTL,
+		ctx:         ctx,
+		cancel:      cancel,
+		inbound:     make(chan *Peer),
+		outbound:    make(chan string),
+		disconnect:  make(chan *Peer),
+		dialingURLs: make(map[string]struct{}),
 	}
 }
 
@@ -106,6 +112,9 @@ func (pm *PeerManager) Run() {
 			pm.addPeer(peer)
 		case peer := <-pm.disconnect:
 			pm.removePeer(peer)
+			if peer.Outbound {
+				go pm.dialPeer(peer.URL)
+			}
 		}
 	}
 }
@@ -122,6 +131,20 @@ func (pm *PeerManager) cleanup() {
 
 // dialPeer initiates an outbound connection to a peer.
 func (pm *PeerManager) dialPeer(url string) {
+	// Prevent duplicate concurrent dials to the same URL.
+	pm.dialingMu.Lock()
+	if _, inFlight := pm.dialingURLs[url]; inFlight {
+		pm.dialingMu.Unlock()
+		return
+	}
+	pm.dialingURLs[url] = struct{}{}
+	pm.dialingMu.Unlock()
+	defer func() {
+		pm.dialingMu.Lock()
+		delete(pm.dialingURLs, url)
+		pm.dialingMu.Unlock()
+	}()
+
 	// Use exponential backoff for reconnection
 	delay := ReconnectBaseDelay
 	maxRetries := 10
@@ -145,6 +168,7 @@ func (pm *PeerManager) dialPeer(url string) {
 		peer := &Peer{
 			ID:          peerID,
 			URL:         url,
+			Outbound:    true,
 			Conn:        conn,
 			Send:        make(chan []byte, 256),
 			ConnectedAt: time.Now(),
