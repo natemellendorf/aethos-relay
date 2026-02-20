@@ -128,12 +128,11 @@ func TestOutboundPeerReconnectsOnDisconnect(t *testing.T) {
 			// First connection: return immediately to simulate a disconnect.
 			return
 		}
-		// Second connection: signal reconnect success.
+		// Second (or later) connection: signal that reconnection succeeded.
 		once.Do(func() { close(reconnected) })
 		// Hold the connection briefly so dialPeer registers the peer.
 		time.Sleep(200 * time.Millisecond)
 	})
-	// testWSServer counts each Upgrade call; reset is done via atomic.
 	defer closeServer()
 
 	pm := NewPeerManager("test-relay", &mockStore{}, model.NewClientRegistry(), 0)
