@@ -549,9 +549,15 @@ func (pm *PeerManager) Stop() {
 	pm.cancel()
 }
 
+// federationUpgrader is used to upgrade inbound federation WebSocket connections.
+var federationUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
+
 // HandleInboundPeer handles an inbound peer connection (from HTTP upgrade).
 func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Upgrade(w, r, nil, 1024, 1024)
+	conn, err := federationUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("federation: upgrade failed: %v", err)
 		return
