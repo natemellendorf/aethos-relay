@@ -124,6 +124,12 @@ func (h *WSHandler) writePump(client *model.Client) {
 func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 	metrics.IncrementReceived()
 
+	// Reject relay-only frame types on client connections.
+	if model.IsRelayFrameType(frame.Type) {
+		h.sendError(client, "relay frame type not allowed on client connections")
+		return
+	}
+
 	switch frame.Type {
 	case model.FrameTypeHello:
 		h.handleHello(client, frame)

@@ -30,18 +30,25 @@ const (
 
 	// ReconnectMaxDelay is the maximum delay for exponential backoff.
 	ReconnectMaxDelay = 60 * time.Second
+
+	// MaxForwardedPayloadSize is the maximum allowed byte length of a forwarded
+	// message's base64-encoded payload.
+	MaxForwardedPayloadSize = 64 * 1024
 )
 
 // Peer represents a connected relay peer.
 type Peer struct {
 	ID            string
 	URL           string
+	Outbound      bool // true if we dialed this peer (enables auto-reconnect)
 	Conn          *websocket.Conn
 	Send          chan []byte
 	LastInventory time.Time
 	ConnectedAt   time.Time
 	Health        PeerHealth
+	healthMu      sync.Mutex
 	Done          chan struct{}
+	doneOnce      sync.Once
 }
 
 // PeerHealth tracks peer health metrics.
@@ -78,9 +85,9 @@ func NewPeerManager(relayID string, store store.Store, clients *model.ClientRegi
 		maxTTL:     maxTTL,
 		ctx:        ctx,
 		cancel:     cancel,
-		inbound:    make(chan *Peer),
-		outbound:   make(chan string),
-		disconnect: make(chan *Peer),
+		inbound:    make(chan *Peer, 100),
+		outbound:   make(chan string, 100),
+		disconnect: make(chan *Peer, 100),
 	}
 }
 
@@ -115,7 +122,7 @@ func (pm *PeerManager) cleanup() {
 	pm.peersMu.Lock()
 	defer pm.peersMu.Unlock()
 	for _, peer := range pm.peers {
-		close(peer.Done)
+		peer.doneOnce.Do(func() { close(peer.Done) })
 		peer.Conn.Close()
 	}
 }
@@ -145,6 +152,7 @@ func (pm *PeerManager) dialPeer(url string) {
 		peer := &Peer{
 			ID:          peerID,
 			URL:         url,
+			Outbound:    true,
 			Conn:        conn,
 			Send:        make(chan []byte, 256),
 			ConnectedAt: time.Now(),
@@ -255,7 +263,9 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 			continue
 		}
 
+		peer.healthMu.Lock()
 		peer.Health.LastSeen = time.Now()
+		peer.healthMu.Unlock()
 
 		switch frameType.Type {
 		case model.FrameTypeRelayHello:
@@ -323,9 +333,17 @@ func (pm *PeerManager) addPeer(peer *Peer) {
 // removePeer removes a peer from the manager.
 func (pm *PeerManager) removePeer(peer *Peer) {
 	pm.peersMu.Lock()
-	defer pm.peersMu.Unlock()
 	delete(pm.peers, peer.ID)
 	log.Printf("federation: peer removed %s (total: %d)", peer.ID, len(pm.peers))
+	pm.peersMu.Unlock()
+
+	// Re-enqueue outbound peers for reconnection while the manager is active.
+	if peer.Outbound {
+		select {
+		case <-pm.ctx.Done():
+		case pm.outbound <- peer.URL:
+		}
+	}
 }
 
 // handleRelayHello handles incoming relay hello.
@@ -335,7 +353,10 @@ func (pm *PeerManager) handleRelayHello(peer *Peer, frame *model.RelayHelloFrame
 		"type":     model.FrameTypeRelayOK,
 		"relay_id": pm.relayID,
 	}
-	peer.Conn.WriteJSON(resp)
+	if err := peer.Conn.WriteJSON(resp); err != nil {
+		log.Printf("federation: failed to send relay_ok to peer %s: %v", peer.ID, err)
+		_ = peer.Conn.Close()
+	}
 }
 
 // handleRelayInventory handles inventory gossip from peers.
@@ -347,7 +368,9 @@ func (pm *PeerManager) handleRelayInventory(peer *Peer, frame *model.RelayInvent
 		return
 	}
 
+	peer.healthMu.Lock()
 	peer.Health.LastSeen = time.Now()
+	peer.healthMu.Unlock()
 
 	// Get local message IDs for this recipient
 	localIDs, err := pm.getLocalMessageIDs(recipientID)
@@ -365,7 +388,11 @@ func (pm *PeerManager) handleRelayInventory(peer *Peer, frame *model.RelayInvent
 			Type:       model.FrameTypeRelayRequest,
 			MessageIDs: missingFromLocal,
 		}
-		data, _ := json.Marshal(request)
+		data, err := json.Marshal(request)
+		if err != nil {
+			log.Printf("federation: failed to marshal relay request: %v", err)
+			return
+		}
 		select {
 		case peer.Send <- data:
 		default:
@@ -392,10 +419,16 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 			Type:    model.FrameTypeRelayForward,
 			Message: msg,
 		}
-		data, _ := json.Marshal(forward)
+		data, err := json.Marshal(forward)
+		if err != nil {
+			log.Printf("federation: failed to marshal relay forward for %s: %v", msgID, err)
+			continue
+		}
 		select {
 		case peer.Send <- data:
+			peer.healthMu.Lock()
 			peer.Health.MessagesForwarded++
+			peer.healthMu.Unlock()
 		default:
 			log.Printf("federation: peer send channel full")
 		}
@@ -405,11 +438,21 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 // handleRelayForward handles incoming forwarded messages.
 func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardFrame) {
 	msg := frame.Message
-	if msg == nil || msg.ID == "" {
+	if msg == nil || msg.ID == "" || msg.From == "" || msg.To == "" || msg.Payload == "" {
+		return
+	}
+	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
+		return
+	}
+	// Reject oversized payloads.
+	if len(msg.Payload) > MaxForwardedPayloadSize {
+		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
 		return
 	}
 
+	peer.healthMu.Lock()
 	peer.Health.MessagesReceived++
+	peer.healthMu.Unlock()
 
 	// Dedupe: check if message already exists
 	ctx := context.Background()
@@ -436,9 +479,7 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	if pm.clients.IsOnline(msg.To) {
 		pm.deliverMessage(msg)
 	}
-
-	// Gossip to other peers (propagate)
-	go pm.gossipMessage(msg)
+	// Do not re-gossip forwarded messages to avoid message loops.
 }
 
 // deliverMessage delivers a message to local recipients.
@@ -506,7 +547,11 @@ func (pm *PeerManager) gossipInventory() {
 				RecipientID: recipientID,
 				MessageIDs:  messageIDs,
 			}
-			data, _ := json.Marshal(inv)
+			data, err := json.Marshal(inv)
+			if err != nil {
+				log.Printf("federation: failed to marshal inventory for gossip: %v", err)
+				continue
+			}
 			select {
 			case peer.Send <- data:
 			default:
@@ -534,7 +579,11 @@ func (pm *PeerManager) gossipMessage(msg *model.Message) {
 		RecipientID: msg.To,
 		MessageIDs:  []string{msg.ID},
 	}
-	data, _ := json.Marshal(inv)
+	data, err := json.Marshal(inv)
+	if err != nil {
+		log.Printf("federation: failed to marshal inventory for gossip: %v", err)
+		return
+	}
 
 	for _, peer := range peers {
 		select {
@@ -566,8 +615,11 @@ func (pm *PeerManager) GetPeers() map[string]PeerHealth {
 
 	result := make(map[string]PeerHealth)
 	for id, peer := range pm.peers {
+		peer.healthMu.Lock()
 		peer.Health.Uptime = time.Since(peer.ConnectedAt)
-		result[id] = peer.Health
+		health := peer.Health
+		peer.healthMu.Unlock()
+		result[id] = health
 	}
 	return result
 }
@@ -610,6 +662,16 @@ func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Validate hello frame - reject connections that don't identify as a relay peer.
+	if hello.Type != model.FrameTypeRelayHello || hello.RelayID == "" {
+		log.Printf("federation: invalid hello from %s: type=%q relay_id=%q", r.RemoteAddr, hello.Type, hello.RelayID)
+		conn.Close()
+		return
+	}
+
+	// Use the peer's relay_id as its canonical identifier.
+	peer.ID = hello.RelayID
+
 	// Send hello_ok
 	resp := map[string]string{
 		"type":     model.FrameTypeRelayOK,
@@ -620,7 +682,7 @@ func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	log.Printf("federation: inbound peer connected from %s", r.RemoteAddr)
+	log.Printf("federation: inbound peer connected from %s (relay_id: %s)", r.RemoteAddr, peer.ID)
 
 	// Start loops
 	go pm.readLoop(peer)
