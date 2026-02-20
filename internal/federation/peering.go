@@ -188,6 +188,35 @@ func (pm *PeerManager) dialPeer(url string) {
 	}
 
 	log.Printf("federation: max retries exceeded for %s", url)
+
+	// After max retries, don't give up permanently. Instead, periodically
+	// re-enqueue this URL for another connection attempt while the
+	// PeerManager context is still active.
+	go func(url string, initialDelay time.Duration) {
+		// Use a conservative retry interval based on the last backoff delay,
+		// but ensure it is at least the base delay to avoid tight loops.
+		retryInterval := initialDelay
+		if retryInterval < ReconnectBaseDelay {
+			retryInterval = ReconnectBaseDelay
+		}
+
+		ticker := time.NewTicker(retryInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-pm.ctx.Done():
+				return
+			case <-ticker.C:
+				select {
+				case <-pm.ctx.Done():
+					return
+				case pm.outbound <- url:
+					// URL re-enqueued for another dialPeer attempt.
+				}
+			}
+		}
+	}(url, delay)
 }
 
 // readLoop reads messages from a peer.
