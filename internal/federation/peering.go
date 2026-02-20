@@ -523,9 +523,12 @@ func (pm *PeerManager) getLocalMessageIDs(recipientID string) ([]string, error) 
 
 // getRecipientsWithMessages gets all recipients with queued messages.
 func (pm *PeerManager) getRecipientsWithMessages() []string {
-	// For now, return empty - we would need to iterate all messages
-	// In a full implementation, we'd track this in a separate index
-	return nil
+	recipients, err := pm.store.GetAllRecipientIDs(context.Background())
+	if err != nil {
+		log.Printf("failed to get recipients with queued messages: %v", err)
+		return nil
+	}
+	return recipients
 }
 
 // GetPeers returns a copy of current peers.
