@@ -246,7 +246,7 @@ func (s *BBoltStore) GetExpiredMessages(ctx context.Context, before time.Time) (
 			}
 			expiresAtStr := string(parts[0])
 			if expiresAtStr > beforeStr {
-				continue // Not yet expired, and keys are sorted so we can break
+				break // Not yet expired, and keys are sorted so we can break
 			}
 
 			msgID := string(v)

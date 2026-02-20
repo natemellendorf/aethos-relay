@@ -315,7 +315,10 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 	}
 }
 
-// send sends a frame to the client.
+// send sends a frame to the client with backpressure handling.
+// Uses a blocking send with timeout to implement bounded backpressure.
+// If the channel is full, it will wait up to 1 second for space.
+// This prevents silent message drops while still providing flow control.
 func (h *WSHandler) send(client *model.Client, frame model.WSFrame) {
 	data, err := json.Marshal(frame)
 	if err != nil {
@@ -324,8 +327,9 @@ func (h *WSHandler) send(client *model.Client, frame model.WSFrame) {
 	}
 	select {
 	case client.Send <- data:
-	default:
-		log.Printf("ws: failed to send, channel full")
+	case <-time.After(1 * time.Second):
+		log.Printf("ws: failed to send, channel full after timeout for client %s", client.WayfarerID)
+		metrics.IncrementDropped()
 	}
 }
 

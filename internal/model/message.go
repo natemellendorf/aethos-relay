@@ -1,6 +1,7 @@
 package model
 
 import (
+	"sync"
 	"time"
 )
 
@@ -74,6 +75,7 @@ type Client struct {
 
 // ClientRegistry manages connected clients.
 type ClientRegistry struct {
+	mu         sync.RWMutex
 	byID       map[string]map[*Client]bool // wayfarer_id -> set of clients
 	byConn     map[*Client]string          // client -> wayfarer_id
 	register   chan *Client
@@ -103,15 +105,19 @@ func (r *ClientRegistry) Run() {
 	for {
 		select {
 		case client := <-r.register:
+			r.mu.Lock()
 			if r.byID[client.WayfarerID] == nil {
 				r.byID[client.WayfarerID] = make(map[*Client]bool)
 			}
 			r.byID[client.WayfarerID][client] = true
 			r.byConn[client] = client.WayfarerID
+			r.mu.Unlock()
 
 		case client := <-r.unregister:
+			r.mu.Lock()
 			wayfarerID, ok := r.byConn[client]
 			if !ok {
+				r.mu.Unlock()
 				continue
 			}
 			if clients, ok := r.byID[wayfarerID]; ok {
@@ -124,11 +130,14 @@ func (r *ClientRegistry) Run() {
 				}
 			}
 			delete(r.byConn, client)
+			r.mu.Unlock()
 		}
 	}
 }
 
 func (r *ClientRegistry) GetClients(wayfarerID string) []*Client {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	var clients []*Client
 	if s, ok := r.byID[wayfarerID]; ok {
 		for c := range s {
@@ -139,10 +148,14 @@ func (r *ClientRegistry) GetClients(wayfarerID string) []*Client {
 }
 
 func (r *ClientRegistry) Count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return len(r.byConn)
 }
 
 func (r *ClientRegistry) IsOnline(wayfarerID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	clients, ok := r.byID[wayfarerID]
 	if !ok || len(clients) == 0 {
 		return false

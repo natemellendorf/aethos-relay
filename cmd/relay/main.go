@@ -88,9 +88,10 @@ func main() {
 	}()
 
 	// Also start WebSocket server on separate port if different
+	var wsServer *http.Server
 	if *wsAddr != *httpAddr {
 		log.Printf("WebSocket server listening on %s", *wsAddr)
-		wsServer := &http.Server{
+		wsServer = &http.Server{
 			Addr:    *wsAddr,
 			Handler: mux,
 		}
@@ -112,6 +113,13 @@ func main() {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
+
+	// Shutdown WebSocket server first if separate
+	if wsServer != nil {
+		if err := wsServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("WebSocket server shutdown error: %v", err)
+		}
+	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Server shutdown error: %v", err)
