@@ -26,6 +26,10 @@ var (
 	MetaLastSweep = []byte("last_sweep")
 
 	ErrInvalidKey = errors.New("invalid key format")
+
+	// recipientDelimiter is the null byte used to separate the recipient ID
+	// from the rest of the queue key.
+	recipientDelimiter = string(rune(0))
 )
 
 // BBoltStore implements Store using bbolt.
@@ -124,7 +128,7 @@ func (s *BBoltStore) GetQueuedMessages(ctx context.Context, to string, limit int
 	err := s.db.View(func(tx *bolt.Tx) error {
 		// Prefix scan the queue bucket
 		c := tx.Bucket(BucketQueueByRecipient).Cursor()
-		prefix := []byte(to + string(rune(0)))
+		prefix := []byte(to + recipientDelimiter)
 
 		count := 0
 		for k, v := c.Seek(prefix); k != nil && count < limit; k, v = c.Next() {
@@ -157,6 +161,40 @@ func (s *BBoltStore) GetQueuedMessages(ctx context.Context, to string, limit int
 	})
 
 	return messages, err
+}
+
+// GetAllQueuedMessageIDs returns all queued message IDs for a recipient without a limit.
+func (s *BBoltStore) GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error) {
+	var ids []string
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(BucketQueueByRecipient).Cursor()
+		prefix := []byte(to + recipientDelimiter)
+
+		for k, v := c.Seek(prefix); k != nil; k, v = c.Next() {
+			if len(k) < len(prefix) || string(k[:len(prefix)]) != string(prefix) {
+				break
+			}
+
+			msgID := string(v)
+			msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+			if msgBytes == nil {
+				continue
+			}
+
+			msg, err := DecodeMessage(msgBytes)
+			if err != nil {
+				continue
+			}
+
+			if !msg.Delivered {
+				ids = append(ids, msgID)
+			}
+		}
+		return nil
+	})
+
+	return ids, err
 }
 
 // MarkDelivered marks a message as delivered.
