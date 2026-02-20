@@ -223,8 +223,8 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		At:    msg.CreatedAt.Unix(),
 	})
 
-	// Announce to federation peers (if recipient is not local)
-	if h.federationManager != nil && !online {
+	// Announce to federation peers (if federation is enabled)
+	if h.federationManager != nil {
 		h.federationManager.AnnounceMessage(msg)
 	}
 }
