@@ -18,11 +18,16 @@ type Store interface {
 	// PersistMessage stores a message and adds it to the recipient's queue.
 	PersistMessage(ctx context.Context, msg *model.Message) error
 
-	// GetQueuedMessages retrieves undelivered messages for a recipient.
-	GetQueuedMessages(ctx context.Context, to string, limit int) ([]*model.Message, error)
+	// GetQueuedMessages retrieves messages for a recipient that haven't been delivered to this specific wayfarer.
+	// The recipientID parameter ensures per-device delivery tracking.
+	GetQueuedMessages(ctx context.Context, recipientID string, limit int) ([]*model.Message, error)
 
-	// MarkDelivered marks a message as delivered.
-	MarkDelivered(ctx context.Context, msgID string) error
+	// MarkDelivered marks a message as delivered to a specific recipient.
+	// This enables per-device delivery tracking - each device/session must ACK separately.
+	MarkDelivered(ctx context.Context, msgID string, recipientID string) error
+
+	// IsDeliveredTo checks if a message has been delivered to a specific recipient.
+	IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error)
 
 	// RemoveMessage removes a message from all buckets.
 	RemoveMessage(ctx context.Context, msgID string) error

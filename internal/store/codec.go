@@ -165,3 +165,21 @@ func EncodeExpiryKey(msgID string, expiresAt time.Time) []byte {
 func EncodeMsgIDKey(msgID string) []byte {
 	return []byte(msgID)
 }
+
+// EncodeDeliveryKey encodes a per-device delivery key (msgID|recipientID).
+func EncodeDeliveryKey(msgID string, recipientID string) []byte {
+	buf := new(bytes.Buffer)
+	buf.WriteString(msgID)
+	buf.WriteByte(0) // separator
+	buf.WriteString(recipientID)
+	return buf.Bytes()
+}
+
+// DecodeDeliveryKey decodes a per-device delivery key.
+func DecodeDeliveryKey(data []byte) (msgID string, recipientID string, err error) {
+	parts := bytes.Split(data, []byte{0})
+	if len(parts) != 2 {
+		return "", "", ErrInvalidKey
+	}
+	return string(parts[0]), string(parts[1]), nil
+}

@@ -25,6 +25,8 @@ func main() {
 	sweepInterval := flag.Duration("sweep-interval", 30*time.Second, "TTL sweeper interval")
 	maxTTLSecs := flag.Int("max-ttl-seconds", 604800, "Maximum TTL in seconds (default 7 days)")
 	logJSON := flag.Bool("log-json", false, "JSON logging output")
+	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated list of allowed WebSocket origins (e.g., 'https://app.aethos.io,https://aethos.app')")
+	devMode := flag.Bool("dev-mode", false, "Enable development mode (allows all origins, for local development only)")
 	flag.Parse()
 
 	if *logJSON {
@@ -39,6 +41,8 @@ func main() {
 	log.Printf("Store path: %s", *storePath)
 	log.Printf("Sweep interval: %s", *sweepInterval)
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
+	log.Printf("Allowed origins: %s", *allowedOrigins)
+	log.Printf("Dev mode: %v", *devMode)
 
 	// Initialize store
 	bbstore := store.NewBBoltStore(*storePath)
@@ -66,7 +70,7 @@ func main() {
 	go clients.Run()
 
 	// Initialize handlers
-	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL)
+	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL, *allowedOrigins, *devMode)
 	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)
 
 	// Set up HTTP server with WebSocket and API handlers
