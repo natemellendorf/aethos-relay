@@ -183,8 +183,8 @@ func TestGetAllRecipientIDs(t *testing.T) {
 	// Persist messages for two different recipients, two messages for recipient-a
 	msgs := []*model.Message{
 		{ID: "m1", From: "s", To: "recipient-a", Payload: "AA==", CreatedAt: time.Now().Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
-		{ID: "m2", From: "s", To: "recipient-a", Payload: "AA==", CreatedAt: time.Now().Add(time.Millisecond).Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
-		{ID: "m3", From: "s", To: "recipient-b", Payload: "AA==", CreatedAt: time.Now().Add(2 * time.Millisecond).Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
+		{ID: "m2", From: "s", To: "recipient-a", Payload: "AA==", CreatedAt: time.Now().Add(time.Second).Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
+		{ID: "m3", From: "s", To: "recipient-b", Payload: "AA==", CreatedAt: time.Now().Add(2 * time.Second).Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
 	}
 	for _, m := range msgs {
 		if err := store.PersistMessage(nil, m); err != nil {
