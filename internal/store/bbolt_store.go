@@ -306,3 +306,44 @@ func (s *BBoltStore) SetLastSweepTime(ctx context.Context, t time.Time) error {
 		return tx.Bucket(BucketMeta).Put(MetaLastSweep, v)
 	})
 }
+
+// GetMessageByID retrieves a message by its ID.
+func (s *BBoltStore) GetMessageByID(ctx context.Context, msgID string) (*model.Message, error) {
+	var msg *model.Message
+	err := s.db.View(func(tx *bolt.Tx) error {
+		msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+		if msgBytes == nil {
+			return fmt.Errorf("message not found: %s", msgID)
+		}
+		var err error
+		msg, err = DecodeMessage(msgBytes)
+		if err != nil {
+			return xerrors.Errorf("failed to decode message: %w", err)
+		}
+		return nil
+	})
+	return msg, err
+}
+
+// GetAllRecipientIDs returns all unique recipient IDs with queued messages.
+func (s *BBoltStore) GetAllRecipientIDs(ctx context.Context) ([]string, error) {
+	var recipientIDs []string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		seen := make(map[string]bool)
+		c := tx.Bucket(BucketQueueByRecipient).Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			// Extract recipient ID from queue key (format: recipient\x00timestamp\x00msgid)
+			parts := bytes.Split(k, []byte{0})
+			if len(parts) < 1 {
+				continue
+			}
+			recipient := string(parts[0])
+			if !seen[recipient] {
+				seen[recipient] = true
+				recipientIDs = append(recipientIDs, recipient)
+			}
+		}
+		return nil
+	})
+	return recipientIDs, err
+}

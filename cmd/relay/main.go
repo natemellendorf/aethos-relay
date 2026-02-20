@@ -8,10 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/natemellendorf/aethos-relay/internal/api"
+	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -25,6 +29,12 @@ func main() {
 	sweepInterval := flag.Duration("sweep-interval", 30*time.Second, "TTL sweeper interval")
 	maxTTLSecs := flag.Int("max-ttl-seconds", 604800, "Maximum TTL in seconds (default 7 days)")
 	logJSON := flag.Bool("log-json", false, "JSON logging output")
+
+	// Federation flags
+	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
+	peerURLs := flag.String("peer", "", "Comma-separated list of peer relay WebSocket URLs")
+	peerPort := flag.String("peer-port", ":8082", "Port for inbound peer connections")
+
 	flag.Parse()
 
 	if *logJSON {
@@ -33,12 +43,19 @@ func main() {
 		log.SetOutput(os.Stderr)
 	}
 
+	// Generate relay ID if not provided
+	if *relayID == "" {
+		*relayID = uuid.New().String()
+	}
+
 	log.Printf("Starting aethos-relay server...")
+	log.Printf("Relay ID: %s", *relayID)
 	log.Printf("WebSocket addr: %s", *wsAddr)
 	log.Printf("HTTP addr: %s", *httpAddr)
 	log.Printf("Store path: %s", *storePath)
 	log.Printf("Sweep interval: %s", *sweepInterval)
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
+	log.Printf("Peer port: %s", *peerPort)
 
 	// Initialize store
 	bbstore := store.NewBBoltStore(*storePath)
@@ -65,13 +82,31 @@ func main() {
 	clients := model.NewClientRegistry()
 	go clients.Run()
 
+	// Initialize federation peer manager
+	federationManager := federation.NewPeerManager(*relayID, bbstore, clients, maxTTL)
+	go federationManager.Run()
+
+	// Connect to configured peers
+	if *peerURLs != "" {
+		peerList := strings.Split(*peerURLs, ",")
+		for _, peerURL := range peerList {
+			peerURL = strings.TrimSpace(peerURL)
+			if peerURL != "" {
+				log.Printf("Connecting to peer: %s", peerURL)
+				federationManager.AddPeerURL(peerURL)
+			}
+		}
+	}
+
 	// Initialize handlers
 	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL)
+	wsHandler.SetFederationManager(federationManager)
 	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)
 
 	// Set up HTTP server with WebSocket and API handlers
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler.HandleWebSocket)
+	mux.HandleFunc("/federation", federationManager.HandleInboundPeer)
 	mux.HandleFunc("/", httpHandler.ServeHTTP)
 
 	httpServer := &http.Server{
@@ -102,6 +137,8 @@ func main() {
 		}()
 	}
 
+	log.Println("Federation peer service ready")
+
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -110,6 +147,7 @@ func main() {
 	log.Println("Shutting down...")
 	cancel()
 	sweeper.Stop()
+	federationManager.Stop()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

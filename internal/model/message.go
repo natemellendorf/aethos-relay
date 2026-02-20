@@ -57,7 +57,40 @@ const (
 	FrameTypePull     = "pull"
 	FrameTypeMessages = "messages"
 	FrameTypeError    = "error"
+
+	// Relay-to-relay federation frames (clients must never receive these)
+	FrameTypeRelayHello     = "relay_hello"
+	FrameTypeRelayInventory = "relay_inventory"
+	FrameTypeRelayRequest   = "relay_request"
+	FrameTypeRelayForward   = "relay_forward"
+	FrameTypeRelayOK        = "relay_ok"
 )
+
+// RelayHelloFrame is the initial handshake between relays.
+type RelayHelloFrame struct {
+	Type    string `json:"type"`
+	RelayID string `json:"relay_id"`
+	Version string `json:"version"`
+}
+
+// RelayInventoryFrame carries message IDs known by a relay for a recipient.
+type RelayInventoryFrame struct {
+	Type        string   `json:"type"`
+	RecipientID string   `json:"recipient_id"`
+	MessageIDs  []string `json:"message_ids"`
+}
+
+// RelayRequestFrame requests full messages for given IDs.
+type RelayRequestFrame struct {
+	Type       string   `json:"type"`
+	MessageIDs []string `json:"message_ids"`
+}
+
+// RelayForwardFrame carries a full message to be forwarded.
+type RelayForwardFrame struct {
+	Type    string   `json:"type"`
+	Message *Message `json:"message"`
+}
 
 // Client represents a connected WebSocket client.
 type Client struct {

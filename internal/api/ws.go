@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -25,9 +26,10 @@ var upgrader = websocket.Upgrader{
 
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
-	store   store.Store
-	clients *model.ClientRegistry
-	maxTTL  time.Duration
+	store             store.Store
+	clients           *model.ClientRegistry
+	maxTTL            time.Duration
+	federationManager *federation.PeerManager
 }
 
 // NewWSHandler creates a new WebSocket handler.
@@ -37,6 +39,11 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 		clients: clients,
 		maxTTL:  maxTTL,
 	}
+}
+
+// SetFederationManager sets the federation peer manager for relaying messages.
+func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
+	h.federationManager = mgr
 }
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
@@ -215,6 +222,11 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		MsgID: msg.ID,
 		At:    msg.CreatedAt.Unix(),
 	})
+
+	// Announce to federation peers (if recipient is not local)
+	if h.federationManager != nil && !online {
+		h.federationManager.AnnounceMessage(msg)
+	}
 }
 
 // handleAck handles the ack frame.
