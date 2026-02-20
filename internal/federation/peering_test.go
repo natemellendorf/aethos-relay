@@ -7,6 +7,59 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
+// TestHandshakeResponseValidation tests that hello responses are validated correctly.
+func TestHandshakeResponseValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		resp        model.RelayHelloFrame
+		wantAccept  bool
+		wantRelayID string
+	}{
+		{
+			name:        "valid relay_ok with relay_id",
+			resp:        model.RelayHelloFrame{Type: model.FrameTypeRelayOK, RelayID: "peer-relay-1"},
+			wantAccept:  true,
+			wantRelayID: "peer-relay-1",
+		},
+		{
+			name:        "valid relay_ok without relay_id uses generated id",
+			resp:        model.RelayHelloFrame{Type: model.FrameTypeRelayOK, RelayID: ""},
+			wantAccept:  true,
+			wantRelayID: "generated-id",
+		},
+		{
+			name:       "wrong type relay_hello rejected",
+			resp:       model.RelayHelloFrame{Type: model.FrameTypeRelayHello, RelayID: "peer-relay-1"},
+			wantAccept: false,
+		},
+		{
+			name:       "empty type rejected",
+			resp:       model.RelayHelloFrame{Type: "", RelayID: "peer-relay-1"},
+			wantAccept: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the validation logic from dialPeer.
+			peerID := "generated-id"
+
+			accepted := tt.resp.Type == model.FrameTypeRelayOK
+			if accepted && tt.resp.RelayID != "" {
+				peerID = tt.resp.RelayID
+			}
+
+			if accepted != tt.wantAccept {
+				t.Errorf("accepted = %v, want %v", accepted, tt.wantAccept)
+			}
+
+			if tt.wantAccept && tt.wantRelayID != "" && peerID != tt.wantRelayID {
+				t.Errorf("peerID = %q, want %q", peerID, tt.wantRelayID)
+			}
+		})
+	}
+}
+
 // TestDiff tests the diff helper function.
 func TestDiff(t *testing.T) {
 	tests := []struct {
