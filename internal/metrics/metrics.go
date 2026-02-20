@@ -41,6 +41,12 @@ var (
 		Name: "store_errors_total",
 		Help: "Total store errors",
 	})
+
+	// MessagesDroppedTotal tracks total messages dropped due to backpressure.
+	MessagesDroppedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "messages_dropped_total",
+		Help: "Total messages dropped due to full send channel",
+	})
 )
 
 // IncrementExpired increments the expired messages counter.
@@ -66,4 +72,9 @@ func IncrementReceived() {
 // IncrementStoreErrors increments the store errors counter.
 func IncrementStoreErrors() {
 	StoreErrorsTotal.Inc()
+}
+
+// IncrementDropped increments the dropped messages counter.
+func IncrementDropped() {
+	MessagesDroppedTotal.Inc()
 }
