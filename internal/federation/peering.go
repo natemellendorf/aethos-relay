@@ -167,7 +167,7 @@ func (pm *PeerManager) dialPeer(url string) {
 		}
 
 		// Wait for hello_ok
-		var helloResp map[string]interface{}
+		var helloResp model.RelayHelloFrame
 		if err := conn.ReadJSON(&helloResp); err != nil {
 			log.Printf("federation: hello response failed %s: %v", url, err)
 			conn.Close()
@@ -176,7 +176,20 @@ func (pm *PeerManager) dialPeer(url string) {
 			continue
 		}
 
-		log.Printf("federation: connected to peer %s", url)
+		if helloResp.Type != model.FrameTypeRelayOK {
+			log.Printf("federation: unexpected handshake response type %q from %s, expected %q", helloResp.Type, url, model.FrameTypeRelayOK)
+			conn.Close()
+			time.Sleep(delay)
+			delay = min(delay*2, ReconnectMaxDelay)
+			continue
+		}
+
+		// Use the peer's relay_id as its canonical identifier if provided.
+		if helloResp.RelayID != "" {
+			peer.ID = helloResp.RelayID
+		}
+
+		log.Printf("federation: connected to peer %s (relay_id: %s)", url, peer.ID)
 
 		// Start peer loops
 		go pm.readLoop(peer)
