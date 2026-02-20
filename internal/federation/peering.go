@@ -400,14 +400,9 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 
 	// Dedupe: check if message already exists
 	ctx := context.Background()
-	existing, err := pm.store.GetQueuedMessages(ctx, msg.To, 1000)
-	if err == nil {
-		for _, m := range existing {
-			if m.ID == msg.ID {
-				log.Printf("federation: duplicate message %s, ignoring", msg.ID)
-				return
-			}
-		}
+	if existing, err := pm.store.GetMessageByID(ctx, msg.ID); err == nil && existing != nil {
+		log.Printf("federation: duplicate message %s, ignoring", msg.ID)
+		return
 	}
 
 	// Verify TTL not expired
@@ -536,18 +531,9 @@ func (pm *PeerManager) gossipMessage(msg *model.Message) {
 	}
 }
 
-// getLocalMessageIDs gets message IDs for a recipient.
+// getLocalMessageIDs gets all message IDs for a recipient.
 func (pm *PeerManager) getLocalMessageIDs(recipientID string) ([]string, error) {
-	messages, err := pm.store.GetQueuedMessages(context.Background(), recipientID, 1000)
-	if err != nil {
-		return nil, err
-	}
-
-	ids := make([]string, 0, len(messages))
-	for _, m := range messages {
-		ids = append(ids, m.ID)
-	}
-	return ids, nil
+	return pm.store.GetAllQueuedMessageIDs(context.Background(), recipientID)
 }
 
 // getRecipientsWithMessages gets all recipients with queued messages.

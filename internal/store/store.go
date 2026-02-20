@@ -41,4 +41,7 @@ type Store interface {
 
 	// GetAllRecipientIDs returns all unique recipient IDs with queued messages.
 	GetAllRecipientIDs(ctx context.Context) ([]string, error)
+
+	// GetAllQueuedMessageIDs returns all queued message IDs for a recipient without a limit.
+	GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error)
 }
