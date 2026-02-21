@@ -65,6 +65,7 @@ const (
 	FrameTypeRelayForward   = "relay_forward"
 	FrameTypeRelayAck       = "relay_ack"
 	FrameTypeRelayOK        = "relay_ok"
+	FrameTypeRelayCover     = "relay_cover"
 )
 
 // RelayHelloFrame is the initial handshake between relays.
@@ -101,6 +102,14 @@ type RelayAckFrame struct {
 	Status      string `json:"status"` // "accepted", "duplicate", "expired"
 }
 
+// RelayCoverFrame is a cover frame for traffic analysis resistance.
+// These frames are relay-to-relay only and should not be stored or forwarded beyond one hop.
+type RelayCoverFrame struct {
+	Type      string `json:"type"`
+	Timestamp int64  `json:"ts"`
+	Nonce     int64  `json:"nonce"`
+}
+
 // RelayEnvelopeFrame carries an envelope for federation routing.
 type RelayEnvelopeFrame struct {
 	Type          string    `json:"type"`
@@ -119,7 +128,8 @@ func IsRelayFrameType(frameType string) bool {
 		FrameTypeRelayRequest,
 		FrameTypeRelayForward,
 		FrameTypeRelayAck,
-		FrameTypeRelayOK:
+		FrameTypeRelayOK,
+		FrameTypeRelayCover:
 		return true
 	default:
 		return false
