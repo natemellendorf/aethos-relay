@@ -43,6 +43,9 @@ type WSFrame struct {
 	Limit      int       `json:"limit,omitempty"`
 	Messages   []Message `json:"messages,omitempty"`
 	At         int64     `json:"at,omitempty"`
+	// Relay federation fields (relay-only, not exposed to clients)
+	RelayDescriptors    []RelayDescriptor    `json:"relay_descriptors,omitempty"`
+	RelayDescriptorAcks []RelayDescriptorAck `json:"relay_descriptor_acks,omitempty"`
 }
 
 // Frame types (protocol v1)

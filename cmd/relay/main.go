@@ -25,6 +25,7 @@ func main() {
 	sweepInterval := flag.Duration("sweep-interval", 30*time.Second, "TTL sweeper interval")
 	maxTTLSecs := flag.Int("max-ttl-seconds", 604800, "Maximum TTL in seconds (default 7 days)")
 	logJSON := flag.Bool("log-json", false, "JSON logging output")
+	autoPeerDiscovery := flag.Bool("auto-peer-discovery", false, "Enable automatic dialing of discovered relays")
 	flag.Parse()
 
 	if *logJSON {
@@ -39,9 +40,10 @@ func main() {
 	log.Printf("Store path: %s", *storePath)
 	log.Printf("Sweep interval: %s", *sweepInterval)
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
+	log.Printf("Auto peer discovery: %v", *autoPeerDiscovery)
 
-	// Initialize store
-	bbstore := store.NewBBoltStore(*storePath)
+	// Initialize store with descriptor support
+	bbstore := store.NewBBoltDescriptorStore(*storePath)
 	if err := bbstore.Open(); err != nil {
 		log.Fatalf("Failed to open store: %v", err)
 	}
@@ -61,6 +63,12 @@ func main() {
 
 	log.Println("TTL sweeper started")
 
+	// Initialize descriptor sweeper
+	descriptorSweeper := store.NewDescriptorSweeper(bbstore, *sweepInterval)
+	go descriptorSweeper.Start(ctx)
+
+	log.Println("Descriptor sweeper started")
+
 	// Initialize client registry
 	clients := model.NewClientRegistry()
 	go clients.Run()
@@ -69,9 +77,17 @@ func main() {
 	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL)
 	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)
 
+	// Initialize relay federation handler (relay-only)
+	relayHandler := api.NewRelayFederationHandler(bbstore, clients, maxTTL)
+	relayHandler.Start(ctx)
+	defer relayHandler.Stop()
+
+	log.Println("Relay federation handler started")
+
 	// Set up HTTP server with WebSocket and API handlers
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler.HandleWebSocket)
+	mux.HandleFunc("/relay", relayHandler.HandleRelayWebSocket) // Relay-to-relay federation
 	mux.HandleFunc("/", httpHandler.ServeHTTP)
 
 	httpServer := &http.Server{
@@ -110,6 +126,7 @@ func main() {
 	log.Println("Shutting down...")
 	cancel()
 	sweeper.Stop()
+	descriptorSweeper.Stop()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
