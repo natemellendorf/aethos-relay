@@ -16,6 +16,13 @@ All bead work must follow these lifecycle rules:
 - Bead MUST be closed when complete.
 - Respect repo boundaries and existing AGENTS instructions.
 
+## Merge Discipline (Mandatory)
+
+Only the Orchestrator agent may request changes be MERGED.
+MERGE must only occur AFTER a review of the changes has been performed by the review agent.
+MERGE should be the last step performed after the associated bead has been closed.
+Performing a MERGE BEFORE all steps and tasks assigned are complete is NOT allowed.
+
 ## Repositories and Boundaries
 
 - Public repo: `aethos`
