@@ -114,6 +114,131 @@ func TestCodec(t *testing.T) {
 	}
 }
 
+func TestGetMessageByID(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	msg := &model.Message{
+		ID:        "msg-by-id-1",
+		From:      "sender-1",
+		To:        "recipient-1",
+		Payload:   "SGVsbG8=",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		Delivered: false,
+	}
+
+	if err := store.PersistMessage(nil, msg); err != nil {
+		t.Fatalf("failed to persist message: %v", err)
+	}
+
+	// Retrieve existing message
+	got, err := store.GetMessageByID(nil, msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessageByID returned unexpected error: %v", err)
+	}
+	if got.ID != msg.ID {
+		t.Errorf("expected message ID %s, got %s", msg.ID, got.ID)
+	}
+	if got.From != msg.From {
+		t.Errorf("expected From %s, got %s", msg.From, got.From)
+	}
+	if got.To != msg.To {
+		t.Errorf("expected To %s, got %s", msg.To, got.To)
+	}
+
+	// Retrieve non-existent message
+	_, err = store.GetMessageByID(nil, "nonexistent-id")
+	if err == nil {
+		t.Error("expected error for non-existent message ID, got nil")
+	}
+}
+
+func TestGetAllRecipientIDs(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	// Empty store returns empty slice
+	ids, err := store.GetAllRecipientIDs(nil)
+	if err != nil {
+		t.Fatalf("GetAllRecipientIDs returned unexpected error on empty store: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("expected 0 recipient IDs on empty store, got %d", len(ids))
+	}
+
+	// Persist messages for two different recipients, two messages for recipient-a
+	msgs := []*model.Message{
+		{ID: "m1", From: "s", To: "recipient-a", Payload: "AA==", CreatedAt: time.Now().Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
+		{ID: "m2", From: "s", To: "recipient-a", Payload: "AA==", CreatedAt: time.Now().Add(time.Second).Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
+		{ID: "m3", From: "s", To: "recipient-b", Payload: "AA==", CreatedAt: time.Now().Add(2 * time.Second).Truncate(time.Second), ExpiresAt: time.Now().Add(time.Hour).Truncate(time.Second)},
+	}
+	for _, m := range msgs {
+		if err := store.PersistMessage(nil, m); err != nil {
+			t.Fatalf("failed to persist message %s: %v", m.ID, err)
+		}
+	}
+
+	ids, err = store.GetAllRecipientIDs(nil)
+	if err != nil {
+		t.Fatalf("GetAllRecipientIDs returned unexpected error: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Errorf("expected 2 unique recipient IDs, got %d", len(ids))
+	}
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		seen[id] = true
+	}
+	if !seen["recipient-a"] {
+		t.Error("expected recipient-a in recipient IDs")
+	}
+	if !seen["recipient-b"] {
+		t.Error("expected recipient-b in recipient IDs")
+	}
+
+	// After removing all of recipient-a's messages, recipient-a should no longer appear
+	if err := store.RemoveMessage(nil, "m1"); err != nil {
+		t.Fatalf("failed to remove m1: %v", err)
+	}
+	if err := store.RemoveMessage(nil, "m2"); err != nil {
+		t.Fatalf("failed to remove m2: %v", err)
+	}
+
+	ids, err = store.GetAllRecipientIDs(nil)
+	if err != nil {
+		t.Fatalf("GetAllRecipientIDs returned unexpected error after delivery: %v", err)
+	}
+	if len(ids) != 1 {
+		t.Errorf("expected 1 recipient ID after delivery, got %d", len(ids))
+	}
+	if ids[0] != "recipient-b" {
+		t.Errorf("expected recipient-b, got %s", ids[0])
+	}
+}
+
 func TestExpiry(t *testing.T) {
 	// Create temp file
 	f, err := os.CreateTemp("", "relay-test-*.db")
