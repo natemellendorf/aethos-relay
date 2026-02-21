@@ -50,3 +50,42 @@ type Store interface {
 	// GetAllQueuedMessageIDs returns all queued message IDs for a recipient without a limit.
 	GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error)
 }
+
+// EnvelopeStore defines the interface for envelope persistence (federation).
+type EnvelopeStore interface {
+	// Open opens the envelope store.
+	Open() error
+
+	// Close closes the envelope store.
+	Close() error
+
+	// PersistEnvelope stores an envelope.
+	PersistEnvelope(ctx context.Context, env *model.Envelope) error
+
+	// GetEnvelopeByID retrieves an envelope by its ID.
+	GetEnvelopeByID(ctx context.Context, envID string) (*model.Envelope, error)
+
+	// GetEnvelopesByDestination retrieves envelopes for a destination.
+	GetEnvelopesByDestination(ctx context.Context, destID string, limit int) ([]*model.Envelope, error)
+
+	// RemoveEnvelope removes an envelope by ID.
+	RemoveEnvelope(ctx context.Context, envID string) error
+
+	// GetExpiredEnvelopes returns envelopes that have expired.
+	GetExpiredEnvelopes(ctx context.Context, before time.Time) ([]*model.Envelope, error)
+
+	// MarkSeen marks an envelope as seen by a relay.
+	MarkSeen(ctx context.Context, envID string, relayID string) error
+
+	// IsSeenBy checks if an envelope has been seen by a specific relay.
+	IsSeenBy(ctx context.Context, envID string, relayID string) (bool, error)
+
+	// GetAllDestinationIDs returns all unique destination IDs with envelopes.
+	GetAllDestinationIDs(ctx context.Context) ([]string, error)
+
+	// GetLastSweepTime returns the last time the sweeper ran.
+	GetLastSweepTime(ctx context.Context) (time.Time, error)
+
+	// SetLastSweepTime records the last sweeper run time.
+	SetLastSweepTime(ctx context.Context, t time.Time) error
+}

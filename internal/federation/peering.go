@@ -51,12 +51,37 @@ type Peer struct {
 	doneOnce      sync.Once
 }
 
-// PeerHealth tracks peer health metrics.
+// PeerHealth tracks peer health metrics with failure tracking.
 type PeerHealth struct {
 	Uptime            time.Duration
 	LastSeen          time.Time
+	LastForwardAt     time.Time
 	MessagesForwarded int
 	MessagesReceived  int
+	FailureCount      int
+	BackoffUntil      time.Time
+	IsHealthy         bool
+}
+
+// RecordFailure records a failure for exponential backoff.
+func (h *PeerHealth) RecordFailure() {
+	h.FailureCount++
+	// Exponential backoff: 2^failure_count seconds, max 5 minutes
+	backoff := time.Duration(min(h.FailureCount*h.FailureCount, 300)) * time.Second
+	h.BackoffUntil = time.Now().Add(backoff)
+	h.IsHealthy = false
+}
+
+// RecordSuccess records a successful operation.
+func (h *PeerHealth) RecordSuccess() {
+	h.FailureCount = 0
+	h.BackoffUntil = time.Time{}
+	h.IsHealthy = true
+}
+
+// IsBackingOff returns true if the peer is currently backing off from failures.
+func (h *PeerHealth) IsBackingOff() bool {
+	return time.Now().Before(h.BackoffUntil)
 }
 
 // PeerManager manages connections to relay peers.
@@ -694,6 +719,168 @@ func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request)
 // AnnounceMessage announces a new message to federation.
 func (pm *PeerManager) AnnounceMessage(msg *model.Message) {
 	go pm.gossipMessage(msg)
+}
+
+// ForwardToPeers forwards a message to all healthy peers except the origin.
+// This implements multi-relay routing with graceful degradation.
+func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) {
+	pm.peersMu.RLock()
+	var healthyPeers []*Peer
+	for _, peer := range pm.peers {
+		// Skip origin relay
+		if peer.ID == originRelayID {
+			continue
+		}
+		// Check if peer is healthy and not backing off
+		peer.healthMu.Lock()
+		isHealthy := peer.Health.IsHealthy && !peer.Health.IsBackingOff()
+		peer.healthMu.Unlock()
+		if isHealthy {
+			healthyPeers = append(healthyPeers, peer)
+		}
+	}
+	pm.peersMu.RUnlock()
+
+	if len(healthyPeers) == 0 {
+		log.Printf("federation: no healthy peers to forward message %s", msg.ID)
+		return
+	}
+
+	// Forward to all healthy peers
+	forward := model.RelayForwardFrame{
+		Type:    model.FrameTypeRelayForward,
+		Message: msg,
+	}
+	data, err := json.Marshal(forward)
+	if err != nil {
+		log.Printf("federation: failed to marshal forward: %v", err)
+		return
+	}
+
+	for _, peer := range healthyPeers {
+		select {
+		case peer.Send <- data:
+			peer.healthMu.Lock()
+			peer.Health.MessagesForwarded++
+			peer.Health.LastForwardAt = time.Now()
+			peer.healthMu.Unlock()
+		default:
+			log.Printf("federation: peer %s send channel full, dropping", peer.ID)
+		}
+	}
+}
+
+// GetHealthyPeers returns a list of healthy peer IDs.
+func (pm *PeerManager) GetHealthyPeers() []string {
+	pm.peersMu.RLock()
+	defer pm.peersMu.RUnlock()
+
+	var healthy []string
+	for id, peer := range pm.peers {
+		peer.healthMu.Lock()
+		isHealthy := peer.Health.IsHealthy && !peer.Health.IsBackingOff()
+		peer.healthMu.Unlock()
+		if isHealthy {
+			healthy = append(healthy, id)
+		}
+	}
+	return healthy
+}
+
+// GetPeerCount returns the current number of connected peers.
+func (pm *PeerManager) GetPeerCount() int {
+	pm.peersMu.RLock()
+	defer pm.peersMu.RUnlock()
+	return len(pm.peers)
+}
+
+// IsPeerHealthy checks if a specific peer is healthy.
+func (pm *PeerManager) IsPeerHealthy(peerID string) bool {
+	pm.peersMu.RLock()
+	peer, ok := pm.peers[peerID]
+	pm.peersMu.RUnlock()
+
+	if !ok {
+		return false
+	}
+
+	peer.healthMu.Lock()
+	defer peer.healthMu.Unlock()
+	return peer.Health.IsHealthy && !peer.Health.IsBackingOff()
+}
+
+// RateLimiter implements per-peer rate limiting.
+type RateLimiter struct {
+	mu          sync.Mutex
+	requests    map[string][]time.Time
+	maxRequests int
+	window      time.Duration
+}
+
+// NewRateLimiter creates a new rate limiter.
+func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
+	return &RateLimiter{
+		requests:    make(map[string][]time.Time),
+		maxRequests: maxRequests,
+		window:      window,
+	}
+}
+
+// Allow checks if a request from the given peer is allowed.
+func (rl *RateLimiter) Allow(peerID string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	windowStart := now.Add(-rl.window)
+
+	// Get or create the request history for this peer
+	history, exists := rl.requests[peerID]
+	if !exists {
+		history = []time.Time{}
+	}
+
+	// Filter out old requests
+	var validRequests []time.Time
+	for _, t := range history {
+		if t.After(windowStart) {
+			validRequests = append(validRequests, t)
+		}
+	}
+
+	// Check if under limit
+	if len(validRequests) >= rl.maxRequests {
+		rl.requests[peerID] = validRequests
+		return false
+	}
+
+	// Add current request
+	validRequests = append(validRequests, now)
+	rl.requests[peerID] = validRequests
+	return true
+}
+
+// Cleanup removes old entries from the rate limiter.
+func (rl *RateLimiter) Cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	windowStart := now.Add(-rl.window)
+
+	for peerID, history := range rl.requests {
+		var validRequests []time.Time
+		for _, t := range history {
+			if t.After(windowStart) {
+				validRequests = append(validRequests, t)
+			}
+		}
+		if len(validRequests) == 0 {
+			delete(rl.requests, peerID)
+		} else {
+			rl.requests[peerID] = validRequests
+		}
+	}
 }
 
 // diff returns elements in a that are not in b.
