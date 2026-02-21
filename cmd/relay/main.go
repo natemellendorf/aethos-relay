@@ -16,6 +16,7 @@ import (
 
 	"github.com/natemellendorf/aethos-relay/internal/api"
 	"github.com/natemellendorf/aethos-relay/internal/federation"
+	"github.com/natemellendorf/aethos-relay/internal/gossip"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -36,6 +37,10 @@ func main() {
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
 	peerURLs := flag.String("peer", "", "Comma-separated list of peer relay WebSocket URLs")
 	maxFederationConns := flag.Int("max-federation-conns", 100, "Maximum concurrent inbound federation connections")
+
+	// Relay discovery flags
+	autoPeerDiscovery := flag.Bool("auto-peer-discovery", false, "Enable automatic peer discovery via gossip (default false)")
+	descriptorStorePath := flag.String("descriptor-store-path", "", "Path to descriptor bbolt database (defaults to store-path + '.descriptors')")
 
 	flag.Parse()
 
@@ -59,6 +64,14 @@ func main() {
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
 	log.Printf("Allowed origins: %s", *allowedOrigins)
 	log.Printf("Dev mode: %v", *devMode)
+	log.Printf("Auto peer discovery: %v", *autoPeerDiscovery)
+
+	// Determine descriptor store path
+	descStorePath := *descriptorStorePath
+	if descStorePath == "" {
+		descStorePath = *storePath + ".descriptors"
+	}
+	log.Printf("Descriptor store path: %s", descStorePath)
 
 	// Initialize store
 	bbstore := store.NewBBoltStore(*storePath)
@@ -69,15 +82,43 @@ func main() {
 
 	log.Println("Store opened successfully")
 
-	// Initialize TTL sweeper
+	// Initialize TTL sweeper (needed for descriptor store)
 	maxTTL := time.Duration(*maxTTLSecs) * time.Second
-	sweeper := store.NewTTLSweeper(bbstore, *sweepInterval, maxTTL)
-	sweeper.SetExpiredCounter(metrics.IncrementExpired)
 
-	// Start sweeper in background
+	// Initialize descriptor store for relay discovery (if enabled)
+	var descriptorStore store.DescriptorStore
+	var descriptorSweeper *store.DescriptorSweeper
+	var gossipEngine *gossip.GossipEngine
+
+	// Create context for background tasks
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go sweeper.Start(ctx)
+
+	if *autoPeerDiscovery {
+		descriptorStore = store.NewBBoltDescriptorStore(descStorePath)
+		if err := descriptorStore.Open(); err != nil {
+			log.Fatalf("Failed to open descriptor store: %v", err)
+		}
+		defer descriptorStore.Close()
+		log.Println("Descriptor store opened successfully")
+
+		// Initialize descriptor TTL sweeper
+		descriptorSweeper = store.NewDescriptorSweeper(descriptorStore, *sweepInterval, maxTTL)
+		descriptorSweeper.SetExpiredCounter(metrics.IncrementDescriptorsExpired)
+
+		// Start descriptor sweeper in background
+		go descriptorSweeper.Start(ctx)
+
+		log.Println("Descriptor TTL sweeper started")
+
+		// Initialize gossip engine
+		gossipEngine = gossip.NewGossipEngine(descriptorStore, *relayID, *autoPeerDiscovery)
+		go gossipEngine.Run(ctx)
+
+		log.Println("Gossip engine started")
+	}
+
+	sweeper := store.NewTTLSweeper(bbstore, *sweepInterval, maxTTL)
 
 	log.Println("TTL sweeper started")
 
@@ -123,6 +164,14 @@ func main() {
 			http.Error(w, "Too many concurrent federation connections", http.StatusServiceUnavailable)
 		}
 	})
+
+	// Register relay descriptor endpoint if auto-peer-discovery is enabled
+	if *autoPeerDiscovery && descriptorStore != nil {
+		descriptorHandler := api.NewRelayDescriptorHandler(descriptorStore, *autoPeerDiscovery)
+		mux.HandleFunc("/relay/descriptors", descriptorHandler.ServeHTTP)
+		log.Println("Relay descriptor endpoint registered at /relay/descriptors")
+	}
+
 	mux.HandleFunc("/", httpHandler.ServeHTTP)
 
 	httpServer := &http.Server{
@@ -164,6 +213,14 @@ func main() {
 	cancel()
 	sweeper.Stop()
 	federationManager.Stop()
+
+	// Stop descriptor components if enabled
+	if descriptorSweeper != nil {
+		descriptorSweeper.Stop()
+	}
+	if gossipEngine != nil {
+		gossipEngine.Stop()
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
