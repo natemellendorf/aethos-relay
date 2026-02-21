@@ -495,7 +495,7 @@ func (pm *PeerManager) deliverMessage(msg *model.Message) {
 		})
 		select {
 		case r.Send <- data:
-			pm.store.MarkDelivered(context.Background(), msg.ID)
+			pm.store.MarkDelivered(context.Background(), msg.ID, r.WayfarerID)
 		default:
 		}
 	}

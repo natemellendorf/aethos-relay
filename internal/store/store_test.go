@@ -52,12 +52,21 @@ func TestBBoltStore(t *testing.T) {
 		t.Fatalf("expected message ID %s, got %s", msg.ID, messages[0].ID)
 	}
 
-	// Test marking delivered
-	if err := store.MarkDelivered(nil, msg.ID); err != nil {
+	// Test marking delivered to a specific recipient
+	if err := store.MarkDelivered(nil, msg.ID, "recipient-1"); err != nil {
 		t.Fatalf("failed to mark delivered: %v", err)
 	}
 
-	// Verify message is marked delivered
+	// Verify message is marked as delivered to this recipient
+	delivered, err := store.IsDeliveredTo(nil, msg.ID, "recipient-1")
+	if err != nil {
+		t.Fatalf("failed to check delivery state: %v", err)
+	}
+	if !delivered {
+		t.Fatalf("expected message to be marked as delivered to recipient-1")
+	}
+
+	// Verify message is no longer returned for this recipient
 	messages, err = store.GetQueuedMessages(nil, "recipient-1", 10)
 	if err != nil {
 		t.Fatalf("failed to get queued messages: %v", err)
@@ -279,5 +288,62 @@ func TestExpiry(t *testing.T) {
 	}
 	if expired[0].ID != expiredMsg.ID {
 		t.Errorf("expected expired message ID %s, got %s", expiredMsg.ID, expired[0].ID)
+	}
+}
+
+// TestPerDeviceDelivery tests that messages are tracked per-device
+func TestPerDeviceDelivery(t *testing.T) {
+	// Create temp file
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	// Open store
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	// Persist a message
+	msg := &model.Message{
+		ID:        "multi-device-msg",
+		From:      "sender-1",
+		To:        "recipient-1",
+		Payload:   "SGVsbG8gV29ybGQ=",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		Delivered: false,
+	}
+
+	if err := store.PersistMessage(nil, msg); err != nil {
+		t.Fatalf("failed to persist message: %v", err)
+	}
+
+	// Device A pulls messages - should get the message
+	messages, err := store.GetQueuedMessages(nil, "recipient-1", 10)
+	if err != nil {
+		t.Fatalf("failed to get queued messages: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message for device A, got %d", len(messages))
+	}
+
+	// Device A acknowledges - mark as delivered to device A
+	if err := store.MarkDelivered(nil, msg.ID, "recipient-1"); err != nil {
+		t.Fatalf("failed to mark delivered to device A: %v", err)
+	}
+
+	// Device A pulls again - should NOT get the message (delivered to this wayfarer)
+	messages, err = store.GetQueuedMessages(nil, "recipient-1", 10)
+	if err != nil {
+		t.Fatalf("failed to get queued messages: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("expected 0 messages after delivery to device A, got %d", len(messages))
 	}
 }

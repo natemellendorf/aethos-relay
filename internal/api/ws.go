@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,12 +17,50 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/store"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for development
-	},
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+// OriginChecker validates WebSocket origin against an allowlist.
+type OriginChecker struct {
+	allowedOrigins map[string]bool
+	devMode        bool
+}
+
+// NewOriginChecker creates a new origin checker.
+// allowedOrigins is a comma-separated list of allowed origins (e.g., "https://app.aethos.io,https://aethos.app")
+// devMode when true allows all origins (for local development)
+func NewOriginChecker(allowedOrigins string, devMode bool) *OriginChecker {
+	oc := &OriginChecker{
+		allowedOrigins: make(map[string]bool),
+		devMode:        devMode,
+	}
+	// In dev mode, allow all origins
+	if devMode {
+		return oc
+	}
+	// Parse allowed origins
+	for _, origin := range strings.Split(allowedOrigins, ",") {
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			oc.allowedOrigins[origin] = true
+		}
+	}
+	return oc
+}
+
+// Check validates if the origin is allowed.
+func (oc *OriginChecker) Check(r *http.Request) bool {
+	// Dev mode allows all origins
+	if oc.devMode {
+		return true
+	}
+	// If no origins configured, deny all
+	if len(oc.allowedOrigins) == 0 {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// No origin header - check if it's a same-origin request
+		return true
+	}
+	return oc.allowedOrigins[origin]
 }
 
 // WSHandler handles WebSocket connections.
@@ -29,15 +68,20 @@ type WSHandler struct {
 	store             store.Store
 	clients           *model.ClientRegistry
 	maxTTL            time.Duration
+	originChecker     *OriginChecker
 	federationManager *federation.PeerManager
 }
 
 // NewWSHandler creates a new WebSocket handler.
-func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration) *WSHandler {
+// allowedOrigins is a comma-separated list of allowed origins.
+// devMode enables relaxed origin checking for local development.
+func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, allowedOrigins string, devMode bool) *WSHandler {
+	originChecker := NewOriginChecker(allowedOrigins, devMode)
 	return &WSHandler{
-		store:   store,
-		clients: clients,
-		maxTTL:  maxTTL,
+		store:         store,
+		clients:       clients,
+		maxTTL:        maxTTL,
+		originChecker: originChecker,
 	}
 }
 
@@ -48,6 +92,20 @@ func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
 func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Check origin before upgrading
+	if !h.originChecker.Check(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Origin already validated above
+		},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws: failed to upgrade: %v", err)
@@ -246,8 +304,8 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	// Mark as delivered in store
-	if err := h.store.MarkDelivered(context.Background(), frame.MsgID); err != nil {
+	// Mark as delivered to this specific recipient in store
+	if err := h.store.MarkDelivered(context.Background(), frame.MsgID, client.WayfarerID); err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, "failed to acknowledge message")
 		return
@@ -323,8 +381,8 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			PayloadB64: msg.Payload,
 			At:         msg.CreatedAt.Unix(),
 		})
-		// Mark as delivered
-		if err := h.store.MarkDelivered(context.Background(), msg.ID); err != nil {
+		// Mark as delivered to this specific recipient
+		if err := h.store.MarkDelivered(context.Background(), msg.ID, r.WayfarerID); err != nil {
 			metrics.IncrementStoreErrors()
 			log.Printf("ws: failed to mark delivered: %v", err)
 			continue

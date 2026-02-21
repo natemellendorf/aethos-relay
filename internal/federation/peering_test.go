@@ -21,12 +21,16 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockStore struct {
-	mu       sync.Mutex
-	messages map[string]*model.Message // msg.ID -> msg
+	mu        sync.Mutex
+	messages  map[string]*model.Message // msg.ID -> msg
+	delivered map[string]bool           // msgID+recipientID -> delivered
 }
 
 func newMockStore() *mockStore {
-	return &mockStore{messages: make(map[string]*model.Message)}
+	return &mockStore{
+		messages:  make(map[string]*model.Message),
+		delivered: make(map[string]bool),
+	}
 }
 
 func (m *mockStore) Open() error  { return nil }
@@ -49,13 +53,20 @@ func (m *mockStore) GetMessageByID(_ context.Context, id string) (*model.Message
 	return msg, nil
 }
 
-func (m *mockStore) MarkDelivered(_ context.Context, id string) error {
+func (m *mockStore) MarkDelivered(_ context.Context, id string, recipientID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.delivered[id+"\x00"+recipientID] = true
 	if msg, ok := m.messages[id]; ok {
 		msg.Delivered = true
 	}
 	return nil
+}
+
+func (m *mockStore) IsDeliveredTo(_ context.Context, id string, recipientID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.delivered[id+"\x00"+recipientID], nil
 }
 
 func (m *mockStore) GetQueuedMessages(_ context.Context, to string, limit int) ([]*model.Message, error) {
@@ -63,7 +74,7 @@ func (m *mockStore) GetQueuedMessages(_ context.Context, to string, limit int) (
 	defer m.mu.Unlock()
 	var result []*model.Message
 	for _, msg := range m.messages {
-		if msg.To == to && !msg.Delivered {
+		if msg.To == to && !m.delivered[msg.ID+"\x00"+to] {
 			result = append(result, msg)
 			if len(result) >= limit {
 				break
@@ -104,7 +115,7 @@ func (m *mockStore) GetAllRecipientIDs(_ context.Context) ([]string, error) {
 	seen := make(map[string]bool)
 	var result []string
 	for _, msg := range m.messages {
-		if !msg.Delivered && !seen[msg.To] {
+		if !seen[msg.To] {
 			seen[msg.To] = true
 			result = append(result, msg.To)
 		}
@@ -117,7 +128,7 @@ func (m *mockStore) GetAllQueuedMessageIDs(_ context.Context, to string) ([]stri
 	defer m.mu.Unlock()
 	var ids []string
 	for _, msg := range m.messages {
-		if msg.To == to && !msg.Delivered {
+		if msg.To == to {
 			ids = append(ids, msg.ID)
 		}
 	}
