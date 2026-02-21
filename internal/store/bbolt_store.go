@@ -26,6 +26,9 @@ var (
 	MetaLastSweep = []byte("last_sweep")
 
 	ErrInvalidKey = errors.New("invalid key format")
+
+	// recipientDelimiter is the null byte used to separate components in composite keys.
+	recipientDelimiter = string(rune(0))
 )
 
 // BBoltStore implements Store using bbolt.
@@ -124,7 +127,7 @@ func (s *BBoltStore) GetQueuedMessages(ctx context.Context, recipientID string, 
 	err := s.db.View(func(tx *bolt.Tx) error {
 		// Prefix scan the queue bucket
 		c := tx.Bucket(BucketQueueByRecipient).Cursor()
-		prefix := []byte(recipientID + string(rune(0)))
+		prefix := []byte(recipientID + recipientDelimiter)
 
 		count := 0
 		for k, v := c.Seek(prefix); k != nil && count < limit; k, v = c.Next() {
@@ -322,4 +325,72 @@ func (s *BBoltStore) SetLastSweepTime(ctx context.Context, t time.Time) error {
 		}
 		return tx.Bucket(BucketMeta).Put(MetaLastSweep, v)
 	})
+}
+
+// GetMessageByID retrieves a message by its ID.
+func (s *BBoltStore) GetMessageByID(ctx context.Context, msgID string) (*model.Message, error) {
+	var msg *model.Message
+	err := s.db.View(func(tx *bolt.Tx) error {
+		msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+		if msgBytes == nil {
+			return fmt.Errorf("message not found: %s", msgID)
+		}
+		var err error
+		msg, err = DecodeMessage(msgBytes)
+		if err != nil {
+			return xerrors.Errorf("failed to decode message: %w", err)
+		}
+		return nil
+	})
+	return msg, err
+}
+
+// GetAllRecipientIDs returns all unique recipient IDs with queued messages.
+func (s *BBoltStore) GetAllRecipientIDs(ctx context.Context) ([]string, error) {
+	var recipientIDs []string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		seen := make(map[string]bool)
+		c := tx.Bucket(BucketQueueByRecipient).Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			// Extract recipient ID from queue key (format: recipient\x00timestamp\x00msgid)
+			parts := bytes.Split(k, []byte{0})
+			if len(parts) < 1 {
+				continue
+			}
+			recipient := string(parts[0])
+			if !seen[recipient] {
+				seen[recipient] = true
+				recipientIDs = append(recipientIDs, recipient)
+			}
+		}
+		return nil
+	})
+	return recipientIDs, err
+}
+
+// GetAllQueuedMessageIDs returns all queued message IDs for a recipient without a limit.
+func (s *BBoltStore) GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error) {
+	var ids []string
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(BucketQueueByRecipient).Cursor()
+		prefix := []byte(to + recipientDelimiter)
+
+		for k, v := c.Seek(prefix); k != nil; k, v = c.Next() {
+			if len(k) < len(prefix) || string(k[:len(prefix)]) != string(prefix) {
+				break
+			}
+
+			msgID := string(v)
+			msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+			if msgBytes == nil {
+				continue
+			}
+
+			ids = append(ids, msgID)
+		}
+		return nil
+	})
+
+	return ids, err
 }
