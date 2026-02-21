@@ -9,3 +9,4 @@
 coverage.out
 relay.db
 relay.db.descriptors
+relay.db.envelopes

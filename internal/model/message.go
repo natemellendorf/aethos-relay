@@ -63,6 +63,7 @@ const (
 	FrameTypeRelayInventory = "relay_inventory"
 	FrameTypeRelayRequest   = "relay_request"
 	FrameTypeRelayForward   = "relay_forward"
+	FrameTypeRelayAck       = "relay_ack"
 	FrameTypeRelayOK        = "relay_ok"
 )
 
@@ -92,6 +93,23 @@ type RelayForwardFrame struct {
 	Message *Message `json:"message"`
 }
 
+// RelayAckFrame acknowledges receipt of a forwarded envelope.
+type RelayAckFrame struct {
+	Type        string `json:"type"`
+	EnvelopeID  string `json:"envelope_id"`
+	Destination string `json:"destination"`
+	Status      string `json:"status"` // "accepted", "duplicate", "expired"
+}
+
+// RelayEnvelopeFrame carries an envelope for federation routing.
+type RelayEnvelopeFrame struct {
+	Type          string    `json:"type"`
+	Envelope      *Envelope `json:"envelope"`
+	HopCount      int       `json:"hop_count"`
+	OriginRelayID string    `json:"origin_relay_id"`
+	TTLSeconds    int       `json:"ttl_seconds"`
+}
+
 // IsRelayFrameType reports whether the given frame type is reserved for relay-to-relay
 // federation and therefore must never be sent to or handled as a client frame.
 func IsRelayFrameType(frameType string) bool {
@@ -100,6 +118,7 @@ func IsRelayFrameType(frameType string) bool {
 		FrameTypeRelayInventory,
 		FrameTypeRelayRequest,
 		FrameTypeRelayForward,
+		FrameTypeRelayAck,
 		FrameTypeRelayOK:
 		return true
 	default:

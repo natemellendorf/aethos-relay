@@ -72,9 +72,54 @@ var (
 		Help: "Current score for a relay",
 	}, []string{"relay_id"})
 
+	// FederationEnvelopeMetrics tracks envelope federation metrics.
+	FederationEnvelopeMetrics = &FederationMetricsGroup{}
+
 	// DescriptorMetrics tracks descriptor-related metrics.
 	DescriptorMetrics = &DescriptorMetricsGroup{}
 )
+
+// FederationMetricsGroup holds federation envelope-related metrics.
+type FederationMetricsGroup struct {
+	EnvelopesReceived  prometheus.Counter
+	EnvelopesForwarded prometheus.Counter
+	EnvelopesDropped   prometheus.Counter
+	EnvelopesExpired   prometheus.Counter
+	PeersConnected     prometheus.Gauge
+	PeerFailures       prometheus.Counter
+}
+
+func init() {
+	FederationEnvelopeMetrics.EnvelopesReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "envelopes_received_total",
+		Help: "Total envelopes received via federation",
+	})
+
+	FederationEnvelopeMetrics.EnvelopesForwarded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "envelopes_forwarded_total",
+		Help: "Total envelopes forwarded to peers",
+	})
+
+	FederationEnvelopeMetrics.EnvelopesDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "envelopes_dropped_total",
+		Help: "Total envelopes dropped due to errors or limits",
+	})
+
+	FederationEnvelopeMetrics.EnvelopesExpired = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "envelopes_expired_total",
+		Help: "Total envelopes expired and removed",
+	})
+
+	FederationEnvelopeMetrics.PeersConnected = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "federation_peers_connected",
+		Help: "Current number of connected federation peers",
+	})
+
+	FederationEnvelopeMetrics.PeerFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "federation_peer_failures_total",
+		Help: "Total peer communication failures",
+	})
+}
 
 // DescriptorMetricsGroup holds descriptor-related metrics.
 type DescriptorMetricsGroup struct {
@@ -196,4 +241,29 @@ func SetRelayScore(relayID string, score float64) {
 // RemoveRelayScore removes a relay score metric.
 func RemoveRelayScore(relayID string) {
 	RelayScoreGauge.DeleteLabelValues(relayID)
+}
+
+// Federation envelope metrics helpers
+func IncrementEnvelopesReceived() {
+	FederationEnvelopeMetrics.EnvelopesReceived.Inc()
+}
+
+func IncrementEnvelopesForwarded() {
+	FederationEnvelopeMetrics.EnvelopesForwarded.Inc()
+}
+
+func IncrementEnvelopesDropped() {
+	FederationEnvelopeMetrics.EnvelopesDropped.Inc()
+}
+
+func IncrementEnvelopesExpired() {
+	FederationEnvelopeMetrics.EnvelopesExpired.Inc()
+}
+
+func SetPeersConnected(count int) {
+	FederationEnvelopeMetrics.PeersConnected.Set(float64(count))
+}
+
+func IncrementPeerFailures() {
+	FederationEnvelopeMetrics.PeerFailures.Inc()
 }

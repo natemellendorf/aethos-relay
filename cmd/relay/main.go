@@ -37,6 +37,12 @@ func main() {
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
 	peerURLs := flag.String("peer", "", "Comma-separated list of peer relay WebSocket URLs")
 	maxFederationConns := flag.Int("max-federation-conns", 100, "Maximum concurrent inbound federation connections")
+	envelopeStorePath := flag.String("envelope-store-path", "", "Path to envelope store (defaults to store-path + '.envelopes')")
+
+	// Abuse resistance flags
+	maxEnvelopeSize := flag.Int("max-envelope-size", 65536, "Maximum envelope payload size in bytes")
+	maxFederationPeers := flag.Int("max-federation-peers", 50, "Maximum number of federation peers")
+	rateLimitPerPeer := flag.Int("rate-limit-per-peer", 100, "Rate limit per peer (requests per minute)")
 
 	// Relay discovery flags
 	autoPeerDiscovery := flag.Bool("auto-peer-discovery", false, "Enable automatic peer discovery via gossip (default false)")
@@ -65,6 +71,16 @@ func main() {
 	log.Printf("Allowed origins: %s", *allowedOrigins)
 	log.Printf("Dev mode: %v", *devMode)
 	log.Printf("Auto peer discovery: %v", *autoPeerDiscovery)
+	log.Printf("Max envelope size: %d bytes", *maxEnvelopeSize)
+	log.Printf("Max federation peers: %d", *maxFederationPeers)
+	log.Printf("Rate limit per peer: %d req/min", *rateLimitPerPeer)
+
+	// Determine envelope store path
+	envStorePath := *envelopeStorePath
+	if envStorePath == "" {
+		envStorePath = *storePath + ".envelopes"
+	}
+	log.Printf("Envelope store path: %s", envStorePath)
 
 	// Determine descriptor store path
 	descStorePath := *descriptorStorePath
@@ -82,20 +98,38 @@ func main() {
 
 	log.Println("Store opened successfully")
 
+	// Initialize envelope store for federation
+	envelopeStore := store.NewBBoltEnvelopeStore(envStorePath)
+	if err := envelopeStore.Open(); err != nil {
+		log.Fatalf("Failed to open envelope store: %v", err)
+	}
+	defer envelopeStore.Close()
+
+	log.Println("Envelope store opened successfully")
+
 	// Initialize TTL sweeper (needed for descriptor store)
 	maxTTL := time.Duration(*maxTTLSecs) * time.Second
+
+	// Initialize envelope sweeper
+	envelopeSweeperConfig := store.EnvelopeTTLDefaultConfig(maxTTL)
+	envelopeSweeper := store.NewEnvelopeSweeper(envelopeStore, envelopeSweeperConfig)
+	envelopeSweeper.SetExpiredCounter(metrics.IncrementEnvelopesExpired)
+
+	// Create context for background tasks
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start envelope sweeper in background
+	go envelopeSweeper.Start(ctx)
+	log.Println("Envelope TTL sweeper started")
 
 	// Initialize descriptor store for relay discovery (if enabled)
 	var descriptorStore store.DescriptorStore
 	var descriptorSweeper *store.DescriptorSweeper
 	var gossipEngine *gossip.GossipEngine
 
-	// Create context for background tasks
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	if *autoPeerDiscovery {
-		descriptorStore = store.NewBBoltDescriptorStore(descStorePath)
+		descriptorStore = store.NewBBoltDescriptorStore(*descriptorStorePath)
 		if err := descriptorStore.Open(); err != nil {
 			log.Fatalf("Failed to open descriptor store: %v", err)
 		}
@@ -153,9 +187,38 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler.HandleWebSocket)
 
-	// Limit concurrent inbound federation connections to prevent resource exhaustion.
+	// Federation WebSocket endpoint with rate limiting
 	federationSem := make(chan struct{}, *maxFederationConns)
-	mux.HandleFunc("/federation", func(w http.ResponseWriter, r *http.Request) {
+	rateLimiter := federation.NewRateLimiter(*rateLimitPerPeer, time.Minute)
+
+	// Start rate limiter cleanup
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				rateLimiter.Cleanup()
+			}
+		}
+	}()
+
+	mux.HandleFunc("/federation/ws", func(w http.ResponseWriter, r *http.Request) {
+		// Check peer count limit
+		if federationManager.GetPeerCount() >= *maxFederationPeers {
+			http.Error(w, "Maximum federation peers reached", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Rate limit by remote addr
+		peerID := r.RemoteAddr
+		if !rateLimiter.Allow(peerID) {
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		select {
 		case federationSem <- struct{}{}:
 			defer func() { <-federationSem }()
