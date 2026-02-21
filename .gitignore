@@ -1,0 +1,11 @@
+/relay
+/bin/
+/dist/
+/build/
+*.exe
+*.out
+*.test
+*.log
+coverage.out
+relay.db
+relay.db.descriptors

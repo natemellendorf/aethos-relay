@@ -48,6 +48,30 @@ var (
 		Help: "Total messages dropped due to full send channel",
 	})
 
+	// RelayPublishSuccessTotal tracks successful federation publishes.
+	RelayPublishSuccessTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "relay_publish_success_total",
+		Help: "Total successful federation publishes",
+	})
+
+	// RelayPublishFailureTotal tracks failed federation publishes.
+	RelayPublishFailureTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "relay_publish_failure_total",
+		Help: "Total failed federation publishes",
+	})
+
+	// PublishWidthCurrent tracks the current adaptive publish width.
+	PublishWidthCurrent = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "publish_width_current",
+		Help: "Current adaptive publish width",
+	})
+
+	// RelayScoreGauge tracks relay scores.
+	RelayScoreGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "relay_score",
+		Help: "Current score for a relay",
+	}, []string{"relay_id"})
+
 	// DescriptorMetrics tracks descriptor-related metrics.
 	DescriptorMetrics = &DescriptorMetricsGroup{}
 )
@@ -147,4 +171,29 @@ func IncrementDescriptorsExpired() {
 
 func SetDescriptorsRegistrySize(size int) {
 	DescriptorMetrics.DescriptorsRegistrySize.Set(float64(size))
+}
+
+// IncrementPublishSuccess increments the successful publish counter.
+func IncrementPublishSuccess() {
+	RelayPublishSuccessTotal.Inc()
+}
+
+// IncrementPublishFailure increments the failed publish counter.
+func IncrementPublishFailure() {
+	RelayPublishFailureTotal.Inc()
+}
+
+// SetPublishWidth sets the current publish width gauge.
+func SetPublishWidth(width int) {
+	PublishWidthCurrent.Set(float64(width))
+}
+
+// SetRelayScore sets the score for a specific relay.
+func SetRelayScore(relayID string, score float64) {
+	RelayScoreGauge.WithLabelValues(relayID).Set(score)
+}
+
+// RemoveRelayScore removes a relay score metric.
+func RemoveRelayScore(relayID string) {
+	RelayScoreGauge.DeleteLabelValues(relayID)
 }
