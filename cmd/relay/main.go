@@ -33,7 +33,7 @@ func main() {
 	// Federation flags
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
 	peerURLs := flag.String("peer", "", "Comma-separated list of peer relay WebSocket URLs")
-	peerPort := flag.String("peer-port", ":8082", "Port for inbound peer connections")
+	maxFederationConns := flag.Int("max-federation-conns", 100, "Maximum concurrent inbound federation connections")
 
 	flag.Parse()
 
@@ -55,7 +55,6 @@ func main() {
 	log.Printf("Store path: %s", *storePath)
 	log.Printf("Sweep interval: %s", *sweepInterval)
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
-	log.Printf("Peer port: %s", *peerPort)
 
 	// Initialize store
 	bbstore := store.NewBBoltStore(*storePath)
@@ -106,7 +105,18 @@ func main() {
 	// Set up HTTP server with WebSocket and API handlers
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler.HandleWebSocket)
-	mux.HandleFunc("/federation", federationManager.HandleInboundPeer)
+
+	// Limit concurrent inbound federation connections to prevent resource exhaustion.
+	federationSem := make(chan struct{}, *maxFederationConns)
+	mux.HandleFunc("/federation", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case federationSem <- struct{}{}:
+			defer func() { <-federationSem }()
+			federationManager.HandleInboundPeer(w, r)
+		default:
+			http.Error(w, "Too many concurrent federation connections", http.StatusServiceUnavailable)
+		}
+	})
 	mux.HandleFunc("/", httpHandler.ServeHTTP)
 
 	httpServer := &http.Server{

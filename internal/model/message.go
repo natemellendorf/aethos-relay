@@ -92,6 +92,30 @@ type RelayForwardFrame struct {
 	Message *Message `json:"message"`
 }
 
+// IsRelayFrameType reports whether the given frame type is reserved for relay-to-relay
+// federation and therefore must never be sent to or handled as a client frame.
+func IsRelayFrameType(frameType string) bool {
+	switch frameType {
+	case FrameTypeRelayHello,
+		FrameTypeRelayInventory,
+		FrameTypeRelayRequest,
+		FrameTypeRelayForward,
+		FrameTypeRelayOK:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsClientAllowedFrameType reports whether the given frame type is valid on client
+// connections. Callers should reject frames where this returns false.
+func IsClientAllowedFrameType(frameType string) bool {
+	if frameType == "" {
+		return false
+	}
+	return !IsRelayFrameType(frameType)
+}
+
 // Client represents a connected WebSocket client.
 type Client struct {
 	ID         string
