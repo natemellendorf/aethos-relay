@@ -183,3 +183,104 @@ func DecodeDeliveryKey(data []byte) (msgID string, recipientID string, err error
 	}
 	return string(parts[0]), string(parts[1]), nil
 }
+
+// EncodeDescriptor encodes a RelayDescriptor to bytes using JSON.
+func EncodeDescriptor(d *model.RelayDescriptor) ([]byte, error) {
+	return []byte(d.RelayID + "\x00" + d.WSURL + "\x00" + d.Region + "\x00" +
+		joinStrings(d.Tags) + "\x00" +
+		d.FirstSeenAt.Format(time.RFC3339Nano) + "\x00" +
+		d.LastSeenAt.Format(time.RFC3339Nano) + "\x00" +
+		d.ExpiresAt.Format(time.RFC3339Nano) + "\x00" +
+		d.AdvertisedBy), nil
+}
+
+// DecodeDescriptor decodes bytes to a RelayDescriptor.
+func DecodeDescriptor(data []byte) (*model.RelayDescriptor, error) {
+	parts := bytes.Split(data, []byte{0})
+	if len(parts) < 7 {
+		return nil, ErrInvalidKey
+	}
+
+	firstSeen, err := time.Parse(time.RFC3339Nano, string(parts[4]))
+	if err != nil {
+		return nil, err
+	}
+	lastSeen, err := time.Parse(time.RFC3339Nano, string(parts[5]))
+	if err != nil {
+		return nil, err
+	}
+	expires, err := time.Parse(time.RFC3339Nano, string(parts[6]))
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.RelayDescriptor{
+		RelayID:      string(parts[0]),
+		WSURL:        string(parts[1]),
+		Region:       string(parts[2]),
+		Tags:         splitStrings(string(parts[3])),
+		FirstSeenAt:  firstSeen,
+		LastSeenAt:   lastSeen,
+		ExpiresAt:    expires,
+		AdvertisedBy: string(parts[7]),
+	}, nil
+}
+
+// EncodeDescriptorExpiryKey encodes a descriptor expiry key.
+func EncodeDescriptorExpiryKey(relayID string, expiresAt time.Time) []byte {
+	buf := new(bytes.Buffer)
+	buf.WriteString(expiresAt.Format(time.RFC3339Nano))
+	buf.WriteByte(0)
+	buf.WriteString(relayID)
+	return buf.Bytes()
+}
+
+// EncodeDescriptorPeerKey encodes a descriptor peer index key.
+func EncodeDescriptorPeerKey(peerID string, timestamp time.Time) []byte {
+	buf := new(bytes.Buffer)
+	buf.WriteString(peerID)
+	buf.WriteByte(0)
+	buf.WriteString(timestamp.Format(time.RFC3339Nano))
+	return buf.Bytes()
+}
+
+// joinStrings joins a string slice with a delimiter.
+func joinStrings(s []string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	result := s[0]
+	for i := 1; i < len(s); i++ {
+		result += "," + s[i]
+	}
+	return result
+}
+
+// splitStrings splits a comma-separated string into a slice.
+func splitStrings(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var result []string
+	for _, part := range splitStr(s, ",") {
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+// splitStr splits a string by delimiter (simple implementation).
+func splitStr(s, sep string) []string {
+	var result []string
+	start := 0
+	for i := 0; i <= len(s)-len(sep); i++ {
+		if s[i:i+len(sep)] == sep {
+			result = append(result, s[start:i])
+			start = i + len(sep)
+			i += len(sep) - 1
+		}
+	}
+	result = append(result, s[start:])
+	return result
+}
