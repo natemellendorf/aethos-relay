@@ -47,7 +47,52 @@ var (
 		Name: "messages_dropped_total",
 		Help: "Total messages dropped due to full send channel",
 	})
+
+	// DescriptorMetrics tracks descriptor-related metrics.
+	DescriptorMetrics = &DescriptorMetricsGroup{}
 )
+
+// DescriptorMetricsGroup holds descriptor-related metrics.
+type DescriptorMetricsGroup struct {
+	DescriptorsReceived           prometheus.Counter
+	DescriptorsAccepted           prometheus.Counter
+	DescriptorsRejectedValidation prometheus.Counter
+	DescriptorsRejectedRateLimit  prometheus.Counter
+	DescriptorsExpired            prometheus.Counter
+	DescriptorsRegistrySize       prometheus.Gauge
+}
+
+func init() {
+	DescriptorMetrics.DescriptorsReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "descriptors_received_total",
+		Help: "Total relay descriptors received",
+	})
+
+	DescriptorMetrics.DescriptorsAccepted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "descriptors_accepted_total",
+		Help: "Total relay descriptors accepted",
+	})
+
+	DescriptorMetrics.DescriptorsRejectedValidation = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "descriptors_rejected_validation_total",
+		Help: "Total relay descriptors rejected due to validation",
+	})
+
+	DescriptorMetrics.DescriptorsRejectedRateLimit = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "descriptors_rejected_rate_limit_total",
+		Help: "Total relay descriptors rejected due to rate limiting",
+	})
+
+	DescriptorMetrics.DescriptorsExpired = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "descriptors_expired_total",
+		Help: "Total relay descriptors expired and removed",
+	})
+
+	DescriptorMetrics.DescriptorsRegistrySize = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "descriptors_registry_size",
+		Help: "Current number of descriptors in registry",
+	})
+}
 
 // IncrementExpired increments the expired messages counter.
 func IncrementExpired() {
@@ -77,4 +122,29 @@ func IncrementStoreErrors() {
 // IncrementDropped increments the dropped messages counter.
 func IncrementDropped() {
 	MessagesDroppedTotal.Inc()
+}
+
+// Descriptor metrics helpers
+func IncrementDescriptorsReceived() {
+	DescriptorMetrics.DescriptorsReceived.Inc()
+}
+
+func IncrementDescriptorsAccepted() {
+	DescriptorMetrics.DescriptorsAccepted.Inc()
+}
+
+func IncrementDescriptorsRejectedValidation() {
+	DescriptorMetrics.DescriptorsRejectedValidation.Inc()
+}
+
+func IncrementDescriptorsRejectedRateLimit() {
+	DescriptorMetrics.DescriptorsRejectedRateLimit.Inc()
+}
+
+func IncrementDescriptorsExpired() {
+	DescriptorMetrics.DescriptorsExpired.Inc()
+}
+
+func SetDescriptorsRegistrySize(size int) {
+	DescriptorMetrics.DescriptorsRegistrySize.Set(float64(size))
 }

@@ -89,6 +89,8 @@ func main() {
 	federationManager := federation.NewPeerManager(*relayID, bbstore, clients, maxTTL)
 	go federationManager.Run()
 
+	log.Println("Federation peer manager started")
+
 	// Connect to configured peers
 	if *peerURLs != "" {
 		peerList := strings.Split(*peerURLs, ",")
