@@ -29,6 +29,9 @@ type Store interface {
 	// IsDeliveredTo checks if a message has been delivered to a specific recipient.
 	IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error)
 
+	// GetMessageByID retrieves a message by its ID.
+	GetMessageByID(ctx context.Context, msgID string) (*model.Message, error)
+
 	// RemoveMessage removes a message from all buckets.
 	RemoveMessage(ctx context.Context, msgID string) error
 
@@ -40,4 +43,10 @@ type Store interface {
 
 	// SetLastSweepTime records the last sweeper run time.
 	SetLastSweepTime(ctx context.Context, t time.Time) error
+
+	// GetAllRecipientIDs returns all unique recipient IDs with queued messages.
+	GetAllRecipientIDs(ctx context.Context) ([]string, error)
+
+	// GetAllQueuedMessageIDs returns all queued message IDs for a recipient without a limit.
+	GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error)
 }

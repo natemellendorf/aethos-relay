@@ -14,6 +14,8 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
+
+	"github.com/natemellendorf/aethos-relay/internal/federation"
 )
 
 // OriginChecker validates WebSocket origin against an allowlist.
@@ -64,10 +66,11 @@ func (oc *OriginChecker) Check(r *http.Request) bool {
 
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
-	store         store.Store
-	clients       *model.ClientRegistry
-	maxTTL        time.Duration
-	originChecker *OriginChecker
+	store             store.Store
+	clients           *model.ClientRegistry
+	maxTTL            time.Duration
+	originChecker     *OriginChecker
+	federationManager *federation.PeerManager
 }
 
 // NewWSHandler creates a new WebSocket handler.
@@ -81,6 +84,11 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 		maxTTL:        maxTTL,
 		originChecker: originChecker,
 	}
+}
+
+// SetFederationManager sets the federation peer manager for relaying messages.
+func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
+	h.federationManager = mgr
 }
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
@@ -273,6 +281,11 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		MsgID: msg.ID,
 		At:    msg.CreatedAt.Unix(),
 	})
+
+	// Announce to federation peers (if federation is enabled)
+	if h.federationManager != nil {
+		h.federationManager.AnnounceMessage(msg)
+	}
 }
 
 // handleAck handles the ack frame.
