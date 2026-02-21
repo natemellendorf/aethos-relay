@@ -4,6 +4,18 @@ This repository is the public WebSocket relay server with bbolt TTL persistence.
 
 This file defines stable rules for agent orchestration.
 
+## Bead Lifecycle Discipline (Mandatory)
+
+All bead work must follow these lifecycle rules:
+
+- Always branch from `origin/main`.
+- Always use git worktrees.
+- Never commit `.beads/*`.
+- Never commit compiled artifacts/binaries.
+- Conventional commits only. No emojis.
+- Bead MUST be closed when complete.
+- Respect repo boundaries and existing AGENTS instructions.
+
 ## Repositories and Boundaries
 
 - Public repo: `aethos`
