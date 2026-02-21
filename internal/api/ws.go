@@ -15,8 +15,6 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
-
-	"github.com/natemellendorf/aethos-relay/internal/federation"
 )
 
 // OriginChecker validates WebSocket origin against an allowlist.
