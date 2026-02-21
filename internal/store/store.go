@@ -21,6 +21,9 @@ type Store interface {
 	// GetQueuedMessages retrieves undelivered messages for a recipient.
 	GetQueuedMessages(ctx context.Context, to string, limit int) ([]*model.Message, error)
 
+	// GetMessageByID retrieves a message by its ID.
+	GetMessageByID(ctx context.Context, msgID string) (*model.Message, error)
+
 	// MarkDelivered marks a message as delivered.
 	MarkDelivered(ctx context.Context, msgID string) error
 
@@ -35,4 +38,10 @@ type Store interface {
 
 	// SetLastSweepTime records the last sweeper run time.
 	SetLastSweepTime(ctx context.Context, t time.Time) error
+
+	// GetAllRecipientIDs returns all unique recipient IDs with queued messages.
+	GetAllRecipientIDs(ctx context.Context) ([]string, error)
+
+	// GetAllQueuedMessageIDs returns all queued message IDs for a recipient without a limit.
+	GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error)
 }
