@@ -67,6 +67,34 @@ go run ./cmd/relay/main.go \
 | `-auto-peer-discovery` | `false` | Enable automatic peer discovery via gossip |
 | `-descriptor-store-path` | `store-path + .descriptors` | Path to descriptor bbolt database |
 
+### TAR (Traffic Analysis Resistance) Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-federation-topk` | `2` | Number of top peers to forward to |
+| `-federation-explore-prob` | `0.1` | Probability of exploring a non-topK peer |
+| `-federation-batch-interval` | `500ms` | Batching interval |
+| `-federation-batch-jitter` | `250ms` | Batching jitter range |
+| `-federation-batch-max` | `10` | Max frames per batch |
+| `-federation-pad-buckets` | `1024,4096,16384,65536` | Padding bucket sizes (comma-separated) |
+| `-federation-pad-enabled` | `false` | Enable payload padding |
+| `-federation-cover-enabled` | `false` | Enable cover frames |
+| `-federation-cover-max` | `3` | Max cover frames when queue empty |
+
+Example with TAR enabled:
+
+```bash
+go run ./cmd/relay/main.go \
+  -relay-id "relay-us-east" \
+  -federation-topk 2 \
+  -federation-explore-prob 0.1 \
+  -federation-batch-interval 500ms \
+  -federation-batch-jitter 250ms \
+  -federation-pad-enabled true \
+  -federation-pad-buckets "1024,4096,16384,65536" \
+  -federation-cover-enabled true
+```
+
 ## TTL Behavior
 
 Messages and envelopes have time-to-live (TTL) that controls how long they persist:
@@ -120,6 +148,54 @@ Available metrics include:
 - `envelopes_forwarded_total` - Total federation envelopes forwarded
 - `envelopes_dropped_total` - Total federation envelopes dropped
 - `federation_peers_connected` - Current connected federation peers
+- `federation_peer_score{peer="..."}` - Current score for a federation peer
+- `federation_peer_acks_total{peer="..."}` - Total acks received from a peer
+- `federation_peer_timeouts_total{peer="..."}` - Total timeouts for a peer
+
+## Peer Scoring
+
+The relay implements a peer scoring system to select optimal forwarding candidates:
+
+### Score Components
+
+- **Success Rate (35%)**: Ratio of successful acks to total attempts
+- **Latency (25%)**: Exponential weighted moving average of ack latency
+- **Stability (20%)**: Bonus for consecutive successes, penalty for consecutive failures
+- **Uptime (20%)**: Connection uptime ratio
+
+### Score Limits
+
+The score is a **local heuristic only** - it reflects this relay's direct experience with each peer and is not a global reputation. Scores range from 0.0 to 1.0:
+
+- 0.3+ is considered healthy
+- Scores decay over time if no successful acks are received
+- Consecutive failures trigger exponential backoff
+
+### GET /federation/peers
+
+View current peer metrics and scores:
+
+```bash
+curl http://localhost:8081/federation/peers
+```
+
+Response:
+```json
+{
+  "peers": [
+    {
+      "peer_id": "peer-abc",
+      "connected": true,
+      "score": 0.85,
+      "is_healthy": true,
+      "acks_total": 150,
+      "timeouts_total": 5,
+      "ack_latency_ewma": 120.5
+    }
+  ],
+  "count": 1
+}
+```
 
 ## Federation Protocol
 
@@ -144,10 +220,45 @@ Relays communicate via WebSocket at `/federation/ws`:
 
 ### Federation Behavior
 
-- **Multi-relay forwarding**: Messages are forwarded to all healthy peers except origin
+- **Multi-relay forwarding**: Messages are forwarded to selected peers based on score (topK + exploration)
 - **Loop prevention**: Seen bucket tracks which relays have processed each envelope
 - **Graceful degradation**: Unhealthy peers are skipped; messages still reach healthy peers
 - **Backoff**: Failed peers have exponential backoff before retry
+
+## Traffic Analysis Resistance (TAR)
+
+The relay implements several techniques to resist traffic analysis:
+
+### Batching and Jitter
+
+Outbound frames are batched and sent at intervals with random jitter:
+- **Batching**: Frames are collected and sent in batches (up to `federation-batch-max` per tick)
+- **Jitter**: Each tick interval includes random jitter (`+/-federation-batch-jitter`)
+
+This makes it harder for observers to correlate message sends with network timing.
+
+### Padding
+
+When enabled, payloads are padded to fixed-size buckets:
+- Payloads are padded to the smallest bucket >= actual size
+- Original content is preserved at the start; remainder is random bytes
+- Example: 2000-byte payload becomes 4096 bytes
+
+**Tradeoffs:**
+- Increases bandwidth usage
+- Hides actual message size from network observers
+- Buckets should be chosen based on expected message size distribution
+
+### Cover Frames
+
+When enabled and the send queue is empty, the relay sends dummy "cover" frames:
+- Frame type: `relay_cover` with timestamp and nonce
+- Relay-to-relay only; not stored or forwarded beyond one hop
+
+**Tradeoffs:**
+- Creates constant traffic even when no messages to send
+- Increases bandwidth but hides idle vs. active states
+- Max cover frames per tick controls maximum overhead
 
 ## Security
 

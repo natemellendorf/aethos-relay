@@ -77,7 +77,34 @@ var (
 
 	// DescriptorMetrics tracks descriptor-related metrics.
 	DescriptorMetrics = &DescriptorMetricsGroup{}
+
+	// PeerScoreMetrics tracks peer scoring metrics.
+	PeerScoreMetrics = &PeerScoreMetricsGroup{}
 )
+
+// PeerScoreMetricsGroup holds peer scoring-related metrics.
+type PeerScoreMetricsGroup struct {
+	PeerScore    *prometheus.GaugeVec
+	PeerAcks     *prometheus.CounterVec
+	PeerTimeouts *prometheus.CounterVec
+}
+
+func init() {
+	PeerScoreMetrics.PeerScore = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "federation_peer_score",
+		Help: "Current score for a federation peer",
+	}, []string{"peer"})
+
+	PeerScoreMetrics.PeerAcks = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "federation_peer_acks_total",
+		Help: "Total acks received from a federation peer",
+	}, []string{"peer"})
+
+	PeerScoreMetrics.PeerTimeouts = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "federation_peer_timeouts_total",
+		Help: "Total timeouts for a federation peer",
+	}, []string{"peer"})
+}
 
 // FederationMetricsGroup holds federation envelope-related metrics.
 type FederationMetricsGroup struct {
@@ -266,4 +293,26 @@ func SetPeersConnected(count int) {
 
 func IncrementPeerFailures() {
 	FederationEnvelopeMetrics.PeerFailures.Inc()
+}
+
+// SetPeerScore sets the score for a specific peer.
+func SetPeerScore(peer string, score float64) {
+	PeerScoreMetrics.PeerScore.WithLabelValues(peer).Set(score)
+}
+
+// IncrementPeerAcks increments the acks counter for a specific peer.
+func IncrementPeerAcks(peer string) {
+	PeerScoreMetrics.PeerAcks.WithLabelValues(peer).Inc()
+}
+
+// IncrementPeerTimeouts increments the timeouts counter for a specific peer.
+func IncrementPeerTimeouts(peer string) {
+	PeerScoreMetrics.PeerTimeouts.WithLabelValues(peer).Inc()
+}
+
+// RemovePeerMetrics removes metrics for a specific peer.
+func RemovePeerMetrics(peer string) {
+	PeerScoreMetrics.PeerScore.DeleteLabelValues(peer)
+	PeerScoreMetrics.PeerAcks.DeleteLabelValues(peer)
+	PeerScoreMetrics.PeerTimeouts.DeleteLabelValues(peer)
 }

@@ -48,6 +48,17 @@ func main() {
 	autoPeerDiscovery := flag.Bool("auto-peer-discovery", false, "Enable automatic peer discovery via gossip (default false)")
 	descriptorStorePath := flag.String("descriptor-store-path", "", "Path to descriptor bbolt database (defaults to store-path + '.descriptors')")
 
+	// TAR (Traffic Analysis Resistance) flags
+	federationTopK := flag.Int("federation-topk", 2, "Number of top peers to forward to (default 2)")
+	federationExploreProb := flag.Float64("federation-explore-prob", 0.1, "Probability of exploring a non-topK peer (default 0.1)")
+	federationBatchInterval := flag.Duration("federation-batch-interval", 500*time.Millisecond, "Batching interval (default 500ms)")
+	federationBatchJitter := flag.Duration("federation-batch-jitter", 250*time.Millisecond, "Batching jitter range (default 250ms)")
+	federationBatchMax := flag.Int("federation-batch-max", 10, "Max frames per batch (default 10)")
+	federationPadBuckets := flag.String("federation-pad-buckets", "1024,4096,16384,65536", "Padding bucket sizes (comma-separated)")
+	federationPadEnabled := flag.Bool("federation-pad-enabled", false, "Enable payload padding (default false)")
+	federationCoverEnabled := flag.Bool("federation-cover-enabled", false, "Enable cover frames (default false)")
+	federationCoverMax := flag.Int("federation-cover-max", 3, "Max cover frames when queue empty (default 3)")
+
 	flag.Parse()
 
 	if *logJSON {
@@ -74,6 +85,45 @@ func main() {
 	log.Printf("Max envelope size: %d bytes", *maxEnvelopeSize)
 	log.Printf("Max federation peers: %d", *maxFederationPeers)
 	log.Printf("Rate limit per peer: %d req/min", *rateLimitPerPeer)
+
+	// Parse padding buckets
+	var padBuckets []int
+	if *federationPadBuckets != "" {
+		for _, b := range strings.Split(*federationPadBuckets, ",") {
+			var bucket int
+			if _, err := fmt.Sscanf(strings.TrimSpace(b), "%d", &bucket); err == nil && bucket > 0 {
+				padBuckets = append(padBuckets, bucket)
+			}
+		}
+	}
+	if len(padBuckets) == 0 {
+		padBuckets = []int{1024, 4096, 16384, 65536}
+	}
+
+	// Initialize TAR config
+	tarConfig := &federation.TARConfig{
+		BatchInterval:  *federationBatchInterval,
+		BatchJitter:    *federationBatchJitter,
+		BatchMax:       *federationBatchMax,
+		PaddingEnabled: *federationPadEnabled,
+		PadBuckets:     padBuckets,
+		CoverEnabled:   *federationCoverEnabled,
+		CoverMax:       *federationCoverMax,
+	}
+	tarConfig.Validate()
+
+	log.Printf("TAR config: batch_interval=%v, batch_jitter=%v, batch_max=%d", tarConfig.BatchInterval, tarConfig.BatchJitter, tarConfig.BatchMax)
+	log.Printf("TAR padding: enabled=%v, buckets=%v", tarConfig.PaddingEnabled, tarConfig.PadBuckets)
+	log.Printf("TAR cover: enabled=%v, max=%d", tarConfig.CoverEnabled, tarConfig.CoverMax)
+
+	// Initialize forwarding config
+	forwardingConfig := &federation.ForwardingConfig{
+		TopK:        *federationTopK,
+		ExploreProb: *federationExploreProb,
+	}
+	forwardingConfig.Validate()
+
+	log.Printf("Forwarding: topk=%d, explore_prob=%.2f", forwardingConfig.TopK, forwardingConfig.ExploreProb)
 
 	// Determine envelope store path
 	envStorePath := *envelopeStorePath
@@ -160,8 +210,8 @@ func main() {
 	clients := model.NewClientRegistry()
 	go clients.Run()
 
-	// Initialize federation peer manager
-	federationManager := federation.NewPeerManager(*relayID, bbstore, clients, maxTTL)
+	// Initialize federation peer manager with TAR and forwarding config
+	federationManager := federation.NewPeerManagerWithConfig(*relayID, bbstore, clients, maxTTL, tarConfig, forwardingConfig)
 	go federationManager.Run()
 
 	log.Println("Federation peer manager started")
@@ -234,6 +284,11 @@ func main() {
 		mux.HandleFunc("/relay/descriptors", descriptorHandler.ServeHTTP)
 		log.Println("Relay descriptor endpoint registered at /relay/descriptors")
 	}
+
+	// Register federation peers endpoint
+	federationPeersHandler := api.NewFederationPeersHandler(federationManager)
+	mux.HandleFunc("/federation/peers", federationPeersHandler.ServeHTTP)
+	log.Println("Federation peers endpoint registered at /federation/peers")
 
 	mux.HandleFunc("/", httpHandler.ServeHTTP)
 

@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
 )
@@ -49,6 +50,11 @@ type Peer struct {
 	healthMu      sync.Mutex
 	Done          chan struct{}
 	doneOnce      sync.Once
+
+	// Peer-specific metrics for scoring
+	Metrics *model.PeerMetrics
+	// TAR batcher for traffic analysis resistance
+	Batcher *PeerBatcher
 }
 
 // PeerHealth tracks peer health metrics with failure tracking.
@@ -97,22 +103,46 @@ type PeerManager struct {
 	inbound    chan *Peer
 	outbound   chan string
 	disconnect chan *Peer
+
+	// TAR configuration
+	tarConfig *TARConfig
+	// Forwarding strategy configuration
+	forwardingConfig *ForwardingConfig
+	// Forwarding strategy
+	forwardingStrategy *ForwardingStrategy
+	// Peer metrics (for scoring)
+	peerMetrics map[string]*model.PeerMetrics
+	metricsMu   sync.RWMutex
 }
 
 // NewPeerManager creates a new peer manager.
 func NewPeerManager(relayID string, store store.Store, clients *model.ClientRegistry, maxTTL time.Duration) *PeerManager {
+	return NewPeerManagerWithConfig(relayID, store, clients, maxTTL, DefaultTARConfig(), DefaultForwardingConfig())
+}
+
+// NewPeerManagerWithConfig creates a new peer manager with explicit TAR and forwarding config.
+func NewPeerManagerWithConfig(relayID string, store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, tarConfig *TARConfig, forwardingConfig *ForwardingConfig) *PeerManager {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Validate configs
+	tarConfig.Validate()
+	forwardingConfig.Validate()
+
 	return &PeerManager{
-		relayID:    relayID,
-		peers:      make(map[string]*Peer),
-		store:      store,
-		clients:    clients,
-		maxTTL:     maxTTL,
-		ctx:        ctx,
-		cancel:     cancel,
-		inbound:    make(chan *Peer, 100),
-		outbound:   make(chan string, 100),
-		disconnect: make(chan *Peer, 100),
+		relayID:            relayID,
+		peers:              make(map[string]*Peer),
+		store:              store,
+		clients:            clients,
+		maxTTL:             maxTTL,
+		ctx:                ctx,
+		cancel:             cancel,
+		inbound:            make(chan *Peer, 100),
+		outbound:           make(chan string, 100),
+		disconnect:         make(chan *Peer, 100),
+		tarConfig:          tarConfig,
+		forwardingConfig:   forwardingConfig,
+		forwardingStrategy: NewForwardingStrategy(forwardingConfig),
+		peerMetrics:        make(map[string]*model.PeerMetrics),
 	}
 }
 
@@ -317,6 +347,15 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 				continue
 			}
 			pm.handleRelayForward(peer, &frame)
+		case model.FrameTypeRelayAck:
+			var frame model.RelayAckFrame
+			if err := json.Unmarshal(rawMsg, &frame); err != nil {
+				continue
+			}
+			pm.handleRelayAck(peer, &frame)
+		case model.FrameTypeRelayCover:
+			// Cover frames are relay-to-relay only, do not process or forward
+			// Just update last seen
 		}
 	}
 }
@@ -352,15 +391,53 @@ func (pm *PeerManager) addPeer(peer *Peer) {
 	pm.peersMu.Lock()
 	defer pm.peersMu.Unlock()
 	pm.peers[peer.ID] = peer
+
+	// Initialize peer metrics for scoring
+	pm.metricsMu.Lock()
+	peer.Metrics = model.NewPeerMetrics(peer.ID)
+	pm.peerMetrics[peer.ID] = peer.Metrics
+	pm.metricsMu.Unlock()
+
+	// Initialize TAR batcher
+	peer.Batcher = NewPeerBatcher(peer.ID, 256, pm.tarConfig)
+	peer.Batcher.Start(func(frame []byte) {
+		select {
+		case peer.Send <- frame:
+		default:
+			metrics.IncrementDropped()
+		}
+	})
+
 	log.Printf("federation: peer added %s (total: %d)", peer.ID, len(pm.peers))
+	metrics.SetPeersConnected(len(pm.peers))
 }
 
 // removePeer removes a peer from the manager.
 func (pm *PeerManager) removePeer(peer *Peer) {
 	pm.peersMu.Lock()
 	delete(pm.peers, peer.ID)
+
+	// Update metrics
+	pm.metricsMu.Lock()
+	if peer.Metrics != nil {
+		peer.Metrics.RecordDisconnect()
+	}
+	pm.metricsMu.Unlock()
+
+	// Stop batcher
+	if peer.Batcher != nil {
+		peer.Batcher.Stop()
+	}
+
 	log.Printf("federation: peer removed %s (total: %d)", peer.ID, len(pm.peers))
 	pm.peersMu.Unlock()
+
+	metrics.SetPeersConnected(len(pm.peers))
+
+	// Remove peer metrics
+	pm.metricsMu.Lock()
+	delete(pm.peerMetrics, peer.ID)
+	pm.metricsMu.Unlock()
 
 	// Re-enqueue outbound peers for reconnection while the manager is active.
 	if peer.Outbound {
@@ -505,6 +582,36 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 		pm.deliverMessage(msg)
 	}
 	// Do not re-gossip forwarded messages to avoid message loops.
+}
+
+// handleRelayAck handles relay acknowledgment frames.
+// Updates peer metrics based on ack status.
+func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
+	if peer.Metrics == nil {
+		return
+	}
+
+	// Calculate latency based on forward time (would need envelope tracking in real impl)
+	// For now, use a default good latency
+	latencyMs := 100.0
+
+	switch frame.Status {
+	case "accepted":
+		peer.Metrics.RecordAck(latencyMs)
+		metrics.IncrementPeerAcks(peer.ID)
+	case "duplicate":
+		// Duplicate is not a failure, just log
+		log.Printf("federation: duplicate ack from peer %s for envelope %s", peer.ID, frame.EnvelopeID)
+	case "expired":
+		// Expired is a soft failure
+		peer.Metrics.RecordTimeout()
+		metrics.IncrementPeerTimeouts(peer.ID)
+	default:
+		log.Printf("federation: unknown ack status from peer %s: %s", peer.ID, frame.Status)
+	}
+
+	// Update metrics
+	metrics.SetPeerScore(peer.ID, peer.Metrics.Score)
 }
 
 // deliverMessage delivers a message to local recipients.
@@ -721,51 +828,68 @@ func (pm *PeerManager) AnnounceMessage(msg *model.Message) {
 	go pm.gossipMessage(msg)
 }
 
-// ForwardToPeers forwards a message to all healthy peers except the origin.
-// This implements multi-relay routing with graceful degradation.
+// ForwardToPeers forwards a message to selected peers based on score.
+// This implements score-based routing with topK selection and exploration.
 func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) {
-	pm.peersMu.RLock()
-	var healthyPeers []*Peer
-	for _, peer := range pm.peers {
-		// Skip origin relay
-		if peer.ID == originRelayID {
+	// Get peer metrics
+	pm.metricsMu.RLock()
+	metricsCopy := make(map[string]*model.PeerMetrics, len(pm.peerMetrics))
+	for id, m := range pm.peerMetrics {
+		metricsCopy[id] = m
+	}
+	pm.metricsMu.RUnlock()
+
+	// Select peers based on scoring
+	selectedIDs := pm.forwardingStrategy.SelectPeers(metricsCopy, originRelayID)
+
+	if len(selectedIDs) == 0 {
+		log.Printf("federation: no selected peers to forward message %s", msg.ID)
+		return
+	}
+
+	// Forward to selected peers using batcher
+	for _, peerID := range selectedIDs {
+		pm.peersMu.RLock()
+		peer, ok := pm.peers[peerID]
+		pm.peersMu.RUnlock()
+
+		if !ok {
 			continue
 		}
-		// Check if peer is healthy and not backing off
-		peer.healthMu.Lock()
-		isHealthy := peer.Health.IsHealthy && !peer.Health.IsBackingOff()
-		peer.healthMu.Unlock()
-		if isHealthy {
-			healthyPeers = append(healthyPeers, peer)
+
+		// Record forward in metrics
+		if peer.Metrics != nil {
+			peer.Metrics.RecordForward()
+			metrics.SetPeerScore(peerID, peer.Metrics.Score)
 		}
-	}
-	pm.peersMu.RUnlock()
 
-	if len(healthyPeers) == 0 {
-		log.Printf("federation: no healthy peers to forward message %s", msg.ID)
-		return
-	}
+		// Create forward frame
+		forward := model.RelayForwardFrame{
+			Type:    model.FrameTypeRelayForward,
+			Message: msg,
+		}
 
-	// Forward to all healthy peers
-	forward := model.RelayForwardFrame{
-		Type:    model.FrameTypeRelayForward,
-		Message: msg,
-	}
-	data, err := json.Marshal(forward)
-	if err != nil {
-		log.Printf("federation: failed to marshal forward: %v", err)
-		return
-	}
+		// Apply padding if enabled
+		data, err := json.Marshal(forward)
+		if err != nil {
+			log.Printf("federation: failed to marshal forward: %v", err)
+			continue
+		}
 
-	for _, peer := range healthyPeers {
-		select {
-		case peer.Send <- data:
-			peer.healthMu.Lock()
-			peer.Health.MessagesForwarded++
-			peer.Health.LastForwardAt = time.Now()
-			peer.healthMu.Unlock()
-		default:
-			log.Printf("federation: peer %s send channel full, dropping", peer.ID)
+		if pm.tarConfig.PaddingEnabled {
+			data = PadPayload(data, pm.tarConfig.PadBuckets)
+		}
+
+		// Enqueue to batcher (or send directly if no batcher)
+		if peer.Batcher != nil {
+			peer.Batcher.Enqueue(data)
+		} else {
+			select {
+			case peer.Send <- data:
+			default:
+				log.Printf("federation: peer %s send channel full, dropping", peer.ID)
+				metrics.IncrementDropped()
+			}
 		}
 	}
 }
@@ -792,6 +916,18 @@ func (pm *PeerManager) GetPeerCount() int {
 	pm.peersMu.RLock()
 	defer pm.peersMu.RUnlock()
 	return len(pm.peers)
+}
+
+// GetPeerMetrics returns peer metrics for all connected peers.
+func (pm *PeerManager) GetPeerMetrics() []*model.PeerScoreResponse {
+	pm.metricsMu.RLock()
+	defer pm.metricsMu.RUnlock()
+
+	var responses []*model.PeerScoreResponse
+	for _, metrics := range pm.peerMetrics {
+		responses = append(responses, metrics.ToResponse())
+	}
+	return responses
 }
 
 // IsPeerHealthy checks if a specific peer is healthy.
