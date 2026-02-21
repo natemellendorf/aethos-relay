@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/natemellendorf/aethos-relay/internal/api"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
@@ -26,6 +28,12 @@ func main() {
 	maxTTLSecs := flag.Int("max-ttl-seconds", 604800, "Maximum TTL in seconds (default 7 days)")
 	logJSON := flag.Bool("log-json", false, "JSON logging output")
 	autoPeerDiscovery := flag.Bool("auto-peer-discovery", false, "Enable automatic dialing of discovered relays")
+	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated list of allowed WebSocket origins (e.g., 'https://app.aethos.io,https://aethos.app')")
+	devMode := flag.Bool("dev-mode", false, "Enable development mode (allows all origins, for local development only)")
+
+	// Relay ID flag
+	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
+
 	flag.Parse()
 
 	if *logJSON {
@@ -34,13 +42,21 @@ func main() {
 		log.SetOutput(os.Stderr)
 	}
 
+	// Generate relay ID if not provided
+	if *relayID == "" {
+		*relayID = uuid.New().String()
+	}
+
 	log.Printf("Starting aethos-relay server...")
+	log.Printf("Relay ID: %s", *relayID)
 	log.Printf("WebSocket addr: %s", *wsAddr)
 	log.Printf("HTTP addr: %s", *httpAddr)
 	log.Printf("Store path: %s", *storePath)
 	log.Printf("Sweep interval: %s", *sweepInterval)
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
 	log.Printf("Auto peer discovery: %v", *autoPeerDiscovery)
+	log.Printf("Allowed origins: %s", *allowedOrigins)
+	log.Printf("Dev mode: %v", *devMode)
 
 	// Initialize store with descriptor support
 	bbstore := store.NewBBoltDescriptorStore(*storePath)
@@ -73,16 +89,17 @@ func main() {
 	clients := model.NewClientRegistry()
 	go clients.Run()
 
-	// Initialize handlers
-	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL)
-	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)
-
-	// Initialize relay federation handler (relay-only)
+	// Initialize relay federation handler (relay-to-relay gossip)
 	relayHandler := api.NewRelayFederationHandler(bbstore, clients, maxTTL)
 	relayHandler.Start(ctx)
 	defer relayHandler.Stop()
 
 	log.Println("Relay federation handler started")
+
+	// Initialize handlers
+	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL, *allowedOrigins, *devMode)
+	wsHandler.SetRelayHandler(relayHandler)
+	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)
 
 	// Set up HTTP server with WebSocket and API handlers
 	mux := http.NewServeMux()
@@ -127,6 +144,7 @@ func main() {
 	cancel()
 	sweeper.Stop()
 	descriptorSweeper.Stop()
+	relayHandler.Stop()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

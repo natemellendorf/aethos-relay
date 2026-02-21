@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,8 +16,33 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/store"
 )
 
+// originChecker checks if the request origin is allowed.
+func (h *WSHandler) checkOrigin(r *http.Request) bool {
+	// Dev mode allows all origins
+	if h.devMode {
+		return true
+	}
+	// If no origins configured, allow all (backwards compatible)
+	if h.allowedOrigins == "" {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// No origin header - same-origin request
+		return true
+	}
+	// Check against allowed list
+	for _, allowed := range strings.Split(h.allowedOrigins, ",") {
+		if strings.TrimSpace(allowed) == origin {
+			return true
+		}
+	}
+	return false
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
+		// Dev mode allows all origins
 		return true // Allow all origins for development
 	},
 	ReadBufferSize:  1024,
@@ -25,22 +51,38 @@ var upgrader = websocket.Upgrader{
 
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
-	store   store.Store
-	clients *model.ClientRegistry
-	maxTTL  time.Duration
+	store          store.Store
+	clients        *model.ClientRegistry
+	maxTTL         time.Duration
+	allowedOrigins string
+	devMode        bool
+	relayHandler   *RelayFederationHandler
 }
 
 // NewWSHandler creates a new WebSocket handler.
-func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration) *WSHandler {
+func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, allowedOrigins string, devMode bool) *WSHandler {
 	return &WSHandler{
-		store:   store,
-		clients: clients,
-		maxTTL:  maxTTL,
+		store:          store,
+		clients:        clients,
+		maxTTL:         maxTTL,
+		allowedOrigins: allowedOrigins,
+		devMode:        devMode,
 	}
+}
+
+// SetRelayHandler sets the relay federation handler for relay-to-relay messaging.
+func (h *WSHandler) SetRelayHandler(relayHandler *RelayFederationHandler) {
+	h.relayHandler = relayHandler
 }
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
 func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Check origin before upgrading
+	if !h.checkOrigin(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws: failed to upgrade: %v", err)
