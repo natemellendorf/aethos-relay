@@ -124,3 +124,35 @@ PR body should include:
 - What changed
 - How it was verified (tests/build)
 - Follow-ups / next beads (if discovered)
+
+## Repository Hygiene
+
+This project requires strict hygiene to avoid committing artifacts:
+
+### Prohibited Files
+- **Never commit compiled binaries**: Do not commit `/relay`, `/bin/`, `/dist/`, `/build/`, `*.exe`, `*.out`, `*.test`
+- **Never commit database files**: Do not commit `relay.db`, `relay.db.descriptors`, or any local datastore files
+- **Never commit logs**: Do not commit `*.log`, `coverage.out`
+- **Never commit `.beads/*`**: This directory should never exist in this repo
+
+### Gitignore
+- Ensure `.gitignore` includes all binary/artifact patterns
+- CI builds binaries only - they are published as releases, not committed
+
+### Before Committing
+- Run `git status` to verify no forbidden files are staged
+- Verify build artifacts are in .gitignore
+- Ensure no local database files are staged
+
+## Pre-Commit Checklist
+
+Before committing, verify:
+
+- [ ] No `.beads/*` files are staged or present
+- [ ] No compiled binaries (`relay`, `*.exe`, `*.out`, `*.test`) are staged
+- [ ] No local database files (`relay.db`, `*.db.descriptors`) are staged
+- [ ] No log files (`*.log`, `coverage.out`) are staged
+- [ ] `go test ./...` passes
+- [ ] `go vet ./...` passes
+- [ ] `go build ./cmd/relay` succeeds
+- [ ] Code follows Go conventions (run `gofmt` if unsure)
