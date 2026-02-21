@@ -483,4 +483,3 @@ func TestIsRelayFrameType(t *testing.T) {
 		t.Error("IsClientAllowedFrameType(\"\") = true, want false")
 	}
 }
-
