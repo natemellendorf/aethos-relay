@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/natemellendorf/aethos-relay/internal/api"
+	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -27,12 +29,13 @@ func main() {
 	sweepInterval := flag.Duration("sweep-interval", 30*time.Second, "TTL sweeper interval")
 	maxTTLSecs := flag.Int("max-ttl-seconds", 604800, "Maximum TTL in seconds (default 7 days)")
 	logJSON := flag.Bool("log-json", false, "JSON logging output")
-	autoPeerDiscovery := flag.Bool("auto-peer-discovery", false, "Enable automatic dialing of discovered relays")
 	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated list of allowed WebSocket origins (e.g., 'https://app.aethos.io,https://aethos.app')")
 	devMode := flag.Bool("dev-mode", false, "Enable development mode (allows all origins, for local development only)")
 
-	// Relay ID flag
+	// Federation flags
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
+	peerURLs := flag.String("peer", "", "Comma-separated list of peer relay WebSocket URLs")
+	maxFederationConns := flag.Int("max-federation-conns", 100, "Maximum concurrent inbound federation connections")
 
 	flag.Parse()
 
@@ -54,12 +57,11 @@ func main() {
 	log.Printf("Store path: %s", *storePath)
 	log.Printf("Sweep interval: %s", *sweepInterval)
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
-	log.Printf("Auto peer discovery: %v", *autoPeerDiscovery)
 	log.Printf("Allowed origins: %s", *allowedOrigins)
 	log.Printf("Dev mode: %v", *devMode)
 
-	// Initialize store with descriptor support
-	bbstore := store.NewBBoltDescriptorStore(*storePath)
+	// Initialize store
+	bbstore := store.NewBBoltStore(*storePath)
 	if err := bbstore.Open(); err != nil {
 		log.Fatalf("Failed to open store: %v", err)
 	}
@@ -79,32 +81,48 @@ func main() {
 
 	log.Println("TTL sweeper started")
 
-	// Initialize descriptor sweeper
-	descriptorSweeper := store.NewDescriptorSweeper(bbstore, *sweepInterval)
-	go descriptorSweeper.Start(ctx)
-
-	log.Println("Descriptor sweeper started")
-
 	// Initialize client registry
 	clients := model.NewClientRegistry()
 	go clients.Run()
 
-	// Initialize relay federation handler (relay-to-relay gossip)
-	relayHandler := api.NewRelayFederationHandler(bbstore, clients, maxTTL)
-	relayHandler.Start(ctx)
-	defer relayHandler.Stop()
+	// Initialize federation peer manager
+	federationManager := federation.NewPeerManager(*relayID, bbstore, clients, maxTTL)
+	go federationManager.Run()
 
-	log.Println("Relay federation handler started")
+	log.Println("Federation peer manager started")
+
+	// Connect to configured peers
+	if *peerURLs != "" {
+		peerList := strings.Split(*peerURLs, ",")
+		for _, peerURL := range peerList {
+			peerURL = strings.TrimSpace(peerURL)
+			if peerURL != "" {
+				log.Printf("Connecting to peer: %s", peerURL)
+				federationManager.AddPeerURL(peerURL)
+			}
+		}
+	}
 
 	// Initialize handlers
 	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL, *allowedOrigins, *devMode)
-	wsHandler.SetRelayHandler(relayHandler)
+	wsHandler.SetFederationManager(federationManager)
 	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)
 
 	// Set up HTTP server with WebSocket and API handlers
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler.HandleWebSocket)
-	mux.HandleFunc("/relay", relayHandler.HandleRelayWebSocket) // Relay-to-relay federation
+
+	// Limit concurrent inbound federation connections to prevent resource exhaustion.
+	federationSem := make(chan struct{}, *maxFederationConns)
+	mux.HandleFunc("/federation", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case federationSem <- struct{}{}:
+			defer func() { <-federationSem }()
+			federationManager.HandleInboundPeer(w, r)
+		default:
+			http.Error(w, "Too many concurrent federation connections", http.StatusServiceUnavailable)
+		}
+	})
 	mux.HandleFunc("/", httpHandler.ServeHTTP)
 
 	httpServer := &http.Server{
@@ -135,6 +153,8 @@ func main() {
 		}()
 	}
 
+	log.Println("Federation peer service ready")
+
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -143,8 +163,7 @@ func main() {
 	log.Println("Shutting down...")
 	cancel()
 	sweeper.Stop()
-	descriptorSweeper.Stop()
-	relayHandler.Stop()
+	federationManager.Stop()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

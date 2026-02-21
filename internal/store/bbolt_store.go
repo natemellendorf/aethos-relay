@@ -26,6 +26,9 @@ var (
 	MetaLastSweep = []byte("last_sweep")
 
 	ErrInvalidKey = errors.New("invalid key format")
+
+	// recipientDelimiter is the null byte used to separate components in composite keys.
+	recipientDelimiter = string(rune(0))
 )
 
 // BBoltStore implements Store using bbolt.
@@ -117,14 +120,14 @@ func (s *BBoltStore) PersistMessage(ctx context.Context, msg *model.Message) err
 	})
 }
 
-// GetQueuedMessages retrieves undelivered messages for a recipient.
-func (s *BBoltStore) GetQueuedMessages(ctx context.Context, to string, limit int) ([]*model.Message, error) {
+// GetQueuedMessages retrieves messages for a recipient that haven't been delivered to this specific wayfarer.
+func (s *BBoltStore) GetQueuedMessages(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
 	var messages []*model.Message
 
 	err := s.db.View(func(tx *bolt.Tx) error {
 		// Prefix scan the queue bucket
 		c := tx.Bucket(BucketQueueByRecipient).Cursor()
-		prefix := []byte(to + string(rune(0)))
+		prefix := []byte(recipientID + recipientDelimiter)
 
 		count := 0
 		for k, v := c.Seek(prefix); k != nil && count < limit; k, v = c.Next() {
@@ -147,8 +150,10 @@ func (s *BBoltStore) GetQueuedMessages(ctx context.Context, to string, limit int
 				continue // Skip malformed messages
 			}
 
-			// Only return undelivered messages
-			if !msg.Delivered {
+			// Check per-device delivery state - only return if not delivered to this specific recipient
+			deliveryKey := EncodeDeliveryKey(msgID, recipientID)
+			delivered := tx.Bucket(BucketDeliveryState).Get(deliveryKey)
+			if delivered == nil {
 				messages = append(messages, msg)
 			}
 			count++
@@ -159,8 +164,9 @@ func (s *BBoltStore) GetQueuedMessages(ctx context.Context, to string, limit int
 	return messages, err
 }
 
-// MarkDelivered marks a message as delivered.
-func (s *BBoltStore) MarkDelivered(ctx context.Context, msgID string) error {
+// MarkDelivered marks a message as delivered to a specific recipient.
+// This enables per-device delivery tracking.
+func (s *BBoltStore) MarkDelivered(ctx context.Context, msgID string, recipientID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
 		if msgBytes == nil {
@@ -172,26 +178,40 @@ func (s *BBoltStore) MarkDelivered(ctx context.Context, msgID string) error {
 			return xerrors.Errorf("failed to decode message: %w", err)
 		}
 
-		msg.Delivered = true
+		// Store per-device delivery state with composite key: msgID|recipientID
+		deliveryKey := EncodeDeliveryKey(msgID, recipientID)
 		now := time.Now()
-		msg.DeliveredAt = &now
-
-		// Update message
-		updatedBytes, err := EncodeMessage(msg)
-		if err != nil {
-			return xerrors.Errorf("failed to encode message: %w", err)
-		}
-		if err := tx.Bucket(BucketMessages).Put([]byte(msgID), updatedBytes); err != nil {
-			return xerrors.Errorf("failed to update message: %w", err)
-		}
-
-		// Store delivery state (simplified - just mark as delivered)
-		if err := tx.Bucket(BucketDeliveryState).Put([]byte(msgID), []byte("delivered")); err != nil {
+		nowBytes, _ := now.MarshalBinary()
+		if err := tx.Bucket(BucketDeliveryState).Put(deliveryKey, nowBytes); err != nil {
 			return xerrors.Errorf("failed to update delivery state: %w", err)
+		}
+
+		// Update message DeliveredAt if this is the first delivery
+		if msg.DeliveredAt == nil {
+			msg.DeliveredAt = &now
+			updatedBytes, err := EncodeMessage(msg)
+			if err != nil {
+				return xerrors.Errorf("failed to encode message: %w", err)
+			}
+			if err := tx.Bucket(BucketMessages).Put([]byte(msgID), updatedBytes); err != nil {
+				return xerrors.Errorf("failed to update message: %w", err)
+			}
 		}
 
 		return nil
 	})
+}
+
+// IsDeliveredTo checks if a message has been delivered to a specific recipient.
+func (s *BBoltStore) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	var delivered bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		deliveryKey := EncodeDeliveryKey(msgID, recipientID)
+		result := tx.Bucket(BucketDeliveryState).Get(deliveryKey)
+		delivered = result != nil
+		return nil
+	})
+	return delivered, err
 }
 
 // RemoveMessage removes a message from all buckets.
@@ -305,4 +325,72 @@ func (s *BBoltStore) SetLastSweepTime(ctx context.Context, t time.Time) error {
 		}
 		return tx.Bucket(BucketMeta).Put(MetaLastSweep, v)
 	})
+}
+
+// GetMessageByID retrieves a message by its ID.
+func (s *BBoltStore) GetMessageByID(ctx context.Context, msgID string) (*model.Message, error) {
+	var msg *model.Message
+	err := s.db.View(func(tx *bolt.Tx) error {
+		msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+		if msgBytes == nil {
+			return fmt.Errorf("message not found: %s", msgID)
+		}
+		var err error
+		msg, err = DecodeMessage(msgBytes)
+		if err != nil {
+			return xerrors.Errorf("failed to decode message: %w", err)
+		}
+		return nil
+	})
+	return msg, err
+}
+
+// GetAllRecipientIDs returns all unique recipient IDs with queued messages.
+func (s *BBoltStore) GetAllRecipientIDs(ctx context.Context) ([]string, error) {
+	var recipientIDs []string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		seen := make(map[string]bool)
+		c := tx.Bucket(BucketQueueByRecipient).Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			// Extract recipient ID from queue key (format: recipient\x00timestamp\x00msgid)
+			parts := bytes.Split(k, []byte{0})
+			if len(parts) < 1 {
+				continue
+			}
+			recipient := string(parts[0])
+			if !seen[recipient] {
+				seen[recipient] = true
+				recipientIDs = append(recipientIDs, recipient)
+			}
+		}
+		return nil
+	})
+	return recipientIDs, err
+}
+
+// GetAllQueuedMessageIDs returns all queued message IDs for a recipient without a limit.
+func (s *BBoltStore) GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error) {
+	var ids []string
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(BucketQueueByRecipient).Cursor()
+		prefix := []byte(to + recipientDelimiter)
+
+		for k, v := c.Seek(prefix); k != nil; k, v = c.Next() {
+			if len(k) < len(prefix) || string(k[:len(prefix)]) != string(prefix) {
+				break
+			}
+
+			msgID := string(v)
+			msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+			if msgBytes == nil {
+				continue
+			}
+
+			ids = append(ids, msgID)
+		}
+		return nil
+	})
+
+	return ids, err
 }

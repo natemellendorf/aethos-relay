@@ -11,76 +11,99 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
 )
 
-// originChecker checks if the request origin is allowed.
-func (h *WSHandler) checkOrigin(r *http.Request) bool {
+// OriginChecker validates WebSocket origin against an allowlist.
+type OriginChecker struct {
+	allowedOrigins map[string]bool
+	devMode        bool
+}
+
+// NewOriginChecker creates a new origin checker.
+// allowedOrigins is a comma-separated list of allowed origins (e.g., "https://app.aethos.io,https://aethos.app")
+// devMode when true allows all origins (for local development)
+func NewOriginChecker(allowedOrigins string, devMode bool) *OriginChecker {
+	oc := &OriginChecker{
+		allowedOrigins: make(map[string]bool),
+		devMode:        devMode,
+	}
+	// In dev mode, allow all origins
+	if devMode {
+		return oc
+	}
+	// Parse allowed origins
+	for _, origin := range strings.Split(allowedOrigins, ",") {
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			oc.allowedOrigins[origin] = true
+		}
+	}
+	return oc
+}
+
+// Check validates if the origin is allowed.
+func (oc *OriginChecker) Check(r *http.Request) bool {
 	// Dev mode allows all origins
-	if h.devMode {
+	if oc.devMode {
 		return true
 	}
-	// If no origins configured, allow all (backwards compatible)
-	if h.allowedOrigins == "" {
-		return true
+	// If no origins configured, deny all
+	if len(oc.allowedOrigins) == 0 {
+		return false
 	}
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		// No origin header - same-origin request
+		// No origin header - check if it's a same-origin request
 		return true
 	}
-	// Check against allowed list
-	for _, allowed := range strings.Split(h.allowedOrigins, ",") {
-		if strings.TrimSpace(allowed) == origin {
-			return true
-		}
-	}
-	return false
-}
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// Dev mode allows all origins
-		return true // Allow all origins for development
-	},
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	return oc.allowedOrigins[origin]
 }
 
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
-	store          store.Store
-	clients        *model.ClientRegistry
-	maxTTL         time.Duration
-	allowedOrigins string
-	devMode        bool
-	relayHandler   *RelayFederationHandler
+	store             store.Store
+	clients           *model.ClientRegistry
+	maxTTL            time.Duration
+	originChecker     *OriginChecker
+	federationManager *federation.PeerManager
 }
 
 // NewWSHandler creates a new WebSocket handler.
+// allowedOrigins is a comma-separated list of allowed origins.
+// devMode enables relaxed origin checking for local development.
 func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, allowedOrigins string, devMode bool) *WSHandler {
+	originChecker := NewOriginChecker(allowedOrigins, devMode)
 	return &WSHandler{
-		store:          store,
-		clients:        clients,
-		maxTTL:         maxTTL,
-		allowedOrigins: allowedOrigins,
-		devMode:        devMode,
+		store:         store,
+		clients:       clients,
+		maxTTL:        maxTTL,
+		originChecker: originChecker,
 	}
 }
 
-// SetRelayHandler sets the relay federation handler for relay-to-relay messaging.
-func (h *WSHandler) SetRelayHandler(relayHandler *RelayFederationHandler) {
-	h.relayHandler = relayHandler
+// SetFederationManager sets the federation peer manager for relaying messages.
+func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
+	h.federationManager = mgr
 }
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
 func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Check origin before upgrading
-	if !h.checkOrigin(r) {
+	if !h.originChecker.Check(r) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
+	}
+
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Origin already validated above
+		},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -158,6 +181,12 @@ func (h *WSHandler) writePump(client *model.Client) {
 // handleFrame handles incoming WebSocket frames.
 func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 	metrics.IncrementReceived()
+
+	// Reject relay-only frame types on client connections.
+	if model.IsRelayFrameType(frame.Type) {
+		h.sendError(client, "relay frame type not allowed on client connections")
+		return
+	}
 
 	switch frame.Type {
 	case model.FrameTypeHello:
@@ -257,6 +286,11 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		MsgID: msg.ID,
 		At:    msg.CreatedAt.Unix(),
 	})
+
+	// Announce to federation peers (if federation is enabled)
+	if h.federationManager != nil {
+		h.federationManager.AnnounceMessage(msg)
+	}
 }
 
 // handleAck handles the ack frame.
@@ -270,8 +304,8 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	// Mark as delivered in store
-	if err := h.store.MarkDelivered(context.Background(), frame.MsgID); err != nil {
+	// Mark as delivered to this specific recipient in store
+	if err := h.store.MarkDelivered(context.Background(), frame.MsgID, client.WayfarerID); err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, "failed to acknowledge message")
 		return
@@ -347,8 +381,8 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			PayloadB64: msg.Payload,
 			At:         msg.CreatedAt.Unix(),
 		})
-		// Mark as delivered
-		if err := h.store.MarkDelivered(context.Background(), msg.ID); err != nil {
+		// Mark as delivered to this specific recipient
+		if err := h.store.MarkDelivered(context.Background(), msg.ID, r.WayfarerID); err != nil {
 			metrics.IncrementStoreErrors()
 			log.Printf("ws: failed to mark delivered: %v", err)
 			continue

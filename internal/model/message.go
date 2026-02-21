@@ -43,9 +43,6 @@ type WSFrame struct {
 	Limit      int       `json:"limit,omitempty"`
 	Messages   []Message `json:"messages,omitempty"`
 	At         int64     `json:"at,omitempty"`
-	// Relay federation fields (relay-only, not exposed to clients)
-	RelayDescriptors    []RelayDescriptor    `json:"relay_descriptors,omitempty"`
-	RelayDescriptorAcks []RelayDescriptorAck `json:"relay_descriptor_acks,omitempty"`
 }
 
 // Frame types (protocol v1)
@@ -60,7 +57,64 @@ const (
 	FrameTypePull     = "pull"
 	FrameTypeMessages = "messages"
 	FrameTypeError    = "error"
+
+	// Relay-to-relay federation frames (clients must never receive these)
+	FrameTypeRelayHello     = "relay_hello"
+	FrameTypeRelayInventory = "relay_inventory"
+	FrameTypeRelayRequest   = "relay_request"
+	FrameTypeRelayForward   = "relay_forward"
+	FrameTypeRelayOK        = "relay_ok"
 )
+
+// RelayHelloFrame is the initial handshake between relays.
+type RelayHelloFrame struct {
+	Type    string `json:"type"`
+	RelayID string `json:"relay_id"`
+	Version string `json:"version"`
+}
+
+// RelayInventoryFrame carries message IDs known by a relay for a recipient.
+type RelayInventoryFrame struct {
+	Type        string   `json:"type"`
+	RecipientID string   `json:"recipient_id"`
+	MessageIDs  []string `json:"message_ids"`
+}
+
+// RelayRequestFrame requests full messages for given IDs.
+type RelayRequestFrame struct {
+	Type       string   `json:"type"`
+	MessageIDs []string `json:"message_ids"`
+}
+
+// RelayForwardFrame carries a full message to be forwarded.
+type RelayForwardFrame struct {
+	Type    string   `json:"type"`
+	Message *Message `json:"message"`
+}
+
+// IsRelayFrameType reports whether the given frame type is reserved for relay-to-relay
+// federation and therefore must never be sent to or handled as a client frame.
+func IsRelayFrameType(frameType string) bool {
+	switch frameType {
+	case FrameTypeRelayHello,
+		FrameTypeRelayInventory,
+		FrameTypeRelayRequest,
+		FrameTypeRelayForward,
+		FrameTypeRelayOK:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsClientAllowedFrameType reports whether the given frame type is valid on client
+// connections. Callers should reject frames where this returns false.
+func IsClientAllowedFrameType(frameType string) bool {
+	if frameType == "" {
+		return false
+	}
+	return !IsRelayFrameType(frameType)
+}
 
 // Client represents a connected WebSocket client.
 type Client struct {
