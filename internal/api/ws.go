@@ -70,6 +70,7 @@ type WSHandler struct {
 	maxTTL            time.Duration
 	originChecker     *OriginChecker
 	federationManager *federation.PeerManager
+	autoDeliverQueued bool
 }
 
 // NewWSHandler creates a new WebSocket handler.
@@ -78,16 +79,23 @@ type WSHandler struct {
 func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, allowedOrigins string, devMode bool) *WSHandler {
 	originChecker := NewOriginChecker(allowedOrigins, devMode)
 	return &WSHandler{
-		store:         store,
-		clients:       clients,
-		maxTTL:        maxTTL,
-		originChecker: originChecker,
+		store:             store,
+		clients:           clients,
+		maxTTL:            maxTTL,
+		originChecker:     originChecker,
+		autoDeliverQueued: true,
 	}
 }
 
 // SetFederationManager sets the federation peer manager for relaying messages.
 func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
 	h.federationManager = mgr
+}
+
+// SetAutoDeliverQueued controls automatic queued delivery on hello.
+// This defaults to true and exists to enable deterministic integration tests.
+func (h *WSHandler) SetAutoDeliverQueued(enabled bool) {
+	h.autoDeliverQueued = enabled
 }
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
@@ -218,7 +226,9 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 	h.send(client, model.WSFrame{Type: model.FrameTypeHelloOK})
 
 	// Deliver any queued messages
-	go h.deliverQueuedMessages(client)
+	if h.autoDeliverQueued {
+		go h.deliverQueuedMessages(client)
+	}
 }
 
 // handleSend handles the send frame.
@@ -258,6 +268,7 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 
 	// Check if recipient is online
 	online := h.clients.IsOnline(frame.To)
+	log.Printf("ws: send msg_id=%s from=%s to=%s ttl=%ds online=%t", msg.ID, msg.From, msg.To, int(ttl.Seconds()), online)
 
 	if online {
 		// Deliver immediately - but still persist for durability
@@ -311,6 +322,8 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 	metrics.IncrementDelivered()
+
+	log.Printf("ws: ack msg_id=%s from=%s to=%s ttl=%ds", frame.MsgID, client.WayfarerID, client.WayfarerID, 0)
 
 	// Send ack_ok
 	h.send(client, model.WSFrame{
@@ -374,6 +387,11 @@ func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
 func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 	recipients := h.clients.GetClients(msg.To)
 	for _, r := range recipients {
+		remainingTTL := int(time.Until(msg.ExpiresAt).Seconds())
+		if remainingTTL < 0 {
+			remainingTTL = 0
+		}
+		log.Printf("ws: deliver msg_id=%s from=%s to=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, remainingTTL)
 		h.send(r, model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
