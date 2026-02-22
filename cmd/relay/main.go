@@ -23,6 +23,15 @@ import (
 )
 
 func main() {
+	boolFlags := map[string]struct{}{
+		"log-json":                 {},
+		"dev-mode":                 {},
+		"auto-peer-discovery":      {},
+		"federation-pad-enabled":   {},
+		"federation-cover-enabled": {},
+	}
+	os.Args = normalizeBoolFlagArgs(os.Args, boolFlags)
+
 	// Parse flags
 	wsAddr := flag.String("ws-addr", ":8080", "WebSocket server address")
 	httpAddr := flag.String("http-addr", ":8081", "HTTP server address")
@@ -356,4 +365,37 @@ func main() {
 
 	log.Println("Server stopped")
 	fmt.Println("aethos-relay stopped gracefully")
+}
+
+func normalizeBoolFlagArgs(args []string, boolFlags map[string]struct{}) []string {
+	if len(args) <= 1 {
+		return args
+	}
+
+	normalized := make([]string, 0, len(args))
+	normalized = append(normalized, args[0])
+
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			normalized = append(normalized, args[i:]...)
+			break
+		}
+
+		if strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") {
+			flagName := strings.TrimLeft(arg, "-")
+			if _, ok := boolFlags[flagName]; ok && i+1 < len(args) {
+				next := strings.ToLower(args[i+1])
+				if next == "true" || next == "false" {
+					normalized = append(normalized, arg+"="+next)
+					i++
+					continue
+				}
+			}
+		}
+
+		normalized = append(normalized, arg)
+	}
+
+	return normalized
 }
