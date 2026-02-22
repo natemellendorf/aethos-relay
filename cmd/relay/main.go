@@ -188,7 +188,7 @@ func main() {
 	var gossipEngine *gossip.GossipEngine
 
 	if *autoPeerDiscovery {
-		descriptorStore = store.NewBBoltDescriptorStore(*descriptorStorePath)
+		descriptorStore = store.NewBBoltDescriptorStore(descStorePath)
 		if err := descriptorStore.Open(); err != nil {
 			log.Fatalf("Failed to open descriptor store: %v", err)
 		}
