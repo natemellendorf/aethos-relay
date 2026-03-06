@@ -332,7 +332,7 @@ func TestRelayAckTracksForwardingOutcomeOnly(t *testing.T) {
 	}
 }
 
-func TestExpiryHandlingForPullAndEnvelopeSweep(t *testing.T) {
+func TestCurrentExpiryBehaviorForPullAndEnvelopeSweep(t *testing.T) {
 	h := newEngineHarness(t, time.Hour)
 
 	persistTestMessage(t, h, &model.Message{
@@ -354,10 +354,23 @@ func TestExpiryHandlingForPullAndEnvelopeSweep(t *testing.T) {
 
 	pulled, err := h.engine.PullForDeliveryIdentity(context.Background(), "bob", 10)
 	if err != nil {
-		t.Fatalf("pull for expiry filtering: %v", err)
+		t.Fatalf("pull for expiry behavior: %v", err)
 	}
-	if len(pulled) != 1 || pulled[0].ID != "active-msg" {
-		t.Fatalf("expected only active message on pull, got %+v", pulled)
+	if len(pulled) != 2 {
+		t.Fatalf("expected pull to include queued expired message before sweep, got %+v", pulled)
+	}
+	foundExpired := false
+	foundActive := false
+	for _, msg := range pulled {
+		if msg.ID == "expired-msg" {
+			foundExpired = true
+		}
+		if msg.ID == "active-msg" {
+			foundActive = true
+		}
+	}
+	if !foundExpired || !foundActive {
+		t.Fatalf("expected both active and expired messages on pull, got %+v", pulled)
 	}
 
 	if err := h.envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{

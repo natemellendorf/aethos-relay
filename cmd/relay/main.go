@@ -221,7 +221,6 @@ func main() {
 
 	// Initialize federation peer manager with TAR and forwarding config
 	federationManager := federation.NewPeerManagerWithConfig(*relayID, bbstore, clients, maxTTL, tarConfig, forwardingConfig)
-	federationManager.SetEnvelopeStore(envelopeStore)
 	go federationManager.Run()
 
 	log.Println("Federation peer manager started")

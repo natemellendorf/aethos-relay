@@ -3,7 +3,6 @@ package federation
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"net/http"
 	"sync"
@@ -855,21 +854,6 @@ func (pm *PeerManager) AnnounceMessage(msg *model.Message) {
 // ForwardToPeers forwards a message to selected peers based on score.
 // This implements score-based routing with topK selection and exploration.
 func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) {
-	ctx := context.Background()
-	envelope, err := pm.engine.PrepareForwardingEnvelope(ctx, msg, pm.forwardingConfig.MaxHops)
-	if err != nil {
-		if errors.Is(err, model.ErrEnvelopeHopLimitExceeded) {
-			log.Printf("federation: hop limit exceeded for message %s", msg.ID)
-			return
-		}
-		if errors.Is(err, model.ErrEnvelopeExpired) {
-			log.Printf("federation: message %s expired before forwarding", msg.ID)
-			return
-		}
-		log.Printf("federation: failed to prepare forwarding envelope %s: %v", msg.ID, err)
-		return
-	}
-
 	// Get peer metrics
 	pm.metricsMu.RLock()
 	metricsCopy := make(map[string]*model.PeerMetrics, len(pm.peerMetrics))
@@ -888,15 +872,6 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 
 	// Forward to selected peers using batcher
 	for _, peerID := range selectedIDs {
-		allow, err := pm.engine.ReserveForwardingCandidate(ctx, envelope.ID, peerID)
-		if err != nil {
-			log.Printf("federation: failed to reserve forwarding candidate peer=%s envelope=%s: %v", peerID, envelope.ID, err)
-			continue
-		}
-		if !allow {
-			continue
-		}
-
 		pm.peersMu.RLock()
 		peer, ok := pm.peers[peerID]
 		pm.peersMu.RUnlock()

@@ -8,12 +8,12 @@ The engine currently owns these responsibilities:
 
 1. Accept client `send` input and build a persisted message with relay-side TTL clamping.
 2. Persist queued messages in the message store for durability.
-3. Serve client `pull` by reading queued messages for a destination identity and filtering expired entries at read time.
+3. Serve client `pull` by reading queued messages for a destination identity using store semantics.
 4. Record client delivery acknowledgements (`ack`) as delivery-state entries for the connection identity used by the caller.
 5. Track per-delivery-identity delivery state so one identity acknowledgement does not automatically acknowledge another identity.
 6. Handle inbound federation forwards (`relay_forward`, currently carrying `message` in this implementation) with validation, duplicate checks, expiry checks, and persistence.
 7. Maintain federation envelope state (ID, destination, origin, hop count, expiry) when an envelope store is configured.
-8. Select/prepare forwarding candidates by reserving `(envelope_id, relay_id)` seen markers before sending to a peer.
+8. Provide optional helpers for envelope hop/seen state when an envelope store is explicitly configured.
 9. Process relay-to-relay receipts (`relay_ack`) as forwarding telemetry only.
 10. Sweep expired envelopes from the envelope store when requested.
 
@@ -27,7 +27,7 @@ The engine does not change wire frame names, field names, or frame encodings. Cl
 - `envelope`: internal federation record used for hop count, seen tracking, origin metadata, and expiry.
 - `federation receipt`: `relay_ack` status from one relay to another about forwarding acceptance/handling.
 - `expiry`: absolute `expires_at` timestamp carried by message/envelope and used to drop/sweep stale data.
-- `forwarding candidate`: peer relay selected by forwarding strategy and accepted by seen-tracking reservation.
+- `forwarding candidate`: peer relay selected by the existing forwarding strategy.
 
 ## Behavior Notes (As Implemented)
 
@@ -35,10 +35,10 @@ The engine does not change wire frame names, field names, or frame encodings. Cl
 - Client `ack` is delivery acknowledgement for the client/identity path invoking `ack` (not a federation receipt).
 - Federation `relay_ack` is relay-to-relay envelope/message handling telemetry and does not mark client delivery state.
 - Federation forwarding preserves the original message expiry when deriving/storing envelope state.
-- Hop count is tracked in internal envelope state and incremented per outbound forward attempt; configured max hop limits are enforced when envelope state is available.
-- Seen tracking is recorded as `(envelope_id, relay_id)` and used to avoid forwarding loops to the same relay.
-- Inbound forwarded payloads are dropped when malformed, oversized, duplicate, already expired, or already seen from that relay.
-- Expired messages are filtered out on pull responses, and expired envelopes are removable via sweep operations.
+- The current peer forwarding path keeps origin behavior: no hop-limit enforcement is applied during `ForwardToPeers`.
+- Inbound `relay_forward` keeps origin validation gates: malformed, oversized, duplicate, or expired payloads are dropped.
+- Pulled queues can include expired messages until normal message TTL cleanup removes them.
+- Expired envelopes are removable via envelope sweep operations.
 
 ## Package Layout
 

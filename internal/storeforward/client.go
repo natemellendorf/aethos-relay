@@ -71,23 +71,12 @@ func (e *Engine) PullForDeliveryIdentity(ctx context.Context, deliveryIdentity s
 		return nil, err
 	}
 
-	now := e.nowUTC()
 	if deliveryIdentity == queueRecipient {
-		var filtered []*model.Message
-		for _, msg := range messages {
-			if now.After(msg.ExpiresAt) {
-				continue
-			}
-			filtered = append(filtered, msg)
-		}
-		return filtered, nil
+		return messages, nil
 	}
 
 	var filtered []*model.Message
 	for _, msg := range messages {
-		if now.After(msg.ExpiresAt) {
-			continue
-		}
 		delivered, err := e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
 		if err != nil {
 			return nil, err
