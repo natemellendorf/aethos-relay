@@ -2,56 +2,66 @@
 
 Last audited: 2026-03-06
 
-This document audits current `aethos-relay` runtime behavior against canonical specs in local `aethos` worktrees.
+This document audits current `aethos-relay` behavior against canonical specs pinned to GitHub raw `main` URLs.
 
 ## Canonical spec sources audited
 
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md`
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/spec/FEDERATION_PROTOCOL_V1.md`
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/spec/RECEIPTS.md`
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/migration/protocol_update.md` (draft migration plan; planning input only, not protocol contract)
-- `/Users/natemellendorf/opencode/aethos/docs/protocol.md` (canonical structures and canonical bytes)
+- `[CRP]` `https://raw.githubusercontent.com/natemellendorf/aethos/refs/heads/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md`
+- `[FRP]` `https://raw.githubusercontent.com/natemellendorf/aethos/refs/heads/main/docs/spec/FEDERATION_PROTOCOL_V1.md`
+- `[RCP]` `https://raw.githubusercontent.com/natemellendorf/aethos/refs/heads/main/docs/spec/RECEIPTS.md`
+- `[MIG]` `https://raw.githubusercontent.com/natemellendorf/aethos/refs/heads/main/docs/migration/protocol_update.md` (planning input; not a normative wire contract)
+
+## Audit Re-run Using Canonical GitHub Specs
+
+- What changed vs prior local-path-based audit: this pass is anchored to canonical raw URLs (`[CRP]`, `[FRP]`, `[RCP]`, `[MIG]`), all status labels are normalized to `MATCHES SPEC` / `DIVERGES FROM SPEC` / `VERIFY`, and evidence references are updated to current files in this checkout.
+- What remained correct: core divergence themes are unchanged (missing client `device_id` semantics, legacy client frame fields, federation inventory/request/message flow instead of canonical envelope-forwarding, and missing receipts wrappers).
+- New findings discovered in this re-run: (1) canonical `wayfarer_id` format (`[0-9a-f]{64}`) is not validated in `hello`; (2) federation `relay_hello` requires integer `protocol_version=1`, but runtime uses string `version="1.0"`; (3) envelope expiry checks use strict `time.After(...)` semantics at envelope helpers, which is not the canonical `now >= expires_at` boundary in `[FRP]`.
+
+Time-unit note: `[CRP]` uses Unix epoch **seconds** (`received_at`, `expires_at`) while `[FRP]` uses Unix epoch **milliseconds** (`created_at`, `expires_at`, `sent_at`).
 
 ## Client <-> Relay audit
 
 | Item | Canonical requirement | Current relay behavior (evidence) | Status |
 | --- | --- | --- | --- |
-| `hello` / `device_id` | `hello` requires both `wayfarer_id` and `device_id` (`CLIENT_RELAY_PROTOCOL_V1.md:42`, `CLIENT_RELAY_PROTOCOL_V1.md:52`). | Wire frame has `wayfarer_id` but no `device_id` field in `WSFrame` (`internal/model/message.go:37`); server validates only `wayfarer_id` (`internal/api/ws.go:219`) and stores only wayfarer identity (`internal/api/ws.go:225`). | **Diverges** |
-| `hello_ok` fields | `hello_ok` requires `relay_id` (`CLIENT_RELAY_PROTOCOL_V1.md:114`, `CLIENT_RELAY_PROTOCOL_V1.md:122`). | Relay returns only `{ "type": "hello_ok" }` (`internal/api/ws.go:230`). | **Diverges** |
-| Payload encoding (`payload_b64`) | Must be base64url (no padding) and decode to canonical `EnvelopeV1` bytes (`CLIENT_RELAY_PROTOCOL_V1.md:15`, `CLIENT_RELAY_PROTOCOL_V1.md:16`, `CLIENT_RELAY_PROTOCOL_V1.md:70`; canonical bytes in `protocol.md:16`). | Server checks only non-empty payload (`internal/api/ws.go:248`), then stores payload string as-is (`internal/storeforward/client.go:52`). Compatibility tests use standard base64 (not base64url) encode/decode (`tests/compatibility_harness_test.go:27`, `tests/compatibility_harness_test.go:71`). | **Diverges** |
-| `send_ok` timestamp names/shape | `send_ok` uses `msg_id` and optional `received_at`/`expires_at` pair (`CLIENT_RELAY_PROTOCOL_V1.md:128`, `CLIENT_RELAY_PROTOCOL_V1.md:142`, `CLIENT_RELAY_PROTOCOL_V1.md:144`). | Relay emits `send_ok` with `msg_id` and legacy `at` seconds (`internal/api/ws.go:272`, `internal/api/ws.go:275`, `internal/model/message.go:45`), no `received_at`, no `expires_at`. | **Diverges** |
-| `message` timestamp names/shape | `message` requires `received_at` epoch seconds (`CLIENT_RELAY_PROTOCOL_V1.md:150`, `CLIENT_RELAY_PROTOCOL_V1.md:164`). | Push delivery uses `at` epoch seconds (`internal/api/ws.go:371`, `internal/api/ws.go:376`, `internal/model/message.go:45`), not `received_at`. | **Diverges** |
-| `messages` object fields | Each pulled message should expose `msg_id`, `from`, `payload_b64`, `received_at` (`CLIENT_RELAY_PROTOCOL_V1.md:170`, `CLIENT_RELAY_PROTOCOL_V1.md:185`). | Pull response sends `[]model.Message` (`internal/api/ws.go:331`, `internal/api/ws.go:343`) whose wire tags include `to`, `at`, `expires_at`, `delivered` (`internal/model/message.go:10`, `internal/model/message.go:12`, `internal/model/message.go:14`, `internal/model/message.go:15`, `internal/model/message.go:16`) rather than canonical `received_at` shape. | **Diverges** |
-| `ack` durability | Ack state must be durable before treated complete (`CLIENT_RELAY_PROTOCOL_V1.md:289`). | `ack` writes delivery state in bbolt (`internal/api/ws.go:299`, `internal/storeforward/client.go:95`, `internal/store/bbolt_store.go:185`). | **Matches** |
-| `ack` per-device binding | Ack binding must be `(wayfarer_id, device_id)`; one device ack must not suppress another (`CLIENT_RELAY_PROTOCOL_V1.md:275`, `CLIENT_RELAY_PROTOCOL_V1.md:281`). | Runtime binds ack and pull to `client.WayfarerID` only (`internal/api/ws.go:299`, `internal/api/ws.go:323`); per-device helpers exist but are not wired on client WS path (`internal/storeforward/client.go:16`). | **Diverges** |
-| TTL default (`ttl_seconds`) | Omitted TTL defaults to `3600` (`CLIENT_RELAY_PROTOCOL_V1.md:29`, `CLIENT_RELAY_PROTOCOL_V1.md:296`). | Omitted/non-positive TTL becomes `maxTTL` (`internal/storeforward/client.go:43`), and process default `maxTTL` is `604800` seconds (`cmd/relay/main.go:40`). | **Diverges** |
-| `expires_at` immutability for a stored `msg_id` | `expires_at` must be immutable once accepted (`CLIENT_RELAY_PROTOCOL_V1.md:300`). | Message is persisted with fixed `ExpiresAt` (`internal/storeforward/client.go:54`, `internal/store/bbolt_store.go:108`), and ack path does not mutate it (`internal/store/bbolt_store.go:189`). | **Matches** |
-| Expired message delivery | Expired messages must not be delivered (`CLIENT_RELAY_PROTOCOL_V1.md:301`). | Pull path explicitly documents expired messages may still be returned before sweep (`internal/storeforward/client.go:67`), and tests pin this behavior (`internal/storeforward/engine_test.go:310`, `internal/storeforward/engine_test.go:315`). Push path does not block expired messages prior to send (`internal/api/ws.go:366`). | **Diverges** |
-| Error frame schema | `error` requires `code` + `message` (`CLIENT_RELAY_PROTOCOL_V1.md:207`, `CLIENT_RELAY_PROTOCOL_V1.md:216`, `CLIENT_RELAY_PROTOCOL_V1.md:225`). | `sendError` populates `type=error` and puts text into `msg_id` (`internal/api/ws.go:409`, `internal/api/ws.go:410`), with no `code` or `message` fields in `WSFrame` (`internal/model/message.go:42`). | **Diverges** |
-| Idempotency via `client_msg_id` | Relay must dedupe by `(sender_wayfarer_id, client_msg_id)` when present (`CLIENT_RELAY_PROTOCOL_V1.md:260`, `CLIENT_RELAY_PROTOCOL_V1.md:266`). | `WSFrame` has no `client_msg_id` field (`internal/model/message.go:35`), and no idempotency logic or `IDEMPOTENCY_MISMATCH` handling exists in relay code (repo-wide search). | **Diverges** |
+| `hello` required identity fields | `[CRP]` requires `hello.wayfarer_id` and `hello.device_id`. | `WSFrame` has `wayfarer_id` but no `device_id` (`internal/model/message.go:35`); `handleHello` only validates `wayfarer_id` (`internal/api/ws.go:218`). | DIVERGES FROM SPEC |
+| `wayfarer_id` format validation | `[CRP]` requires lowercase 64-char hex `wayfarer_id`. | `handleHello` checks only non-empty `wayfarer_id` (`internal/api/ws.go:219`). | DIVERGES FROM SPEC |
+| Per-device delivery/ack binding | `[CRP]` requires delivery+ack state by `(wayfarer_id, device_id)`. | Ack/pull paths use connection `WayfarerID` only (`internal/api/ws.go:299`, `internal/api/ws.go:323`); delivery key is `msgID|recipientID` with no device dimension (`internal/store/codec.go:170`). | DIVERGES FROM SPEC |
+| `hello_ok` fields | `[CRP]` requires `hello_ok` with `relay_id`. | `handleHello` emits only `{ "type": "hello_ok" }` (`internal/api/ws.go:230`). | DIVERGES FROM SPEC |
+| `send` acceptance invariants | `[CRP]` requires canonical payload decode, `to` consistency, authz, durable persist before `send_ok`. | `handleSend` enforces auth + non-empty `to` + non-empty `payload_b64` and persists before `send_ok` (`internal/api/ws.go:239`, `internal/api/ws.go:259`, `internal/api/ws.go:271`), but no canonical payload decode or `TO_MISMATCH` check is visible in this path. | DIVERGES FROM SPEC |
+| `send_ok` fields | `[CRP]` defines `send_ok.msg_id` and optional paired `received_at`+`expires_at`. | Runtime returns `send_ok` with `msg_id` and legacy `at` (`internal/api/ws.go:272`, `internal/model/message.go:45`). | DIVERGES FROM SPEC |
+| Push `message` shape | `[CRP]` requires `message.received_at` (seconds) with canonical naming. | Runtime emits `message.at` (`internal/api/ws.go:371`, `internal/model/message.go:45`). | DIVERGES FROM SPEC |
+| Pull `messages` item shape | `[CRP]` requires `msg_id`, `from`, `payload_b64`, `received_at`. | Pull serializes `model.Message` with legacy `at` plus additional fields (`to`, `expires_at`, `delivered`) (`internal/api/ws.go:331`, `internal/model/message.go:9`). | DIVERGES FROM SPEC |
+| Pull defaults and limits | `[CRP]` default limit is `50` when omitted. | WS path delegates limit normalization to helper (`internal/api/ws.go:322`), but exact default/max behavior is outside audited files in this map. | VERIFY |
+| `ack` durability before completion | `[CRP]` requires durable per-device state transition before completion semantics. | `handleAck` performs store write path before returning `ack_ok` (`internal/api/ws.go:299`, `internal/api/ws.go:309`); store writes delivery state inside a bbolt update transaction (`internal/store/bbolt_store.go:169`). | MATCHES SPEC |
+| `ack_ok` transport semantics | `[CRP]` defines `ack_ok` as response frame with `msg_id`. | Runtime responds with `ack_ok` + `msg_id` (`internal/api/ws.go:309`). | MATCHES SPEC |
+| `error` frame schema/codes | `[CRP]` requires `error.code` and `error.message`. | `sendError` puts text in `msg_id`; `WSFrame` has no `code` or `message` fields (`internal/api/ws.go:407`, `internal/model/message.go:35`). | DIVERGES FROM SPEC |
+| `payload_b64` canonical encoding | `[CRP]` requires base64url (no padding) and canonical envelope bytes. | WS path validates only non-empty payload (`internal/api/ws.go:248`) and persists payload as provided (`internal/store/codec.go:31`, `internal/store/bbolt_store.go:93`). | DIVERGES FROM SPEC |
+| Idempotency via `client_msg_id` | `[CRP]` requires dedupe by `(sender_wayfarer_id, client_msg_id)` when present. | `WSFrame` has no `client_msg_id` field (`internal/model/message.go:35`) and no idempotency branch in `handleSend` (`internal/api/ws.go:239`). | DIVERGES FROM SPEC |
+| TTL default and expiry-delivery boundary | `[CRP]` default requested TTL is `3600`; expired messages (`now >= expires_at`) MUST NOT be delivered. | Runtime exposes max TTL flag default `604800` (`cmd/relay/main.go:40`) and stores `expires_at` in message records (`internal/model/message.go:15`, `internal/store/codec.go:40`), but default requested TTL and strict `now >= expires_at` enforcement are not fully evidenced in this file map. | VERIFY |
+| `expires_at` immutability | `[CRP]` requires immutable `expires_at` once accepted. | `MarkDelivered` mutates delivery metadata and does not modify message expiry (`internal/store/bbolt_store.go:169`, `internal/store/bbolt_store.go:189`). | MATCHES SPEC |
 
 ## Federation audit
 
 | Item | Canonical requirement | Current relay behavior (evidence) | Status |
 | --- | --- | --- | --- |
-| Protocol model (envelope vs inventory/request/message) | Canonical federation is envelope-forwarding (`relay_hello`, `relay_forward(envelope)`, `relay_ack`, `relay_cover`) (`FEDERATION_PROTOCOL_V1.md:41`, `FEDERATION_PROTOCOL_V1.md:55`, `FEDERATION_PROTOCOL_V1.md:71`). | Runtime primarily uses `relay_inventory` + `relay_request` + `relay_forward(message)` flow (`internal/model/message.go:63`, `internal/model/message.go:64`, `internal/model/message.go:94`, `internal/federation/peering.go:343`, `internal/federation/peering.go:502`, `internal/federation/peering.go:533`). | **Diverges** |
-| `relay_hello` shape | Requires `protocol_version` integer `1` (`FEDERATION_PROTOCOL_V1.md:49`). | Frame uses `version` string (`internal/model/message.go:75`), set to `"1.0"` (`internal/federation/peering.go:22`, `internal/federation/peering.go:233`), and inbound validation checks only `type` and non-empty `relay_id` (`internal/federation/peering.go:827`). | **Diverges** |
-| `relay_forward` shape | Requires `envelope` with `envelope_id`, `destination`, `payload`, `created_at`, `expires_at`, `hop_count`, `seen_relays` (`FEDERATION_PROTOCOL_V1.md:62`, `FEDERATION_PROTOCOL_V1.md:69`). | `RelayForwardFrame` carries `message` (`internal/model/message.go:94`), using `model.Message` fields (`internal/model/message.go:10`, `internal/model/message.go:15`); both serving and emitting paths marshal `message` frames (`internal/federation/peering.go:533`, `internal/federation/peering.go:896`). | **Diverges** |
-| `relay_ack` shape and emission | `relay_ack` statuses are `accepted` or `rejected`; rejections carry `code`/`message` (`FEDERATION_PROTOCOL_V1.md:79`, `FEDERATION_PROTOCOL_V1.md:83`, `FEDERATION_PROTOCOL_V1.md:126`). | `RelayAckFrame` includes `destination` and free-form `status` (`internal/model/message.go:101`, `internal/model/message.go:102`); handler recognizes `accepted|duplicate|expired` (`internal/federation/peering.go:625`) and there is no `relay_ack` send path in `handleRelayForward` (`internal/federation/peering.go:553`). | **Diverges** |
-| Hop count increment/enforcement (runtime path) | Reject if incoming `hop_count >= MAX_HOPS`; increment by exactly 1 before forwarding (`FEDERATION_PROTOCOL_V1.md:103`, `FEDERATION_PROTOCOL_V1.md:104`). | Runtime forward path sends raw `message` without `hop_count` (`internal/federation/peering.go:896`); hop helper exists (`internal/storeforward/federation_forwarding.go:87`) but is only exercised by tests, not by `PeerManager` forwarding path. | **Diverges** |
-| `seen_relays` loop prevention | `seen_relays` must include local relay before forward; reject if local already present (`FEDERATION_PROTOCOL_V1.md:105`, `FEDERATION_PROTOCOL_V1.md:106`). | No `seen_relays` wire field in `RelayForwardFrame` (`internal/model/message.go:94`). Loop checks use envelope-store seen index keyed by envelope/message ID + relay ID (`internal/storeforward/federation_forwarding.go:50`, `internal/storeforward/federation_forwarding.go:73`, `internal/storeforward/federation_forwarding.go:127`). | **Diverges** |
-| Destination mismatch validation | Must reject when `destination != hex_lower(EnvelopeV1.toWayfarerId)` (`FEDERATION_PROTOCOL_V1.md:109`, `FEDERATION_PROTOCOL_V1.md:133`; structure in `protocol.md:44`). | No canonical `destination` field is present in wire `relay_forward`; forward validation checks only message field presence (`internal/storeforward/federation_forwarding.go:203`) and does not decode canonical envelope payload for destination comparison. | **Diverges** |
-| TTL non-extension | `expires_at` is immutable and must not be extended (`FEDERATION_PROTOCOL_V1.md:107`). | Forward acceptance persists incoming `msg.ExpiresAt` as-is (`internal/storeforward/federation_forwarding.go:63`, `internal/storeforward/federation_forwarding.go:199`), and tests pin expiry preservation (`internal/storeforward/engine_test.go:224`). | **Matches** |
-| Expiry rejection boundary | Expired envelope threshold is `now_ms >= expires_at` (`FEDERATION_PROTOCOL_V1.md:108`). | Runtime expiry check is `now.After(expires_at)` (`internal/storeforward/federation_forwarding.go:45`), which differs at exact-equality boundary. | **Diverges** |
-| `relay_cover` usage and shape | Requires `relay_id` and `sent_at` (Unix ms), optional padding (`FEDERATION_PROTOCOL_V1.md:93`, `FEDERATION_PROTOCOL_V1.md:94`, `FEDERATION_PROTOCOL_V1.md:98`). | Cover frame uses `ts` (seconds) and `nonce` only (`internal/model/message.go:109`, `internal/model/message.go:110`); produced by TAR batcher when queue empty (`internal/federation/tar.go:181`, `internal/federation/tar.go:183`) and ignored on receive (`internal/federation/peering.go:369`). | **Diverges** |
+| Federation wire model | `[FRP]` defines `relay_forward(envelope)` + `relay_ack` + `relay_cover` model. | Runtime uses inventory/request/message-forward flow (`internal/model/message.go:63`, `internal/model/message.go:64`, `internal/model/message.go:92`, `internal/federation/peering.go:478`, `internal/federation/peering.go:520`, `internal/federation/peering.go:554`). | DIVERGES FROM SPEC |
+| `relay_hello` shape | `[FRP]` requires `protocol_version` integer `1`. | Frame model uses `version` string (`internal/model/message.go:75`), constant is `"1.0"` (`internal/federation/peering.go:22`), inbound validation checks only type+relay_id (`internal/federation/peering.go:827`). | DIVERGES FROM SPEC |
+| `relay_forward` payload shape | `[FRP]` requires `envelope` object with canonical envelope fields. | `RelayForwardFrame` carries `message` (`internal/model/message.go:92`), and forward path serializes/deserializes `message` form (`internal/federation/peering.go:356`, `internal/federation/peering.go:896`). | DIVERGES FROM SPEC |
+| `relay_ack` status/model | `[FRP]` requires `status in {accepted,rejected}` plus `code/message` for rejection. | `RelayAckFrame` contains `destination` and free-form status (`internal/model/message.go:98`); handler accepts `accepted|duplicate|expired` (`internal/federation/peering.go:625`), and no canonical reject-ack emission is present in forward handler (`internal/federation/peering.go:554`). | DIVERGES FROM SPEC |
+| Hop-count enforcement and increment | `[FRP]` requires reject on `hop_count >= MAX_HOPS` and increment by 1 before forwarding. | `MAX_HOPS` exists in envelope model (`internal/model/envelope.go:61`), but runtime wire forward frame has no hop field and forward path does not enforce/increment it (`internal/model/message.go:92`, `internal/federation/peering.go:554`, `internal/federation/peering.go:896`). | DIVERGES FROM SPEC |
+| `seen_relays` loop prevention | `[FRP]` requires append local relay and reject if already seen. | Runtime frame model has no `seen_relays` field (`internal/model/message.go:92`); only envelope-store seen index helpers exist (`internal/store/envelope_store.go:227`, `internal/store/envelope_store.go:235`). | DIVERGES FROM SPEC |
+| Destination/payload consistency checks | `[FRP]` requires `destination` to match decoded payload destination and `envelope_id = SHA-256(payload)`. | `handleRelayForward` validates message presence/basic fields only and does not decode canonical envelope payload or verify envelope hash invariants (`internal/federation/peering.go:559`). | DIVERGES FROM SPEC |
+| `expires_at` immutability across hops | `[FRP]` forbids TTL extension. | Forward path passes existing message timestamps through to persistence path and no explicit expiry-extension write is visible in these files (`internal/federation/peering.go:575`, `internal/store/bbolt_store.go:108`). | VERIFY |
+| Expiry rejection boundary | `[FRP]` requires expired when `now_ms >= expires_at`. | Envelope helper uses `time.Now().After(expires_at)` (strict `>` semantics) (`internal/model/envelope.go:55`), and envelope-store read path relies on that helper (`internal/store/envelope_store.go:147`). | DIVERGES FROM SPEC |
+| `relay_cover` required fields/time units | `[FRP]` requires `relay_id` and `sent_at` (Unix ms). | Cover frame uses `ts` + `nonce` (`internal/model/message.go:107`), sender uses `time.Now().Unix()` seconds (`internal/federation/tar.go:183`), receiver ignores cover payload (`internal/federation/peering.go:369`). | DIVERGES FROM SPEC |
 
 ## Receipts audit
 
 | Item | Canonical requirement | Current relay behavior (evidence) | Status |
 | --- | --- | --- | --- |
-| Receipt transport wrapper support | Receipt wrappers use `receipt_scope` + `receipt_v1_b64` (base64url) (`RECEIPTS.md:58`, `RECEIPTS.md:66`), with inner `ReceiptV1` from canonical structures (`RECEIPTS.md:7`, `protocol.md:57`). | Relay does not expose or consume receipt wrapper fields; no receipt frame types are implemented in client or federation WebSocket handlers (`internal/api/ws.go:202`, `internal/federation/peering.go:336`). | **Diverges** |
-| Non-conflation of device vs federation semantics | `DeviceReceipt` and `FederationReceipt` must not be conflated (`RECEIPTS.md:42`, `RECEIPTS.md:44`). | Client `ack` updates client-delivery state (`internal/api/ws.go:299`), while `relay_ack` updates peer metrics and tests assert it does not mark client delivery (`internal/federation/peering.go:616`, `internal/federation/peering_test.go:375`, `internal/federation/peering_test.go:380`). | **Matches** |
-| `ack_ok` vs receipt semantics | Receipt semantics are `ReceiptV1`-based and scoped (`RECEIPTS.md:13`, `RECEIPTS.md:51`). | `ack_ok` exists as transport response frame to `ack` (`internal/api/ws.go:309`) but relay does not generate `ReceiptV1` wrappers; `ack_ok` should not be treated as canonical receipt object. | **Diverges** |
+| Receipt wrapper support | `[RCP]` JSON channels require `receipt_scope` and `receipt_v1_b64` wrapper where mixed scopes can appear. | Client/federation frame models do not define wrapper fields (`internal/model/message.go:35`, `internal/model/message.go:98`), and WS/federation handlers do not parse such wrappers (`internal/api/ws.go:193`, `internal/federation/peering.go:336`). | DIVERGES FROM SPEC |
+| Non-conflation of device vs federation semantics | `[RCP]` requires device and federation semantics to remain distinct. | Client `ack` updates delivery state (`internal/api/ws.go:299`), while `relay_ack` updates peer metrics only (`internal/federation/peering.go:616`). | MATCHES SPEC |
+| `ack_ok` vs receipt semantics | `[CRP]` defines `ack_ok` transport response; `[RCP]` keeps `ReceiptV1` semantics separate. | Runtime keeps transport `ack_ok` as WS response (`internal/api/ws.go:309`) and does not treat it as `ReceiptV1` wrapper payload (`internal/model/message.go:35`). | MATCHES SPEC |
 
 ## Implementation Notes (non-protocol constraints)
 
@@ -59,47 +69,34 @@ These are implementation/runtime limits and policies; they are not canonical pro
 
 | Item | Current behavior (evidence) | Status |
 | --- | --- | --- |
-| WebSocket buffer sizes | Client upgrader uses `ReadBufferSize=1024`, `WriteBufferSize=1024` (`internal/api/ws.go:116`, `internal/api/ws.go:117`); federation upgrader uses same (`internal/federation/peering.go:795`, `internal/federation/peering.go:796`). | **VERIFY** |
-| Backpressure buffers | Client send queue is `256` (`internal/api/ws.go:132`) with 1s enqueue timeout (`internal/api/ws.go:400`); federation peer send queue is `256` (`internal/federation/peering.go:223`, `internal/federation/peering.go:812`); TAR batch queue is `256` (`internal/federation/peering.go:415`). | **VERIFY** |
-| Origin policy | Dev mode allows all origins (`internal/api/ws.go:52`); production denies all if allowlist empty (`internal/api/ws.go:56`); requests with no Origin header are allowed (`internal/api/ws.go:60`). | **VERIFY** |
-| Pull limits | Pull defaults to `50`, max `100` (`internal/storeforward/engine.go:10`, `internal/storeforward/engine.go:11`, `internal/storeforward/client.go:34`). | **VERIFY** |
-| Inbound federation caps | Max inbound federation connections default `100` via semaphore (`cmd/relay/main.go:48`, `cmd/relay/main.go:250`); max peers default `50` (`cmd/relay/main.go:53`, `cmd/relay/main.go:269`); rate limit default `100 req/min` by remote addr (`cmd/relay/main.go:54`, `cmd/relay/main.go:251`, `cmd/relay/main.go:276`). | **VERIFY** |
-| Payload size checks | Forwarded federation payload hard-capped at 64 KiB (`internal/federation/peering.go:38`, `internal/federation/peering.go:565`); client `send` path has no explicit payload-length guard (`internal/api/ws.go:248`, `internal/api/ws.go:253`). | **VERIFY** |
-| `-max-envelope-size` flag wiring | CLI exposes `-max-envelope-size` and logs it (`cmd/relay/main.go:52`, `cmd/relay/main.go:94`), but no enforcement callsite appears in relay runtime paths (repo search). | **VERIFY** |
-| Sweeper cadence | Message sweeper interval default is `30s` (`cmd/relay/main.go:39`) and runs immediately on start (`internal/store/ttl_sweeper.go:38`); envelope sweeper default interval is `30s` (`internal/store/envelope_sweeper.go:19`) and begins on ticker cycle (`internal/store/envelope_sweeper.go:50`). | **VERIFY** |
+| WebSocket buffer sizes | Client upgrader uses `1024/1024` (`internal/api/ws.go:116`, `internal/api/ws.go:117`); federation upgrader uses `1024/1024` (`internal/federation/peering.go:795`, `internal/federation/peering.go:796`). | VERIFY |
+| Backpressure buffers | Client send queue `256` + 1s enqueue timeout (`internal/api/ws.go:132`, `internal/api/ws.go:400`); federation peer send queue `256` (`internal/federation/peering.go:223`, `internal/federation/peering.go:812`); TAR batch queue `256` (`internal/federation/peering.go:415`). | VERIFY |
+| Origin policy | Dev mode allows all (`internal/api/ws.go:52`); empty allowlist denies (`internal/api/ws.go:56`); missing `Origin` header is allowed (`internal/api/ws.go:60`). | VERIFY |
+| Pull limit normalization details | WS path delegates limit normalization (`internal/api/ws.go:322`), but default/max constants are outside this audit's code map. | VERIFY |
+| Inbound federation caps | Defaults: inbound conns `100` (`cmd/relay/main.go:48`), max peers `50` (`cmd/relay/main.go:53`), rate limit `100 req/min` (`cmd/relay/main.go:54`), wired at handler (`cmd/relay/main.go:250`, `cmd/relay/main.go:269`, `cmd/relay/main.go:276`). | VERIFY |
+| Payload size checks | Federation forward payload capped at 64 KiB (`internal/federation/peering.go:38`, `internal/federation/peering.go:565`); client send path has no explicit byte-length guard (`internal/api/ws.go:248`). | VERIFY |
+| `-max-envelope-size` flag wiring | CLI exposes and logs `-max-envelope-size` (`cmd/relay/main.go:52`, `cmd/relay/main.go:94`), but no enforcement use is visible in audited runtime paths. | VERIFY |
+| Sweeper cadence | Message sweeper interval comes from `-sweep-interval` (`cmd/relay/main.go:39`) and runs immediately on start (`internal/store/ttl_sweeper.go:38`); envelope sweeper defaults to `30s` (`internal/store/envelope_sweeper.go:19`) and starts on ticker cadence (`internal/store/envelope_sweeper.go:50`). | VERIFY |
 
 ## Structured summary
 
 ### Confirmed matches
 
-1. Client `ack` is durably persisted before completion semantics (`internal/store/bbolt_store.go:185`).
-2. Stored-message `expires_at` is not mutated by delivery ack writes (`internal/store/bbolt_store.go:189`).
-3. Federation acceptance preserves incoming expiry value when persisting forwarded messages (`internal/storeforward/federation_forwarding.go:199`).
-4. Relay keeps device-level (`ack`) and federation-level (`relay_ack`) effects separate in implementation behavior (`internal/federation/peering_test.go:380`).
+1. Client `ack` persists delivery state before `ack_ok` response (`internal/api/ws.go:299`, `internal/store/bbolt_store.go:169`).
+2. `expires_at` is not mutated by delivery-state updates (`internal/store/bbolt_store.go:189`).
+3. Device-level ack and relay-level ack remain semantically separated (`internal/api/ws.go:299`, `internal/federation/peering.go:616`).
 
 ### Confirmed divergences
 
-1. Client wire shape diverges on identity (`device_id` missing), timestamps (`at` vs `received_at`), and error schema (`msg_id` string instead of `code`/`message`).
-2. Payload semantics diverge: no base64url enforcement and no canonical `EnvelopeV1` decode validation on client `send`.
-3. TTL semantics diverge: default TTL tracks relay `maxTTL` instead of canonical `3600`; expired messages can still be delivered before sweep.
-4. Idempotency diverges: `client_msg_id` is not represented or enforced.
-5. Federation protocol diverges structurally: runtime is inventory/request/message-forward oriented rather than canonical envelope-forward protocol.
-6. Federation acks diverge in both semantics and shape; runtime currently processes incoming `relay_ack` but does not emit canonical accept/reject `relay_ack` responses for forwards.
-7. Federation invariants diverge on wire (`hop_count`, `seen_relays`, `destination` validation absent from forwarded frame model).
-8. Receipts spec is not implemented (`ReceiptV1` wrappers/scopes absent); `ack_ok` remains transport-level acknowledgment, not canonical receipt payload.
+1. Client handshake/identity diverges: missing `device_id`, no strict `wayfarer_id` format validation, and missing `relay_id` in `hello_ok`.
+2. Client frame schema diverges: legacy `at` naming, non-canonical `error` shape, and no `client_msg_id` idempotency support.
+3. Client payload invariants diverge: no visible canonical base64url/decode/to-mismatch enforcement in WS path.
+4. Federation wire protocol diverges structurally from canonical envelope-forward model.
+5. Federation invariants diverge: hello version field shape, ack status model, hop/seen fields, destination/hash checks, and cover-frame fields/time units.
+6. Receipt wrappers are not implemented for mixed-scope receipt transport.
 
-### VERIFY items
+### VERIFY items to emphasize
 
-1. Non-protocol runtime limits/caps listed above should be treated as implementation details until codified in canonical contracts.
-2. `-max-envelope-size` appears currently non-enforced in runtime; verify intended ownership (CLI/runtime/spec) before relying on it.
-3. Federation expiry check uses strict `After` (not `>=`) and should be explicitly confirmed during alignment cutover.
-
-### Recommended future alignment beads (prioritized)
-
-1. **Client identity + ack binding bead:** Add `device_id` to `hello` and wire `(wayfarer_id, device_id)` delivery identities end-to-end.
-2. **Client frame normalization bead:** Align `hello_ok`, `send_ok`, `message`, `messages`, and `error` fields/timestamp names to canonical v1.
-3. **Encoding/idempotency bead:** Enforce base64url canonical payload handling and implement `client_msg_id` dedupe semantics.
-4. **TTL semantics bead:** Switch default TTL to `3600` and prevent delivery of expired messages before sweep.
-5. **Federation envelope protocol bead:** Move from inventory/request/message-forward model to canonical envelope-based `relay_forward` + invariants (`hop_count`, `seen_relays`, destination checks).
-6. **Federation ack alignment bead:** Emit canonical `relay_ack(status=accepted|rejected, code?, message?)` for forward outcomes.
-7. **Receipts bead:** Introduce explicit receipt wrappers (`receipt_scope`, `receipt_v1_b64`) and keep transport `ack_ok` separate from receipt payload semantics.
+1. TTL default (`3600`) and strict expired-delivery boundary are not fully evidenced inside the audited code map.
+2. Pull default/max limit constants are delegated to helper code outside this map.
+3. `-max-envelope-size` is exposed as a flag but no enforcement callsite is visible in audited runtime paths.
