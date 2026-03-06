@@ -14,7 +14,7 @@ The engine currently owns these responsibilities:
 6. Handle inbound federation forwards (`relay_forward`, currently carrying `message` in this implementation) with validation, duplicate checks, expiry checks, and persistence.
 7. Maintain federation envelope state (ID, destination, origin, hop count, expiry) when an envelope store is configured.
 8. Provide optional helpers for envelope hop/seen state when an envelope store is explicitly configured.
-9. Process relay-to-relay receipts (`relay_ack`) as forwarding telemetry only.
+9. Keep relay-to-relay receipt handling (`relay_ack`) out of engine persistence and delivery-state paths.
 10. Sweep expired envelopes from the envelope store when requested.
 
 The engine does not change wire frame names, field names, or frame encodings. Client and federation handlers still marshal/unmarshal the same frame types as before.
@@ -55,4 +55,3 @@ The engine does not change wire frame names, field names, or frame encodings. Cl
 - `engine.go`: engine wiring/state and federation configuration.
 - `client.go`: client send/pull/ack behavior and delivery identity handling.
 - `federation_forwarding.go`: relay forward acceptance, envelope hop/seen handling, and envelope sweeps.
-- `receipts.go`: relay receipt (`relay_ack`) telemetry tracking.

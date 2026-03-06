@@ -287,51 +287,6 @@ func TestSeenTrackingPreventsLoops(t *testing.T) {
 	}
 }
 
-func TestRelayAckTracksForwardingOutcomeOnly(t *testing.T) {
-	h := newEngineHarness(t, time.Hour)
-
-	msg := &model.Message{
-		ID:        "msg-ack-check",
-		From:      "alice",
-		To:        "bob",
-		Payload:   "QQ==",
-		CreatedAt: h.now,
-		ExpiresAt: h.now.Add(30 * time.Minute),
-	}
-	persistTestMessage(t, h, msg)
-
-	h.engine.RecordRelayAck("peer-1", &model.RelayAckFrame{
-		Type:        model.FrameTypeRelayAck,
-		EnvelopeID:  msg.ID,
-		Destination: "bob",
-		Status:      "accepted",
-	})
-
-	outcome, ok := h.engine.RelayAckFor(msg.ID, "bob", "peer-1")
-	if !ok {
-		t.Fatal("expected relay ack outcome to be recorded")
-	}
-	if outcome.Status != "accepted" {
-		t.Fatalf("relay ack status mismatch: got %q", outcome.Status)
-	}
-
-	clientDelivered, err := h.messageStore.IsDeliveredTo(context.Background(), msg.ID, "bob")
-	if err != nil {
-		t.Fatalf("check client delivery state: %v", err)
-	}
-	if clientDelivered {
-		t.Fatal("relay_ack must not mutate client ack delivery state")
-	}
-
-	queued, err := h.engine.PullForDeliveryIdentity(context.Background(), "bob", 10)
-	if err != nil {
-		t.Fatalf("pull queued after relay_ack: %v", err)
-	}
-	if len(queued) != 1 {
-		t.Fatalf("expected message to remain queued for client path, got %d", len(queued))
-	}
-}
-
 func TestCurrentExpiryBehaviorForPullAndEnvelopeSweep(t *testing.T) {
 	h := newEngineHarness(t, time.Hour)
 

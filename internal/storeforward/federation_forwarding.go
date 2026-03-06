@@ -41,7 +41,7 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 		return RelayForwardResult{Status: RelayForwardTooLarge}, ErrForwardMessageTooLarge
 	}
 
-	now := e.nowUTC()
+	now := e.now()
 	if now.After(msg.ExpiresAt) {
 		return RelayForwardResult{Status: RelayForwardExpired}, nil
 	}
@@ -94,7 +94,7 @@ func (e *Engine) PrepareForwardingEnvelope(ctx context.Context, msg *model.Messa
 		return nil, err
 	}
 
-	if e.nowUTC().After(envelope.ExpiresAt) {
+	if e.now().After(envelope.ExpiresAt) {
 		return nil, model.ErrEnvelopeExpired
 	}
 
@@ -217,5 +217,6 @@ func isNotFoundErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	// TODO: switch to errors.Is when store exports typed not-found sentinels.
 	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }

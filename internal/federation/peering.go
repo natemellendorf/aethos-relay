@@ -556,6 +556,16 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	if msg == nil {
 		return
 	}
+	if msg.ID == "" || msg.From == "" || msg.To == "" || msg.Payload == "" {
+		return
+	}
+	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
+		return
+	}
+	if len(msg.Payload) > MaxForwardedPayloadSize {
+		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
+		return
+	}
 
 	peer.healthMu.Lock()
 	peer.Health.MessagesReceived++
@@ -565,8 +575,6 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	result, err := pm.engine.AcceptRelayForward(ctx, peer.ID, msg, MaxForwardedPayloadSize)
 	if err != nil {
 		switch result.Status {
-		case storeforward.RelayForwardTooLarge:
-			log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
 		case storeforward.RelayForwardInvalid:
 			return
 		default:
@@ -606,8 +614,6 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 // This is separate from end-device `ack` delivery state.
 // Updates peer metrics based on ack status.
 func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
-	pm.engine.RecordRelayAck(peer.ID, frame)
-
 	if peer.Metrics == nil {
 		return
 	}

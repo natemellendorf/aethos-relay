@@ -333,6 +333,54 @@ func TestHandleRelayForward_NoReGossip(t *testing.T) {
 	}
 }
 
+// TestHandleRelayAck_UpdatesMetricsWithoutClientDeliveryMutation verifies that
+// relay-to-relay acks update peer scoring inputs but do not mark client delivery.
+func TestHandleRelayAck_UpdatesMetricsWithoutClientDeliveryMutation(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "msg-ack-1",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := st.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist message: %v", err)
+	}
+
+	peer := &Peer{
+		ID:      "peer-1",
+		Metrics: model.NewPeerMetrics("peer-1"),
+		Done:    make(chan struct{}),
+	}
+
+	beforeAcks := peer.Metrics.AcksTotal
+	pm.handleRelayAck(peer, &model.RelayAckFrame{
+		Type:        model.FrameTypeRelayAck,
+		EnvelopeID:  msg.ID,
+		Destination: msg.To,
+		Status:      "accepted",
+	})
+
+	if peer.Metrics.AcksTotal != beforeAcks+1 {
+		t.Fatalf("expected peer ack count to increment, got %d want %d", peer.Metrics.AcksTotal, beforeAcks+1)
+	}
+
+	delivered, err := st.IsDeliveredTo(context.Background(), msg.ID, msg.To)
+	if err != nil {
+		t.Fatalf("check delivery state: %v", err)
+	}
+	if delivered {
+		t.Fatal("relay_ack should not mark client delivery state")
+	}
+}
+
 // TestHandleRelayInventory_RequestsMissingMessages verifies that when a peer
 // announces messages we don't have, we request exactly those IDs.
 func TestHandleRelayInventory_RequestsMissingMessages(t *testing.T) {

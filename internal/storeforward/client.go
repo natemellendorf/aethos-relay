@@ -44,7 +44,7 @@ func (e *Engine) AcceptClientSend(from, to, payloadB64 string, ttlSeconds int) (
 		ttl = e.maxTTL
 	}
 
-	now := e.nowUTC()
+	now := e.now()
 	msg := &model.Message{
 		ID:        uuid.New().String(),
 		From:      from,
@@ -63,7 +63,8 @@ func (e *Engine) PersistMessage(ctx context.Context, msg *model.Message) error {
 	return e.store.PersistMessage(ctx, msg)
 }
 
-// PullForDeliveryIdentity returns queued, non-expired messages for a delivery identity.
+// PullForDeliveryIdentity returns queued messages for a delivery identity.
+// Expired messages may still be returned until TTL cleanup removes them.
 func (e *Engine) PullForDeliveryIdentity(ctx context.Context, deliveryIdentity string, limit int) ([]*model.Message, error) {
 	queueRecipient := QueueRecipient(deliveryIdentity)
 	messages, err := e.store.GetQueuedMessages(ctx, queueRecipient, NormalizePullLimit(limit))
