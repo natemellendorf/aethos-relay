@@ -2,7 +2,7 @@
 
 Last audited: 2026-03-06
 
-This document audits current `aethos-relay` behavior against canonical specs pinned to GitHub raw `main` URLs.
+This document audits current `aethos-relay` behavior against specs anchored to canonical main-branch raw URLs.
 
 ## Canonical spec sources audited
 
@@ -25,19 +25,19 @@ Time-unit note: `[CRP]` uses Unix epoch **seconds** (`received_at`, `expires_at`
 | --- | --- | --- | --- |
 | `hello` required identity fields | `[CRP]` requires `hello.wayfarer_id` and `hello.device_id`. | `WSFrame` has `wayfarer_id` but no `device_id` (`internal/model/message.go:35`); `handleHello` only validates `wayfarer_id` (`internal/api/ws.go:218`). | DIVERGES FROM SPEC |
 | `wayfarer_id` format validation | `[CRP]` requires lowercase 64-char hex `wayfarer_id`. | `handleHello` checks only non-empty `wayfarer_id` (`internal/api/ws.go:219`). | DIVERGES FROM SPEC |
-| Per-device delivery/ack binding | `[CRP]` requires delivery+ack state by `(wayfarer_id, device_id)`. | Ack/pull paths use connection `WayfarerID` only (`internal/api/ws.go:299`, `internal/api/ws.go:323`); delivery key is `msgID|recipientID` with no device dimension (`internal/store/codec.go:170`). | DIVERGES FROM SPEC |
+| Per-device delivery/ack binding | `[CRP]` requires delivery+ack state by `(wayfarer_id, device_id)`. | Engine/store can accept device-qualified identities via `DeliveryIdentity(wayfarerID, deviceID)` (`internal/storeforward/client.go:16`) and persist opaque recipient strings in delivery keys (`internal/store/codec.go:170`), but WS frames/handlers never populate `device_id` and currently key by `wayfarer_id` only (`internal/api/ws.go:225`, `internal/api/ws.go:299`, `internal/api/ws.go:323`), so acks suppress across devices for the same wayfarer. | DIVERGES FROM SPEC |
 | `hello_ok` fields | `[CRP]` requires `hello_ok` with `relay_id`. | `handleHello` emits only `{ "type": "hello_ok" }` (`internal/api/ws.go:230`). | DIVERGES FROM SPEC |
 | `send` acceptance invariants | `[CRP]` requires canonical payload decode, `to` consistency, authz, durable persist before `send_ok`. | `handleSend` enforces auth + non-empty `to` + non-empty `payload_b64` and persists before `send_ok` (`internal/api/ws.go:239`, `internal/api/ws.go:259`, `internal/api/ws.go:271`), but no canonical payload decode or `TO_MISMATCH` check is visible in this path. | DIVERGES FROM SPEC |
 | `send_ok` fields | `[CRP]` defines `send_ok.msg_id` and optional paired `received_at`+`expires_at`. | Runtime returns `send_ok` with `msg_id` and legacy `at` (`internal/api/ws.go:272`, `internal/model/message.go:45`). | DIVERGES FROM SPEC |
 | Push `message` shape | `[CRP]` requires `message.received_at` (seconds) with canonical naming. | Runtime emits `message.at` (`internal/api/ws.go:371`, `internal/model/message.go:45`). | DIVERGES FROM SPEC |
 | Pull `messages` item shape | `[CRP]` requires `msg_id`, `from`, `payload_b64`, `received_at`. | Pull serializes `model.Message` with legacy `at` plus additional fields (`to`, `expires_at`, `delivered`) (`internal/api/ws.go:331`, `internal/model/message.go:9`). | DIVERGES FROM SPEC |
-| Pull defaults and limits | `[CRP]` default limit is `50` when omitted. | WS path delegates limit normalization to helper (`internal/api/ws.go:322`), but exact default/max behavior is outside audited files in this map. | VERIFY |
+| Pull defaults and limits | `[CRP]` default limit is `50` when omitted. | Engine defines `defaultPullLimit=50` and `maxPullLimit=100` (`internal/storeforward/engine.go:10`); helper applies default `50` for omitted/invalid limits (`internal/storeforward/client.go:33`); WS pull path uses that helper (`internal/api/ws.go:322`). | MATCHES SPEC |
 | `ack` durability before completion | `[CRP]` requires durable per-device state transition before completion semantics. | `handleAck` performs store write path before returning `ack_ok` (`internal/api/ws.go:299`, `internal/api/ws.go:309`); store writes delivery state inside a bbolt update transaction (`internal/store/bbolt_store.go:169`). | MATCHES SPEC |
 | `ack_ok` transport semantics | `[CRP]` defines `ack_ok` as response frame with `msg_id`. | Runtime responds with `ack_ok` + `msg_id` (`internal/api/ws.go:309`). | MATCHES SPEC |
 | `error` frame schema/codes | `[CRP]` requires `error.code` and `error.message`. | `sendError` puts text in `msg_id`; `WSFrame` has no `code` or `message` fields (`internal/api/ws.go:407`, `internal/model/message.go:35`). | DIVERGES FROM SPEC |
 | `payload_b64` canonical encoding | `[CRP]` requires base64url (no padding) and canonical envelope bytes. | WS path validates only non-empty payload (`internal/api/ws.go:248`) and persists payload as provided (`internal/store/codec.go:31`, `internal/store/bbolt_store.go:93`). | DIVERGES FROM SPEC |
 | Idempotency via `client_msg_id` | `[CRP]` requires dedupe by `(sender_wayfarer_id, client_msg_id)` when present. | `WSFrame` has no `client_msg_id` field (`internal/model/message.go:35`) and no idempotency branch in `handleSend` (`internal/api/ws.go:239`). | DIVERGES FROM SPEC |
-| TTL default and expiry-delivery boundary | `[CRP]` default requested TTL is `3600`; expired messages (`now >= expires_at`) MUST NOT be delivered. | Runtime exposes max TTL flag default `604800` (`cmd/relay/main.go:40`) and stores `expires_at` in message records (`internal/model/message.go:15`, `internal/store/codec.go:40`), but default requested TTL and strict `now >= expires_at` enforcement are not fully evidenced in this file map. | VERIFY |
+| TTL default and expiry-delivery boundary | `[CRP]` default requested TTL is `3600`; expired messages (`now >= expires_at`) MUST NOT be delivered. | Omitted `ttl_seconds` decodes to `0` on WS frames (`internal/model/message.go:40`), and send handling maps `ttl_seconds <= 0` to `maxTTL` (`internal/storeforward/client.go:43`) instead of canonical `3600`. Pull handling also documents that expired messages may be returned until cleanup (`internal/storeforward/client.go:67`), and WS delivery still emits frames for those messages (remaining TTL is clamped to `0` but the message is sent) (`internal/api/ws.go:366`, `internal/api/ws.go:371`). | DIVERGES FROM SPEC |
 | `expires_at` immutability | `[CRP]` requires immutable `expires_at` once accepted. | `MarkDelivered` mutates delivery metadata and does not modify message expiry (`internal/store/bbolt_store.go:169`, `internal/store/bbolt_store.go:189`). | MATCHES SPEC |
 
 ## Federation audit
@@ -72,7 +72,7 @@ These are implementation/runtime limits and policies; they are not canonical pro
 | WebSocket buffer sizes | Client upgrader uses `1024/1024` (`internal/api/ws.go:116`, `internal/api/ws.go:117`); federation upgrader uses `1024/1024` (`internal/federation/peering.go:795`, `internal/federation/peering.go:796`). | VERIFY |
 | Backpressure buffers | Client send queue `256` + 1s enqueue timeout (`internal/api/ws.go:132`, `internal/api/ws.go:400`); federation peer send queue `256` (`internal/federation/peering.go:223`, `internal/federation/peering.go:812`); TAR batch queue `256` (`internal/federation/peering.go:415`). | VERIFY |
 | Origin policy | Dev mode allows all (`internal/api/ws.go:52`); empty allowlist denies (`internal/api/ws.go:56`); missing `Origin` header is allowed (`internal/api/ws.go:60`). | VERIFY |
-| Pull limit normalization details | WS path delegates limit normalization (`internal/api/ws.go:322`), but default/max constants are outside this audit's code map. | VERIFY |
+| Pull limit normalization details | WS pull path uses normalization helper (`internal/api/ws.go:322`) with `defaultPullLimit=50` and `maxPullLimit=100` constants (`internal/storeforward/engine.go:10`, `internal/storeforward/client.go:33`). | VERIFY |
 | Inbound federation caps | Defaults: inbound conns `100` (`cmd/relay/main.go:48`), max peers `50` (`cmd/relay/main.go:53`), rate limit `100 req/min` (`cmd/relay/main.go:54`), wired at handler (`cmd/relay/main.go:250`, `cmd/relay/main.go:269`, `cmd/relay/main.go:276`). | VERIFY |
 | Payload size checks | Federation forward payload capped at 64 KiB (`internal/federation/peering.go:38`, `internal/federation/peering.go:565`); client send path has no explicit byte-length guard (`internal/api/ws.go:248`). | VERIFY |
 | `-max-envelope-size` flag wiring | CLI exposes and logs `-max-envelope-size` (`cmd/relay/main.go:52`, `cmd/relay/main.go:94`), but no enforcement use is visible in audited runtime paths. | VERIFY |
@@ -91,12 +91,13 @@ These are implementation/runtime limits and policies; they are not canonical pro
 1. Client handshake/identity diverges: missing `device_id`, no strict `wayfarer_id` format validation, and missing `relay_id` in `hello_ok`.
 2. Client frame schema diverges: legacy `at` naming, non-canonical `error` shape, and no `client_msg_id` idempotency support.
 3. Client payload invariants diverge: no visible canonical base64url/decode/to-mismatch enforcement in WS path.
-4. Federation wire protocol diverges structurally from canonical envelope-forward model.
-5. Federation invariants diverge: hello version field shape, ack status model, hop/seen fields, destination/hash checks, and cover-frame fields/time units.
-6. Receipt wrappers are not implemented for mixed-scope receipt transport.
+4. Client TTL semantics diverge: omitted `ttl_seconds` defaults to `maxTTL`, not canonical `3600`.
+5. Client expiry boundary diverges: expired queued messages may still be returned/delivered until cleanup.
+6. Federation wire protocol diverges structurally from canonical envelope-forward model.
+7. Federation invariants diverge: hello version field shape, ack status model, hop/seen fields, destination/hash checks, and cover-frame fields/time units.
+8. Receipt wrappers are not implemented for mixed-scope receipt transport.
 
 ### VERIFY items to emphasize
 
-1. TTL default (`3600`) and strict expired-delivery boundary are not fully evidenced inside the audited code map.
-2. Pull default/max limit constants are delegated to helper code outside this map.
-3. `-max-envelope-size` is exposed as a flag but no enforcement callsite is visible in audited runtime paths.
+1. Federation `expires_at` immutability across hops still needs stronger end-to-end write-path evidence.
+2. `-max-envelope-size` is exposed as a flag but no enforcement callsite is visible in audited runtime paths.
