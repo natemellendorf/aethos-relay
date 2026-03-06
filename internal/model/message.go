@@ -35,6 +35,7 @@ type DeliveryState struct {
 type WSFrame struct {
 	Type       string    `json:"type"`
 	WayfarerID string    `json:"wayfarer_id,omitempty"`
+	DeviceID   string    `json:"device_id,omitempty"`
 	From       string    `json:"from,omitempty"`
 	To         string    `json:"to,omitempty"`
 	TTLSeconds int       `json:"ttl_seconds,omitempty"`
@@ -149,6 +150,8 @@ func IsClientAllowedFrameType(frameType string) bool {
 type Client struct {
 	ID         string
 	WayfarerID string
+	DeviceID   string
+	DeliveryID string
 	Conn       interface {
 		WriteJSON(v interface{}) error
 		ReadJSON(v interface{}) error
@@ -157,6 +160,49 @@ type Client struct {
 		Close() error
 	}
 	Send chan []byte
+
+	deliveryMu               sync.Mutex
+	deliveryRecipientByMsgID map[string]string
+}
+
+// TrackMessageDeliveryRecipient records which recipient identity was used when
+// sending a specific message to this connection.
+func (c *Client) TrackMessageDeliveryRecipient(msgID, recipientID string) {
+	if msgID == "" || recipientID == "" {
+		return
+	}
+	c.deliveryMu.Lock()
+	if c.deliveryRecipientByMsgID == nil {
+		c.deliveryRecipientByMsgID = make(map[string]string)
+	}
+	c.deliveryRecipientByMsgID[msgID] = recipientID
+	c.deliveryMu.Unlock()
+}
+
+// ConsumeMessageDeliveryRecipient returns and removes the tracked recipient
+// identity for a message.
+func (c *Client) ConsumeMessageDeliveryRecipient(msgID string) string {
+	if msgID == "" {
+		return ""
+	}
+	c.deliveryMu.Lock()
+	defer c.deliveryMu.Unlock()
+	if c.deliveryRecipientByMsgID == nil {
+		return ""
+	}
+	recipientID, ok := c.deliveryRecipientByMsgID[msgID]
+	if !ok {
+		return ""
+	}
+	delete(c.deliveryRecipientByMsgID, msgID)
+	return recipientID
+}
+
+// ResetDeliveryTracking clears per-message recipient identity tracking.
+func (c *Client) ResetDeliveryTracking() {
+	c.deliveryMu.Lock()
+	c.deliveryRecipientByMsgID = make(map[string]string)
+	c.deliveryMu.Unlock()
 }
 
 // ClientRegistry manages connected clients.

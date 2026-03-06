@@ -17,6 +17,7 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
+	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
 func TestRelayLinkCompatibilityPayloadIntegrityAndAck(t *testing.T) {
@@ -79,11 +80,76 @@ func TestRelayLinkCompatibilityPayloadIntegrityAndAck(t *testing.T) {
 	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeAck, MsgID: sendOK.MsgID})
 	mustType(t, readFrame(t, b), model.FrameTypeAckOK)
 
+	legacyDelivered, err := relay.store.IsDeliveredTo(context.Background(), sendOK.MsgID, "wayfarer-b")
+	if err != nil {
+		t.Fatalf("check legacy delivery state: %v", err)
+	}
+	if !legacyDelivered {
+		t.Fatal("legacy ack should mark delivery for wayfarer bucket")
+	}
+
 	writeFrame(t, b, model.WSFrame{Type: model.FrameTypePull, Limit: 10})
 	empty := readFrame(t, b)
 	mustType(t, empty, model.FrameTypeMessages)
 	if len(empty.Messages) != 0 {
 		t.Fatalf("expected empty queue after ack, got %d", len(empty.Messages))
+	}
+}
+
+func TestRelayLinkCompatibilityDeviceScopedDeliveryAndAck(t *testing.T) {
+	relay, wsURL := startRelayForTest(t, "relay-device", false, "")
+	defer relay.close()
+
+	fixture := mustReadFixture(t)
+	b64 := base64.StdEncoding.EncodeToString(fixture)
+
+	a := mustDial(t, wsURL)
+	defer a.Close()
+	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a"})
+	mustType(t, readFrame(t, a), model.FrameTypeHelloOK)
+
+	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: b64, TTLSeconds: 120})
+	sendOK := readFrame(t, a)
+	mustType(t, sendOK, model.FrameTypeSendOK)
+
+	deviceA := mustDial(t, wsURL)
+	defer deviceA.Close()
+	writeFrame(t, deviceA, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-b", DeviceID: "device-a"})
+	mustType(t, readFrame(t, deviceA), model.FrameTypeHelloOK)
+	writeFrame(t, deviceA, model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+	pulledA := readFrame(t, deviceA)
+	mustType(t, pulledA, model.FrameTypeMessages)
+	if len(pulledA.Messages) != 1 {
+		t.Fatalf("device-a expected one message, got %d", len(pulledA.Messages))
+	}
+	writeFrame(t, deviceA, model.WSFrame{Type: model.FrameTypeAck, MsgID: sendOK.MsgID})
+	mustType(t, readFrame(t, deviceA), model.FrameTypeAckOK)
+
+	deviceAID := storeforward.DeliveryIdentity("wayfarer-b", "device-a")
+	deliveredA, err := relay.store.IsDeliveredTo(context.Background(), sendOK.MsgID, deviceAID)
+	if err != nil {
+		t.Fatalf("check device-a delivery state: %v", err)
+	}
+	if !deliveredA {
+		t.Fatal("device-a ack should mark device-specific delivery identity")
+	}
+	legacyDelivered, err := relay.store.IsDeliveredTo(context.Background(), sendOK.MsgID, "wayfarer-b")
+	if err != nil {
+		t.Fatalf("check legacy bucket after device ack: %v", err)
+	}
+	if legacyDelivered {
+		t.Fatal("device-scoped ack should not mark legacy wayfarer delivery bucket")
+	}
+
+	deviceB := mustDial(t, wsURL)
+	defer deviceB.Close()
+	writeFrame(t, deviceB, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-b", DeviceID: "device-b"})
+	mustType(t, readFrame(t, deviceB), model.FrameTypeHelloOK)
+	writeFrame(t, deviceB, model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+	pulledB := readFrame(t, deviceB)
+	mustType(t, pulledB, model.FrameTypeMessages)
+	if len(pulledB.Messages) != 1 {
+		t.Fatalf("device-b should still receive message after device-a ack, got %d", len(pulledB.Messages))
 	}
 }
 
