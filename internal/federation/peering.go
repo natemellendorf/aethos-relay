@@ -348,6 +348,8 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 			}
 			pm.handleRelayForward(peer, &frame)
 		case model.FrameTypeRelayAck:
+			// `relay_ack` is relay-level acceptance feedback for a forwarded envelope payload
+			// (called `envelope` in spec terms, forwarded as `message` in this implementation).
 			var frame model.RelayAckFrame
 			if err := json.Unmarshal(rawMsg, &frame); err != nil {
 				continue
@@ -585,6 +587,9 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 }
 
 // handleRelayAck handles relay acknowledgment frames.
+// `relay_ack` is relay-level acceptance telemetry for a forwarded envelope payload
+// (called `envelope` in the spec; this implementation currently forwards it in `message`).
+// This is separate from end-device `ack` delivery state.
 // Updates peer metrics based on ack status.
 func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
 	if peer.Metrics == nil {

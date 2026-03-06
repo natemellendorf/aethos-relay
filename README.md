@@ -33,6 +33,15 @@ go run ./cmd/relay/main.go \
   -http-addr :8081
 ```
 
+## Supported Protocol Versions
+
+- Client Relay Protocol: v1 ([CLIENT_RELAY_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md))
+- Federation Protocol: v1 ([FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md))
+- Relay conformance notes: [docs/PROTOCOL_CONFORMANCE.md](docs/PROTOCOL_CONFORMANCE.md)
+
+The canonical specification for wire protocol fields and semantics is defined in the aethos protocol repository.
+See [aethos/docs/spec](https://github.com/natemellendorf/aethos/tree/main/docs/spec).
+
 ## Flags
 
 ### Server Flags
@@ -98,6 +107,9 @@ go run ./cmd/relay/main.go \
 ## TTL Behavior
 
 Messages and envelopes have time-to-live (TTL) that controls how long they persist:
+
+The canonical specification for these behaviors is defined in the aethos protocol repository.
+See [aethos/docs/spec](https://github.com/natemellendorf/aethos/tree/main/docs/spec).
 
 - **Maximum TTL**: 7 days (604800 seconds) by default
 - **Sweeper**: Runs every 30 seconds (configurable) to remove expired messages
@@ -201,6 +213,9 @@ Response:
 
 Relays communicate via WebSocket at `/federation/ws`:
 
+The canonical specification for these behaviors is defined in the aethos protocol repository.
+See [FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md).
+
 ### Frames
 
 **relay_hello** - Initial handshake:
@@ -208,10 +223,19 @@ Relays communicate via WebSocket at `/federation/ws`:
 {"type": "relay_hello", "relay_id": "relay-us-east", "version": "1.0"}
 ```
 
-**relay_forward** - Forward envelope:
+**relay_forward** - Forward envelope payload:
+
+Current `aethos-relay` wire shape:
+```json
+{"type": "relay_forward", "message": {...}}
+```
+
+Canonical v1 spec shape:
 ```json
 {"type": "relay_forward", "envelope": {...}}
 ```
+
+Implementation note (known deviation): the current relay implementation uses `{"type":"relay_forward","message":...}` on the wire and treats `message` as the forwarded envelope payload.
 
 **relay_ack** - Acknowledge receipt:
 ```json
@@ -282,6 +306,9 @@ For local development, use dev mode:
 
 The relay uses a simple JSON-based WebSocket protocol:
 
+The canonical specification for these behaviors is defined in the aethos protocol repository.
+See [CLIENT_RELAY_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md).
+
 ### Client → Server
 
 **Hello**
@@ -334,6 +361,9 @@ The relay uses a simple JSON-based WebSocket protocol:
 ## Per-Device Delivery
 
 Messages are tracked per-device/wallet. When a message is delivered to one device, it is not suppressed for other devices of the same wayfarer ID. Each device must independently acknowledge messages to mark them as delivered.
+
+The canonical specification for these behaviors is defined in the aethos protocol repository.
+See [CLIENT_RELAY_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md).
 
 This ensures:
 - Multi-device users receive messages on all connected devices
