@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
+	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
 const (
@@ -113,6 +115,7 @@ type PeerManager struct {
 	// Peer metrics (for scoring)
 	peerMetrics map[string]*model.PeerMetrics
 	metricsMu   sync.RWMutex
+	engine      *storeforward.Engine
 }
 
 // NewPeerManager creates a new peer manager.
@@ -127,6 +130,9 @@ func NewPeerManagerWithConfig(relayID string, store store.Store, clients *model.
 	// Validate configs
 	tarConfig.Validate()
 	forwardingConfig.Validate()
+
+	engine := storeforward.New(store, maxTTL)
+	engine.ConfigureFederation(relayID, nil)
 
 	return &PeerManager{
 		relayID:            relayID,
@@ -143,12 +149,18 @@ func NewPeerManagerWithConfig(relayID string, store store.Store, clients *model.
 		forwardingConfig:   forwardingConfig,
 		forwardingStrategy: NewForwardingStrategy(forwardingConfig),
 		peerMetrics:        make(map[string]*model.PeerMetrics),
+		engine:             engine,
 	}
 }
 
 // AddPeerURL adds a peer URL to connect to.
 func (pm *PeerManager) AddPeerURL(url string) {
 	pm.outbound <- url
+}
+
+// SetEnvelopeStore wires envelope persistence into the store-and-forward engine.
+func (pm *PeerManager) SetEnvelopeStore(envelopeStore store.EnvelopeStore) {
+	pm.engine.ConfigureFederation(pm.relayID, envelopeStore)
 }
 
 // Run starts the peer manager.
@@ -542,15 +554,7 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 // handleRelayForward handles incoming forwarded messages.
 func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardFrame) {
 	msg := frame.Message
-	if msg == nil || msg.ID == "" || msg.From == "" || msg.To == "" || msg.Payload == "" {
-		return
-	}
-	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
-		return
-	}
-	// Reject oversized payloads.
-	if len(msg.Payload) > MaxForwardedPayloadSize {
-		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
+	if msg == nil {
 		return
 	}
 
@@ -558,22 +562,33 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	peer.Health.MessagesReceived++
 	peer.healthMu.Unlock()
 
-	// Dedupe: check if message already exists
 	ctx := context.Background()
-	if existing, err := pm.store.GetMessageByID(ctx, msg.ID); err == nil && existing != nil {
+	result, err := pm.engine.AcceptRelayForward(ctx, peer.ID, msg, MaxForwardedPayloadSize)
+	if err != nil {
+		switch result.Status {
+		case storeforward.RelayForwardTooLarge:
+			log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
+		case storeforward.RelayForwardInvalid:
+			return
+		default:
+			log.Printf("federation: persist forwarded message failed: %v", err)
+		}
+		return
+	}
+
+	switch result.Status {
+	case storeforward.RelayForwardDuplicate:
 		log.Printf("federation: duplicate message %s, ignoring", msg.ID)
 		return
-	}
-
-	// Verify TTL not expired
-	if time.Now().After(msg.ExpiresAt) {
+	case storeforward.RelayForwardExpired:
 		log.Printf("federation: message %s already expired, ignoring", msg.ID)
 		return
-	}
-
-	// Persist the message
-	if err := pm.store.PersistMessage(ctx, msg); err != nil {
-		log.Printf("federation: persist forwarded message failed: %v", err)
+	case storeforward.RelayForwardSeenLoop:
+		log.Printf("federation: loop-detected message %s from %s, ignoring", msg.ID, peer.ID)
+		return
+	case storeforward.RelayForwardAccepted:
+		// continue
+	default:
 		return
 	}
 
@@ -592,6 +607,8 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 // This is separate from end-device `ack` delivery state.
 // Updates peer metrics based on ack status.
 func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
+	pm.engine.RecordRelayAck(peer.ID, frame)
+
 	if peer.Metrics == nil {
 		return
 	}
@@ -632,7 +649,9 @@ func (pm *PeerManager) deliverMessage(msg *model.Message) {
 		})
 		select {
 		case r.Send <- data:
-			pm.store.MarkDelivered(context.Background(), msg.ID, r.WayfarerID)
+			if err := pm.engine.MarkDelivery(context.Background(), msg.ID, r.WayfarerID); err != nil {
+				log.Printf("federation: failed to mark delivered for %s: %v", r.WayfarerID, err)
+			}
 		default:
 		}
 	}
@@ -836,6 +855,21 @@ func (pm *PeerManager) AnnounceMessage(msg *model.Message) {
 // ForwardToPeers forwards a message to selected peers based on score.
 // This implements score-based routing with topK selection and exploration.
 func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) {
+	ctx := context.Background()
+	envelope, err := pm.engine.PrepareForwardingEnvelope(ctx, msg, pm.forwardingConfig.MaxHops)
+	if err != nil {
+		if errors.Is(err, model.ErrEnvelopeHopLimitExceeded) {
+			log.Printf("federation: hop limit exceeded for message %s", msg.ID)
+			return
+		}
+		if errors.Is(err, model.ErrEnvelopeExpired) {
+			log.Printf("federation: message %s expired before forwarding", msg.ID)
+			return
+		}
+		log.Printf("federation: failed to prepare forwarding envelope %s: %v", msg.ID, err)
+		return
+	}
+
 	// Get peer metrics
 	pm.metricsMu.RLock()
 	metricsCopy := make(map[string]*model.PeerMetrics, len(pm.peerMetrics))
@@ -854,6 +888,15 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 
 	// Forward to selected peers using batcher
 	for _, peerID := range selectedIDs {
+		allow, err := pm.engine.ReserveForwardingCandidate(ctx, envelope.ID, peerID)
+		if err != nil {
+			log.Printf("federation: failed to reserve forwarding candidate peer=%s envelope=%s: %v", peerID, envelope.ID, err)
+			continue
+		}
+		if !allow {
+			continue
+		}
+
 		pm.peersMu.RLock()
 		peer, ok := pm.peers[peerID]
 		pm.peersMu.RUnlock()

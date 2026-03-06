@@ -15,6 +15,7 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
+	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
 // OriginChecker validates WebSocket origin against an allowlist.
@@ -66,6 +67,7 @@ func (oc *OriginChecker) Check(r *http.Request) bool {
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
 	store             store.Store
+	engine            *storeforward.Engine
 	clients           *model.ClientRegistry
 	maxTTL            time.Duration
 	originChecker     *OriginChecker
@@ -80,6 +82,7 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 	originChecker := NewOriginChecker(allowedOrigins, devMode)
 	return &WSHandler{
 		store:             store,
+		engine:            storeforward.New(store, maxTTL),
 		clients:           clients,
 		maxTTL:            maxTTL,
 		originChecker:     originChecker,
@@ -247,49 +250,22 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	// Validate TTL
-	ttl := time.Duration(frame.TTLSeconds) * time.Second
-	if ttl <= 0 {
-		ttl = h.maxTTL
-	}
-	if ttl > h.maxTTL {
-		ttl = h.maxTTL
-	}
-
-	now := time.Now()
-	msg := &model.Message{
-		ID:        uuid.New().String(),
-		From:      client.WayfarerID,
-		To:        frame.To,
-		Payload:   frame.PayloadB64,
-		CreatedAt: now,
-		ExpiresAt: now.Add(ttl),
-		Delivered: false,
-	}
+	msg, ttl := h.engine.AcceptClientSend(client.WayfarerID, frame.To, frame.PayloadB64, frame.TTLSeconds)
 
 	// Check if recipient is online
 	online := h.clients.IsOnline(frame.To)
 	log.Printf("ws: send msg_id=%s from=%s to=%s ttl=%ds online=%t", msg.ID, msg.From, msg.To, int(ttl.Seconds()), online)
 
-	if online {
-		// Deliver immediately - but still persist for durability
-		if err := h.store.PersistMessage(context.Background(), msg); err != nil {
-			metrics.IncrementStoreErrors()
-			h.sendError(client, "failed to persist message")
-			return
-		}
-		metrics.IncrementPersisted()
+	if err := h.engine.PersistMessage(context.Background(), msg); err != nil {
+		metrics.IncrementStoreErrors()
+		h.sendError(client, "failed to persist message")
+		return
+	}
+	metrics.IncrementPersisted()
 
+	if online {
 		// Try to deliver
 		h.deliverToRecipient(msg)
-	} else {
-		// Persist for later delivery
-		if err := h.store.PersistMessage(context.Background(), msg); err != nil {
-			metrics.IncrementStoreErrors()
-			h.sendError(client, "failed to persist message")
-			return
-		}
-		metrics.IncrementPersisted()
 	}
 
 	// Send send_ok
@@ -320,7 +296,7 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	}
 
 	// Mark delivered for this connection's `wayfarer_id` identity.
-	if err := h.store.MarkDelivered(context.Background(), frame.MsgID, client.WayfarerID); err != nil {
+	if err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, client.WayfarerID); err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, "failed to acknowledge message")
 		return
@@ -343,12 +319,8 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	limit := frame.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 50
-	}
-
-	messages, err := h.store.GetQueuedMessages(context.Background(), client.WayfarerID, limit)
+	limit := storeforward.NormalizePullLimit(frame.Limit)
+	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), client.WayfarerID, limit)
 	if err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, "failed to pull messages")
@@ -376,7 +348,7 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 
 // deliverQueuedMessages delivers any queued messages when a client connects.
 func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
-	messages, err := h.store.GetQueuedMessages(context.Background(), client.WayfarerID, 100)
+	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), client.WayfarerID, 100)
 	if err != nil {
 		log.Printf("ws: failed to get queued messages: %v", err)
 		return
@@ -404,7 +376,7 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			At:         msg.CreatedAt.Unix(),
 		})
 		// Mark as delivered to this specific recipient
-		if err := h.store.MarkDelivered(context.Background(), msg.ID, r.WayfarerID); err != nil {
+		if err := h.engine.MarkDelivery(context.Background(), msg.ID, r.WayfarerID); err != nil {
 			metrics.IncrementStoreErrors()
 			log.Printf("ws: failed to mark delivered: %v", err)
 			continue
