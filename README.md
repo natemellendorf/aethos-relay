@@ -39,6 +39,9 @@ go run ./cmd/relay/main.go \
 - Federation Protocol: v1 ([FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md))
 - Relay conformance notes: [docs/PROTOCOL_CONFORMANCE.md](docs/PROTOCOL_CONFORMANCE.md)
 
+The canonical specification for wire protocol fields and semantics is defined in the aethos protocol repository.
+See [aethos/docs/spec](https://github.com/natemellendorf/aethos/tree/main/docs/spec).
+
 ## Flags
 
 ### Server Flags
@@ -220,7 +223,14 @@ See [FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/ma
 {"type": "relay_hello", "relay_id": "relay-us-east", "version": "1.0"}
 ```
 
-**relay_forward** - Forward envelope:
+**relay_forward** - Forward envelope payload:
+
+Current `aethos-relay` wire shape:
+```json
+{"type": "relay_forward", "message": {...}}
+```
+
+Canonical v1 spec shape:
 ```json
 {"type": "relay_forward", "envelope": {...}}
 ```
