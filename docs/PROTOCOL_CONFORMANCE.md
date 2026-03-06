@@ -1,15 +1,21 @@
 # Protocol Conformance
 
-This relay implementation follows the canonical protocol specifications defined in the `aethos` repository.
+This relay implementation targets the canonical protocol specifications defined in the `aethos` repository, with known implementation deviations listed below.
 
-- Spec index: https://github.com/natemellendorf/aethos/tree/main/docs/spec
-- Client Relay Protocol v1: https://github.com/natemellendorf/aethos/blob/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md
-- Federation Protocol v1: https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md
+- [Spec index](https://github.com/natemellendorf/aethos/tree/main/docs/spec)
+- [Client Relay Protocol v1](https://github.com/natemellendorf/aethos/blob/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md)
+- [Federation Protocol v1](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md)
 
 ## Supported Protocol Versions
 
 - Client Relay Protocol: v1
 - Federation Protocol: v1
+
+## Known Deviations (Non-Normative)
+
+- `relay_forward` canonical frame shape is `{"type":"relay_forward","envelope":{...}}` in [FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md), while current relay code uses `RelayForwardFrame` with `json:"message"` (`internal/model/message.go`) and corresponding marshal/unmarshal paths in `internal/federation/peering.go`.
+- `relay_hello` canonical field is `protocol_version` integer (v1 spec), while current relay code sends/accepts string `version` via `RelayHelloFrame` (`internal/model/message.go`) and `ProtocolVersion = "1.0"` (`internal/federation/peering.go`).
+- `relay_ack` canonical statuses are `accepted|rejected` (with optional `code`/`message`), while current relay code handles `accepted|duplicate|expired` in `handleRelayAck` (`internal/federation/peering.go`).
 
 ## Implementation Constraints (Non-Normative)
 

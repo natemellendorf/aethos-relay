@@ -202,7 +202,7 @@ func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 	case model.FrameTypeSend:
 		h.handleSend(client, frame)
 	case model.FrameTypeAck:
-		// `ack` is a client/device-level delivery acknowledgment for a message.
+		// `ack` confirms message delivery for the authenticated `wayfarer_id`.
 		h.handleAck(client, frame)
 	case model.FrameTypePull:
 		h.handlePull(client, frame)
@@ -306,7 +306,7 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 }
 
 // handleAck handles the ack frame.
-// `ack` confirms delivery for this specific connected device identity.
+// `ack` confirms delivery for the authenticated `wayfarer_id` identity.
 func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
 		h.sendError(client, "not authenticated")
@@ -317,7 +317,7 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	// Mark delivered for this specific device-level recipient identity.
+	// Mark delivered for this authenticated `wayfarer_id` identity.
 	if err := h.store.MarkDelivered(context.Background(), frame.MsgID, client.WayfarerID); err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, "failed to acknowledge message")

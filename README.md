@@ -37,6 +37,7 @@ go run ./cmd/relay/main.go \
 
 - Client Relay Protocol: v1 ([CLIENT_RELAY_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md))
 - Federation Protocol: v1 ([FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md))
+- Relay conformance notes: [docs/PROTOCOL_CONFORMANCE.md](docs/PROTOCOL_CONFORMANCE.md)
 
 ## Flags
 
@@ -223,6 +224,8 @@ See [FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/ma
 ```json
 {"type": "relay_forward", "envelope": {...}}
 ```
+
+Implementation note (known deviation): the current relay implementation uses `{"type":"relay_forward","message":...}` on the wire and treats `message` as the forwarded envelope payload.
 
 **relay_ack** - Acknowledge receipt:
 ```json
