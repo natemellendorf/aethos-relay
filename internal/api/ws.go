@@ -479,7 +479,11 @@ func (h *WSHandler) sendError(client *model.Client, code model.ErrorCode, messag
 		code = model.ErrorCodeInternalError
 	}
 	if message == "" {
-		message = "internal error"
+		if code == model.ErrorCodeInternalError {
+			message = "internal error"
+		} else {
+			message = string(code)
+		}
 	}
 
 	h.send(client, model.WSFrame{
