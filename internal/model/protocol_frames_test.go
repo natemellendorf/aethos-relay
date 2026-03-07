@@ -31,6 +31,7 @@ func TestClientFrameDecodeEncode(t *testing.T) {
 		raw            string
 		wantType       string
 		wantWayfarerID string
+		wantDeviceID   string
 		wantTo         string
 		wantMsgID      string
 	}{
@@ -39,6 +40,13 @@ func TestClientFrameDecodeEncode(t *testing.T) {
 			raw:            `{"type":"hello","wayfarer_id":"wayfarer-a"}`,
 			wantType:       FrameTypeHello,
 			wantWayfarerID: "wayfarer-a",
+		},
+		{
+			name:           "hello with device",
+			raw:            `{"type":"hello","wayfarer_id":"wayfarer-a","device_id":"device-1"}`,
+			wantType:       FrameTypeHello,
+			wantWayfarerID: "wayfarer-a",
+			wantDeviceID:   "device-1",
 		},
 		{
 			name:     "send",
@@ -71,6 +79,9 @@ func TestClientFrameDecodeEncode(t *testing.T) {
 			}
 			if tt.wantWayfarerID != "" && frame.WayfarerID != tt.wantWayfarerID {
 				t.Fatalf("wayfarer_id mismatch: got %q want %q", frame.WayfarerID, tt.wantWayfarerID)
+			}
+			if tt.wantDeviceID != "" && frame.DeviceID != tt.wantDeviceID {
+				t.Fatalf("device_id mismatch: got %q want %q", frame.DeviceID, tt.wantDeviceID)
 			}
 			if tt.wantTo != "" && frame.To != tt.wantTo {
 				t.Fatalf("to mismatch: got %q want %q", frame.To, tt.wantTo)

@@ -205,13 +205,20 @@ func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 	case model.FrameTypeSend:
 		h.handleSend(client, frame)
 	case model.FrameTypeAck:
-		// `ack` marks the message delivered for the `wayfarer_id` on this connection.
+		// `ack` marks the message delivered for the tracked recipient identity on this connection.
 		h.handleAck(client, frame)
 	case model.FrameTypePull:
 		h.handlePull(client, frame)
 	default:
 		h.sendError(client, "unknown frame type")
 	}
+}
+
+func deliveryIdentityForClient(client *model.Client) string {
+	if client.DeliveryID != "" {
+		return client.DeliveryID
+	}
+	return client.WayfarerID
 }
 
 // handleHello handles the hello frame.
@@ -221,8 +228,15 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	// Register client
+	// Legacy clients omit device_id; in that case, keep the delivery identity at
+	// the existing wayfarer-only bucket for backward compatibility.
+	deliveryID := storeforward.DeliveryIdentity(frame.WayfarerID, frame.DeviceID)
+
+	// Register client.
 	client.WayfarerID = frame.WayfarerID
+	client.DeviceID = frame.DeviceID
+	client.DeliveryID = deliveryID
+	client.ResetDeliveryTracking()
 	client.ID = uuid.New().String()
 	h.clients.Register(client)
 
@@ -282,9 +296,9 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 }
 
 // handleAck handles the ack frame.
-// `ack` marks the message delivered for the `wayfarer_id` associated with this
-// WebSocket connection (set by `hello`). The client does not provide a recipient
-// in the `ack` frame; the server uses the connection identity.
+// `ack` marks the message delivered for the recipient identity associated with
+// this WebSocket connection. The client does not provide a recipient in the
+// `ack` frame; the server resolves it from tracked delivery state.
 func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
 		h.sendError(client, "not authenticated")
@@ -295,15 +309,21 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	// Mark delivered for this connection's `wayfarer_id` identity.
-	if err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, client.WayfarerID); err != nil {
+	recipientID := client.ConsumeMessageDeliveryRecipient(frame.MsgID)
+	if recipientID == "" {
+		// Legacy fallback: if this ack cannot be tied to a tracked delivery event,
+		// write ack state under the wayfarer bucket to preserve existing behavior.
+		recipientID = client.WayfarerID
+	}
+
+	if err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, recipientID); err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, "failed to acknowledge message")
 		return
 	}
 	metrics.IncrementDelivered()
 
-	log.Printf("ws: ack msg_id=%s from=%s to=%s ttl=%ds", frame.MsgID, client.WayfarerID, client.WayfarerID, 0)
+	log.Printf("ws: ack msg_id=%s from=%s recipient_id=%s ttl=%ds", frame.MsgID, client.WayfarerID, recipientID, 0)
 
 	// Send ack_ok
 	h.send(client, model.WSFrame{
@@ -320,7 +340,8 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 	}
 
 	limit := storeforward.NormalizePullLimit(frame.Limit)
-	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), client.WayfarerID, limit)
+	deliveryID := deliveryIdentityForClient(client)
+	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), deliveryID, limit)
 	if err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, "failed to pull messages")
@@ -330,6 +351,7 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 	// Convert to response format
 	var msgs []model.Message
 	for _, m := range messages {
+		client.TrackMessageDeliveryRecipient(m.ID, deliveryID)
 		msgs = append(msgs, model.Message{
 			ID:        m.ID,
 			From:      m.From,
@@ -348,7 +370,9 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 
 // deliverQueuedMessages delivers any queued messages when a client connects.
 func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
-	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), client.WayfarerID, 100)
+	// Queue indexing remains wayfarer-scoped today; PullForDeliveryIdentity
+	// applies per-device filtering via delivery-state checks when device_id is set.
+	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), deliveryIdentityForClient(client), 100)
 	if err != nil {
 		log.Printf("ws: failed to get queued messages: %v", err)
 		return
@@ -363,11 +387,13 @@ func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
 func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 	recipients := h.clients.GetClients(msg.To)
 	for _, r := range recipients {
+		recipientID := deliveryIdentityForClient(r)
 		remainingTTL := int(time.Until(msg.ExpiresAt).Seconds())
 		if remainingTTL < 0 {
 			remainingTTL = 0
 		}
-		log.Printf("ws: deliver msg_id=%s from=%s to=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, remainingTTL)
+		log.Printf("ws: deliver msg_id=%s from=%s to=%s recipient_id=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, recipientID, remainingTTL)
+		r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
 		h.send(r, model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
@@ -376,7 +402,7 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			At:         msg.CreatedAt.Unix(),
 		})
 		// Mark as delivered to this specific recipient
-		if err := h.engine.MarkDelivery(context.Background(), msg.ID, r.WayfarerID); err != nil {
+		if err := h.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
 			metrics.IncrementStoreErrors()
 			log.Printf("ws: failed to mark delivered: %v", err)
 			continue
