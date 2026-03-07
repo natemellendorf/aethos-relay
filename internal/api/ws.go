@@ -475,6 +475,13 @@ func (h *WSHandler) send(client *model.Client, frame model.WSFrame) {
 // sendError sends canonical error fields (code/message) and temporarily mirrors
 // message into legacy msg_id for backward compatibility during migration.
 func (h *WSHandler) sendError(client *model.Client, code model.ErrorCode, message string) {
+	if code == "" {
+		code = model.ErrorCodeInternalError
+	}
+	if message == "" {
+		message = "internal error"
+	}
+
 	h.send(client, model.WSFrame{
 		Type:    model.FrameTypeError,
 		Code:    string(code),

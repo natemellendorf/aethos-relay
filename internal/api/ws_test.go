@@ -286,6 +286,28 @@ func TestHandlePullAndAckUseDeviceDeliveryIdentity(t *testing.T) {
 	}
 }
 
+func TestHandlePullIsDeliveredToFailureMapsToInternalError(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeviceID = "device-a"
+	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+
+	st.queued[client.WayfarerID] = []*model.Message{{
+		ID:        "msg-device",
+		From:      "wayfarer-a",
+		To:        client.WayfarerID,
+		Payload:   "QQ==",
+		CreatedAt: time.Now(),
+	}}
+	st.isDeliveredErr = errors.New("is delivered failed")
+
+	h.handlePull(client, &model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+
+	resp := readQueuedFrame(t, client)
+	assertErrorFrameCompat(t, resp, model.ErrorCodeInternalError, "failed to pull messages")
+}
+
 func TestHandleAckLegacyFallbackUsesWayfarerIdentity(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	client := newClientForWSHandler()
