@@ -101,30 +101,40 @@ func TestClientRegistryMutexWorksCorrectly(t *testing.T) {
 	}
 	registry.Register(client)
 
-	// Verify client is registered
-	if !registry.IsOnline("test-user") {
-		t.Error("expected client to be online")
-	}
+	awaitRegistryState(t, 100*time.Millisecond, func() bool {
+		return registry.IsOnline("test-user")
+	}, "expected client to be online")
 
-	clients := registry.GetClients("test-user")
-	if len(clients) != 1 {
-		t.Errorf("expected 1 client, got %d", len(clients))
-	}
+	awaitRegistryState(t, 100*time.Millisecond, func() bool {
+		return len(registry.GetClients("test-user")) == 1
+	}, "expected 1 client to be registered")
 
-	if registry.Count() != 1 {
-		t.Errorf("expected count 1, got %d", registry.Count())
-	}
+	awaitRegistryState(t, 100*time.Millisecond, func() bool {
+		return registry.Count() == 1
+	}, "expected registry count to be 1")
 
 	// Unregister
 	registry.Unregister(client)
-	time.Sleep(10 * time.Millisecond) // Give time for unregister to process
 
-	// Verify client is unregistered
-	if registry.IsOnline("test-user") {
-		t.Error("expected client to be offline after unregister")
+	awaitRegistryState(t, 100*time.Millisecond, func() bool {
+		return !registry.IsOnline("test-user")
+	}, "expected client to be offline after unregister")
+
+	awaitRegistryState(t, 100*time.Millisecond, func() bool {
+		return registry.Count() == 0
+	}, "expected registry count to be 0")
+}
+
+func awaitRegistryState(t *testing.T, timeout time.Duration, state func() bool, failureMessage string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if state() {
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
 
-	if registry.Count() != 0 {
-		t.Errorf("expected count 0, got %d", registry.Count())
-	}
+	t.Fatal(failureMessage)
 }

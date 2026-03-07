@@ -70,24 +70,30 @@ func (c *TARConfig) Validate() error {
 
 // PeerBatcher manages batching for a single peer.
 type PeerBatcher struct {
-	peerID   string
-	queue    chan []byte
-	config   *TARConfig
-	ctx      context.Context
-	cancel   context.CancelFunc
-	closed   bool
-	closedMu sync.Mutex
+	peerID     string
+	queue      chan []byte
+	config     *TARConfig
+	ctx        context.Context
+	cancel     context.CancelFunc
+	randIntn   func(int) int
+	randInt63  func() int64
+	randInt63n func(int64) int64
+	closed     bool
+	closedMu   sync.Mutex
 }
 
 // NewPeerBatcher creates a new peer batcher.
 func NewPeerBatcher(peerID string, queueSize int, config *TARConfig) *PeerBatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PeerBatcher{
-		peerID: peerID,
-		queue:  make(chan []byte, queueSize),
-		config: config,
-		ctx:    ctx,
-		cancel: cancel,
+		peerID:     peerID,
+		queue:      make(chan []byte, queueSize),
+		config:     config,
+		ctx:        ctx,
+		cancel:     cancel,
+		randIntn:   rand.Intn,
+		randInt63:  rand.Int63,
+		randInt63n: rand.Int63n,
 	}
 }
 
@@ -130,7 +136,11 @@ func (b *PeerBatcher) batcherLoop(sendFunc func([]byte)) {
 			// Calculate jitter (if jitter is 0, skip jitter calculation)
 			adjustedInterval := b.config.BatchInterval
 			if b.config.BatchJitter > 0 {
-				jitter := time.Duration(rand.Int63n(int64(2*b.config.BatchJitter))) - b.config.BatchJitter
+				randInt63n := b.randInt63n
+				if randInt63n == nil {
+					randInt63n = rand.Int63n
+				}
+				jitter := time.Duration(randInt63n(int64(2*b.config.BatchJitter))) - b.config.BatchJitter
 				adjustedInterval = b.config.BatchInterval + jitter
 			}
 
@@ -172,16 +182,27 @@ func (b *PeerBatcher) sendCoverFrames(sendFunc func([]byte)) {
 	}
 
 	// Random number of cover frames (0 to CoverMax)
-	numCover := rand.Intn(b.config.CoverMax + 1)
+	randIntn := b.randIntn
+	if randIntn == nil {
+		randIntn = rand.Intn
+	}
+	numCover := randIntn(b.config.CoverMax + 1)
 	if numCover == 0 {
 		return
 	}
 
+	randInt63 := b.randInt63
+	if randInt63 == nil {
+		randInt63 = rand.Int63
+	}
+
 	for i := 0; i < numCover; i++ {
+		now := time.Now()
 		cover := model.RelayCoverFrame{
 			Type:      model.FrameTypeRelayCover,
-			Timestamp: time.Now().Unix(),
-			Nonce:     rand.Int63(),
+			Timestamp: now.Unix(),
+			SentAt:    uint64(now.UnixMilli()),
+			Nonce:     randInt63(),
 		}
 		data, err := json.Marshal(cover)
 		if err != nil {

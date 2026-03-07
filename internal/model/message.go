@@ -33,17 +33,25 @@ type DeliveryState struct {
 
 // WSFrame represents a WebSocket frame (protocol v1).
 type WSFrame struct {
-	Type       string    `json:"type"`
-	WayfarerID string    `json:"wayfarer_id,omitempty"`
-	DeviceID   string    `json:"device_id,omitempty"`
-	From       string    `json:"from,omitempty"`
-	To         string    `json:"to,omitempty"`
-	TTLSeconds int       `json:"ttl_seconds,omitempty"`
-	PayloadB64 string    `json:"payload_b64,omitempty"`
-	MsgID      string    `json:"msg_id,omitempty"`
-	Limit      int       `json:"limit,omitempty"`
-	Messages   []Message `json:"messages,omitempty"`
-	At         int64     `json:"at,omitempty"`
+	Type       string          `json:"type"`
+	WayfarerID string          `json:"wayfarer_id,omitempty"`
+	DeviceID   string          `json:"device_id,omitempty"`
+	From       string          `json:"from,omitempty"`
+	To         string          `json:"to,omitempty"`
+	TTLSeconds int             `json:"ttl_seconds,omitempty"`
+	PayloadB64 string          `json:"payload_b64,omitempty"`
+	MsgID      string          `json:"msg_id,omitempty"`
+	Limit      int             `json:"limit,omitempty"`
+	Messages   []WSPullMessage `json:"messages,omitempty"`
+	At         int64           `json:"at,omitempty"`
+	ReceivedAt int64           `json:"received_at,omitempty"`
+	ExpiresAt  int64           `json:"expires_at,omitempty"`
+}
+
+// WSPullMessage represents a message entry in a `messages` pull response.
+type WSPullMessage struct {
+	Message
+	ReceivedAt int64 `json:"received_at"`
 }
 
 // Frame types (protocol v1)
@@ -91,8 +99,15 @@ type RelayRequestFrame struct {
 
 // RelayForwardFrame carries a full message to be forwarded.
 type RelayForwardFrame struct {
-	Type    string   `json:"type"`
-	Message *Message `json:"message"`
+	Type     string                        `json:"type"`
+	Message  *Message                      `json:"message"`
+	Envelope *RelayForwardEnvelopeMetadata `json:"envelope,omitempty"`
+}
+
+// RelayForwardEnvelopeMetadata carries canonical federation envelope timestamps.
+type RelayForwardEnvelopeMetadata struct {
+	CreatedAt uint64 `json:"created_at"`
+	ExpiresAt uint64 `json:"expires_at"`
 }
 
 // RelayAckFrame acknowledges receipt of a forwarded envelope.
@@ -108,6 +123,7 @@ type RelayAckFrame struct {
 type RelayCoverFrame struct {
 	Type      string `json:"type"`
 	Timestamp int64  `json:"ts"`
+	SentAt    uint64 `json:"sent_at,omitempty"`
 	Nonce     int64  `json:"nonce"`
 }
 

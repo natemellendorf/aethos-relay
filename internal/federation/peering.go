@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,7 +37,20 @@ const (
 	// MaxForwardedPayloadSize is the maximum allowed byte length of a forwarded
 	// message's base64-encoded payload.
 	MaxForwardedPayloadSize = 64 * 1024
+
+	// DecodeWarningInterval is the minimum time between repeated malformed-frame
+	// warnings for the same peer and decode stage.
+	DecodeWarningInterval = 10 * time.Second
+
+	// DecodeWarningRawPrefixLimit bounds raw frame preview logging.
+	DecodeWarningRawPrefixLimit = 160
+
+	// decodeWarningRawPrefixTrimSlack captures nearby non-whitespace bytes when
+	// leading/trailing whitespace is trimmed from malformed frame previews.
+	decodeWarningRawPrefixTrimSlack = 32
 )
+
+var decodeWarningWhitespaceReplacer = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
 
 // Peer represents a connected relay peer.
 type Peer struct {
@@ -115,6 +129,9 @@ type PeerManager struct {
 	peerMetrics map[string]*model.PeerMetrics
 	metricsMu   sync.RWMutex
 	engine      *storeforward.Engine
+
+	decodeWarningsMu sync.Mutex
+	decodeWarnings   map[string]time.Time
 }
 
 // NewPeerManager creates a new peer manager.
@@ -149,6 +166,7 @@ func NewPeerManagerWithConfig(relayID string, store store.Store, clients *model.
 		forwardingStrategy: NewForwardingStrategy(forwardingConfig),
 		peerMetrics:        make(map[string]*model.PeerMetrics),
 		engine:             engine,
+		decodeWarnings:     make(map[string]time.Time),
 	}
 }
 
@@ -213,6 +231,7 @@ func (pm *PeerManager) dialPeer(url string) {
 			delay = min(delay*2, ReconnectMaxDelay)
 			continue
 		}
+		conn.SetReadLimit(model.WebSocketReadLimitBytes)
 
 		peerID := uuid.New().String()
 		peer := &Peer{
@@ -326,6 +345,7 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(rawMsg, &frameType); err != nil {
+			pm.logDecodeWarning(peer, "frame_type", err, rawMsg)
 			continue
 		}
 
@@ -355,6 +375,7 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 		case model.FrameTypeRelayForward:
 			var frame model.RelayForwardFrame
 			if err := json.Unmarshal(rawMsg, &frame); err != nil {
+				pm.logDecodeWarning(peer, "relay_forward", err, rawMsg)
 				continue
 			}
 			pm.handleRelayForward(peer, &frame)
@@ -371,6 +392,88 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 			// Just update last seen
 		}
 	}
+}
+
+func (pm *PeerManager) logDecodeWarning(peer *Peer, stage string, err error, rawMsg json.RawMessage) {
+	if !pm.shouldLogDecodeWarning(peer, stage) {
+		return
+	}
+	log.Printf(
+		"federation: dropped malformed %s frame from relay_id=%s addr=%s: %v raw_prefix=%q",
+		stage,
+		peerRelayID(peer),
+		peerAddr(peer),
+		err,
+		decodeWarningRawPrefix(rawMsg),
+	)
+}
+
+func (pm *PeerManager) shouldLogDecodeWarning(peer *Peer, stage string) bool {
+	key := stage + "|" + decodeWarningPeerKey(peer)
+	now := time.Now()
+
+	pm.decodeWarningsMu.Lock()
+	defer pm.decodeWarningsMu.Unlock()
+
+	last, ok := pm.decodeWarnings[key]
+	if ok && now.Sub(last) < DecodeWarningInterval {
+		return false
+	}
+	pm.decodeWarnings[key] = now
+	return true
+}
+
+func decodeWarningPeerKey(peer *Peer) string {
+	if peer == nil {
+		return "unknown"
+	}
+	if peer.ID != "" {
+		return "relay_id:" + peer.ID
+	}
+	if peer.URL != "" {
+		return "addr:" + peer.URL
+	}
+	return "unknown"
+}
+
+func peerRelayID(peer *Peer) string {
+	if peer == nil || peer.ID == "" {
+		return "unknown"
+	}
+	return peer.ID
+}
+
+func peerAddr(peer *Peer) string {
+	if peer == nil || peer.URL == "" {
+		return "unknown"
+	}
+	return peer.URL
+}
+
+func decodeWarningRawPrefix(rawMsg json.RawMessage) string {
+	if len(rawMsg) == 0 {
+		return ""
+	}
+	rawPrefixLimit := DecodeWarningRawPrefixLimit + decodeWarningRawPrefixTrimSlack
+	if len(rawMsg) > rawPrefixLimit {
+		rawMsg = rawMsg[:rawPrefixLimit]
+	}
+	prefix := strings.TrimSpace(string(rawMsg))
+	prefix = decodeWarningWhitespaceReplacer.Replace(prefix)
+	if len(prefix) <= DecodeWarningRawPrefixLimit {
+		return prefix
+	}
+	return prefix[:DecodeWarningRawPrefixLimit-3] + "..."
+}
+
+func deliveryIdentityForClient(client *model.Client) string {
+	if client == nil {
+		return ""
+	}
+	if client.DeliveryID != "" {
+		return client.DeliveryID
+	}
+	return client.WayfarerID
 }
 
 // writeLoop writes messages to a peer.
@@ -531,8 +634,9 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 		}
 
 		forward := model.RelayForwardFrame{
-			Type:    model.FrameTypeRelayForward,
-			Message: msg,
+			Type:     model.FrameTypeRelayForward,
+			Message:  msg,
+			Envelope: relayForwardEnvelopeFromMessage(msg),
 		}
 		data, err := json.Marshal(forward)
 		if err != nil {
@@ -552,6 +656,19 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 
 // handleRelayForward handles incoming forwarded messages.
 func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardFrame) {
+	now := time.Now()
+	if envelopeErr := relayForwardEnvelopeValidationError(frame.Envelope, now); envelopeErr != "" {
+		peerID := "unknown"
+		if peer != nil && peer.ID != "" {
+			peerID = peer.ID
+		}
+		if !hasValidLegacyRelayForwardTimestamps(frame.Message, now) {
+			log.Printf("federation: rejecting relay_forward from peer %s: invalid envelope metadata (%s) and invalid legacy message timestamps", peerID, envelopeErr)
+			return
+		}
+		log.Printf("federation: warning invalid relay_forward envelope from peer %s: %s; falling back to legacy message timestamps", peerID, envelopeErr)
+	}
+
 	msg := frame.Message
 	if msg == nil {
 		return
@@ -560,6 +677,9 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 		return
 	}
 	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
+		return
+	}
+	if msg.CreatedAt.After(msg.ExpiresAt) {
 		return
 	}
 	if len(msg.Payload) > MaxForwardedPayloadSize {
@@ -608,6 +728,48 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	// Do not re-gossip forwarded messages to avoid message loops.
 }
 
+func relayForwardEnvelopeFromMessage(msg *model.Message) *model.RelayForwardEnvelopeMetadata {
+	if msg == nil {
+		return nil
+	}
+	return &model.RelayForwardEnvelopeMetadata{
+		CreatedAt: uint64(msg.CreatedAt.UnixMilli()),
+		ExpiresAt: uint64(msg.ExpiresAt.UnixMilli()),
+	}
+}
+
+func relayForwardEnvelopeValidationError(envelope *model.RelayForwardEnvelopeMetadata, now time.Time) string {
+	if envelope == nil {
+		return ""
+	}
+	if envelope.CreatedAt == 0 || envelope.ExpiresAt == 0 {
+		return "missing created_at or expires_at"
+	}
+	if envelope.CreatedAt > envelope.ExpiresAt {
+		return "created_at is after expires_at"
+	}
+	if now.UnixMilli() < 0 {
+		return "invalid local clock"
+	}
+	if uint64(now.UnixMilli()) >= envelope.ExpiresAt {
+		return "envelope is expired"
+	}
+	return ""
+}
+
+func hasValidLegacyRelayForwardTimestamps(msg *model.Message, now time.Time) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
+		return false
+	}
+	if msg.CreatedAt.After(msg.ExpiresAt) {
+		return false
+	}
+	return !now.After(msg.ExpiresAt)
+}
+
 // handleRelayAck handles relay acknowledgment frames.
 // `relay_ack` is relay-level acceptance telemetry for a forwarded envelope payload
 // (called `envelope` in the spec; this implementation currently forwards it in `message`).
@@ -645,17 +807,24 @@ func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
 func (pm *PeerManager) deliverMessage(msg *model.Message) {
 	recipients := pm.clients.GetClients(msg.To)
 	for _, r := range recipients {
+		recipientID := deliveryIdentityForClient(r)
+		if recipientID == "" {
+			continue
+		}
+		receivedAt := msg.CreatedAt.Unix()
 		data, _ := json.Marshal(model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
 			From:       msg.From,
 			PayloadB64: msg.Payload,
-			At:         msg.CreatedAt.Unix(),
+			At:         receivedAt,
+			ReceivedAt: receivedAt,
 		})
 		select {
 		case r.Send <- data:
-			if err := pm.engine.MarkDelivery(context.Background(), msg.ID, r.WayfarerID); err != nil {
-				log.Printf("federation: failed to mark delivered for %s: %v", r.WayfarerID, err)
+			r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
+			if err := pm.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
+				log.Printf("federation: failed to mark delivered for %s: %v", recipientID, err)
 			}
 		default:
 		}
@@ -803,6 +972,7 @@ func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request)
 		log.Printf("federation: upgrade failed: %v", err)
 		return
 	}
+	conn.SetReadLimit(model.WebSocketReadLimitBytes)
 
 	peerID := uuid.New().String()
 	peer := &Peer{
@@ -894,8 +1064,9 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 
 		// Create forward frame
 		forward := model.RelayForwardFrame{
-			Type:    model.FrameTypeRelayForward,
-			Message: msg,
+			Type:     model.FrameTypeRelayForward,
+			Message:  msg,
+			Envelope: relayForwardEnvelopeFromMessage(msg),
 		}
 
 		// Apply padding if enabled
