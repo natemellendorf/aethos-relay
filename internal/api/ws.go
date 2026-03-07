@@ -133,6 +133,7 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Send:       make(chan []byte, 256),
 		WayfarerID: "",
 	}
+	client.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64)
 
 	// Start writer goroutine
 	go h.writePump(client)
@@ -265,7 +266,16 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	msg, ttl := h.engine.AcceptClientSend(client.WayfarerID, frame.To, frame.PayloadB64, frame.TTLSeconds)
+	normalizedPayloadB64 := model.NormalizePayloadB64(frame.PayloadB64)
+	if _, err := model.DecodePayloadB64(normalizedPayloadB64); err != nil {
+		log.Printf("ws: rejecting send from=%s to=%s: invalid payload_b64: %v", client.WayfarerID, frame.To, err)
+		h.sendError(client, "invalid payload_b64")
+		return
+	}
+
+	client.SetPayloadEncodingPref(model.DetectPayloadB64EncodingPref(normalizedPayloadB64))
+
+	msg, ttl := h.engine.AcceptClientSend(client.WayfarerID, frame.To, normalizedPayloadB64, frame.TTLSeconds)
 
 	// Check if recipient is online
 	online := h.clients.IsOnline(frame.To)
@@ -358,10 +368,17 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 		if m == nil {
 			continue
 		}
+		decodedPayload, err := model.DecodePayloadB64(m.Payload)
+		if err != nil {
+			h.dropCorruptMessage(m.ID, deliveryID, "pull", err)
+			continue
+		}
+		wireMessage := *m
+		wireMessage.Payload = model.EncodePayloadB64(decodedPayload, client.GetPayloadEncodingPref())
 		receivedAt := m.CreatedAt.Unix()
-		client.TrackMessageDeliveryRecipient(m.ID, deliveryID)
+		client.TrackMessageDeliveryRecipient(wireMessage.ID, deliveryID)
 		msgs = append(msgs, model.WSPullMessage{
-			Message:    *m,
+			Message:    wireMessage,
 			ReceivedAt: receivedAt,
 		})
 	}
@@ -389,9 +406,16 @@ func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
 
 // deliverToRecipient delivers a message to the recipient if online.
 func (h *WSHandler) deliverToRecipient(msg *model.Message) {
+	decodedPayload, err := model.DecodePayloadB64(msg.Payload)
+	if err != nil {
+		h.dropCorruptMessage(msg.ID, msg.To, "deliver", err)
+		return
+	}
+
 	recipients := h.clients.GetClients(msg.To)
 	for _, r := range recipients {
 		recipientID := deliveryIdentityForClient(r)
+		payloadB64 := model.EncodePayloadB64(decodedPayload, r.GetPayloadEncodingPref())
 		remainingTTL := int(time.Until(msg.ExpiresAt).Seconds())
 		if remainingTTL < 0 {
 			remainingTTL = 0
@@ -403,7 +427,7 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
 			From:       msg.From,
-			PayloadB64: msg.Payload,
+			PayloadB64: payloadB64,
 			At:         receivedAt,
 			ReceivedAt: receivedAt,
 		})
@@ -414,6 +438,19 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			continue
 		}
 		metrics.IncrementDelivered()
+	}
+}
+
+func (h *WSHandler) dropCorruptMessage(msgID, recipientID, stage string, decodeErr error) {
+	if msgID == "" {
+		log.Printf("ws: skipping corrupt payload removal with empty msg_id recipient=%s stage=%s: %v", recipientID, stage, decodeErr)
+		return
+	}
+
+	log.Printf("ws: dropping corrupt payload msg_id=%s recipient=%s stage=%s: %v", msgID, recipientID, stage, decodeErr)
+	if err := h.engine.RemoveMessage(context.Background(), msgID); err != nil {
+		metrics.IncrementStoreErrors()
+		log.Printf("ws: failed to remove corrupt message msg_id=%s stage=%s: %v", msgID, stage, err)
 	}
 }
 

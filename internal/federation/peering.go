@@ -632,11 +632,23 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 		if err != nil {
 			continue
 		}
+		if msg == nil {
+			continue
+		}
+
+		normalizedPayload := model.NormalizePayloadB64(msg.Payload)
+		if _, err := model.DecodePayloadB64(normalizedPayload); err != nil {
+			pm.dropCorruptMessage(msg.ID, "relay_request", peerRelayID(peer), err)
+			continue
+		}
+
+		forwardMessage := *msg
+		forwardMessage.Payload = normalizedPayload
 
 		forward := model.RelayForwardFrame{
 			Type:     model.FrameTypeRelayForward,
-			Message:  msg,
-			Envelope: relayForwardEnvelopeFromMessage(msg),
+			Message:  &forwardMessage,
+			Envelope: relayForwardEnvelopeFromMessage(&forwardMessage),
 		}
 		data, err := json.Marshal(forward)
 		if err != nil {
@@ -673,6 +685,7 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	if msg == nil {
 		return
 	}
+	msg.Payload = model.NormalizePayloadB64(msg.Payload)
 	if msg.ID == "" || msg.From == "" || msg.To == "" || msg.Payload == "" {
 		return
 	}
@@ -684,6 +697,10 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	}
 	if len(msg.Payload) > MaxForwardedPayloadSize {
 		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
+		return
+	}
+	if _, err := model.DecodePayloadB64(msg.Payload); err != nil {
+		log.Printf("federation: rejecting relay_forward %s from %s: invalid payload_b64: %v", msg.ID, peerRelayID(peer), err)
 		return
 	}
 
@@ -805,18 +822,25 @@ func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
 
 // deliverMessage delivers a message to local recipients.
 func (pm *PeerManager) deliverMessage(msg *model.Message) {
+	decodedPayload, err := model.DecodePayloadB64(msg.Payload)
+	if err != nil {
+		pm.dropCorruptMessage(msg.ID, "deliver_local", msg.To, err)
+		return
+	}
+
 	recipients := pm.clients.GetClients(msg.To)
 	for _, r := range recipients {
 		recipientID := deliveryIdentityForClient(r)
 		if recipientID == "" {
 			continue
 		}
+		payloadB64 := model.EncodePayloadB64(decodedPayload, r.GetPayloadEncodingPref())
 		receivedAt := msg.CreatedAt.Unix()
 		data, _ := json.Marshal(model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
 			From:       msg.From,
-			PayloadB64: msg.Payload,
+			PayloadB64: payloadB64,
 			At:         receivedAt,
 			ReceivedAt: receivedAt,
 		})
@@ -828,6 +852,18 @@ func (pm *PeerManager) deliverMessage(msg *model.Message) {
 			}
 		default:
 		}
+	}
+}
+
+func (pm *PeerManager) dropCorruptMessage(msgID, stage, peerContext string, decodeErr error) {
+	if msgID == "" {
+		log.Printf("federation: skipping corrupt payload removal with empty msg_id stage=%s peer=%s: %v", stage, peerContext, decodeErr)
+		return
+	}
+
+	log.Printf("federation: dropping corrupt payload msg_id=%s stage=%s peer=%s: %v", msgID, stage, peerContext, decodeErr)
+	if err := pm.engine.RemoveMessage(context.Background(), msgID); err != nil {
+		log.Printf("federation: failed to remove corrupt payload msg_id=%s stage=%s: %v", msgID, stage, err)
 	}
 }
 
@@ -1030,6 +1066,19 @@ func (pm *PeerManager) AnnounceMessage(msg *model.Message) {
 // ForwardToPeers forwards a message to selected peers based on score.
 // This implements score-based routing with topK selection and exploration.
 func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) {
+	if msg == nil {
+		return
+	}
+
+	normalizedPayload := model.NormalizePayloadB64(msg.Payload)
+	if _, err := model.DecodePayloadB64(normalizedPayload); err != nil {
+		pm.dropCorruptMessage(msg.ID, "forward_to_peers", originRelayID, err)
+		return
+	}
+
+	forwardMessage := *msg
+	forwardMessage.Payload = normalizedPayload
+
 	// Get peer metrics
 	pm.metricsMu.RLock()
 	metricsCopy := make(map[string]*model.PeerMetrics, len(pm.peerMetrics))
@@ -1042,7 +1091,7 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 	selectedIDs := pm.forwardingStrategy.SelectPeers(metricsCopy, originRelayID)
 
 	if len(selectedIDs) == 0 {
-		log.Printf("federation: no selected peers to forward message %s", msg.ID)
+		log.Printf("federation: no selected peers to forward message %s", forwardMessage.ID)
 		return
 	}
 
@@ -1065,8 +1114,8 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 		// Create forward frame
 		forward := model.RelayForwardFrame{
 			Type:     model.FrameTypeRelayForward,
-			Message:  msg,
-			Envelope: relayForwardEnvelopeFromMessage(msg),
+			Message:  &forwardMessage,
+			Envelope: relayForwardEnvelopeFromMessage(&forwardMessage),
 		}
 
 		// Apply padding if enabled

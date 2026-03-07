@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +31,8 @@ type wsStoreSpy struct {
 	mu sync.Mutex
 
 	queued            map[string][]*model.Message
+	persisted         []*model.Message
+	removedMsgIDs     []string
 	markDelivered     []deliveredCall
 	isDeliveredChecks []deliveredCall
 	getQueuedCalls    []string
@@ -46,6 +51,10 @@ func (s *wsStoreSpy) Open() error { return nil }
 func (s *wsStoreSpy) Close() error { return nil }
 
 func (s *wsStoreSpy) PersistMessage(ctx context.Context, msg *model.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copyMsg := *msg
+	s.persisted = append(s.persisted, &copyMsg)
 	return nil
 }
 
@@ -87,6 +96,23 @@ func (s *wsStoreSpy) GetMessageByID(ctx context.Context, msgID string) (*model.M
 }
 
 func (s *wsStoreSpy) RemoveMessage(ctx context.Context, msgID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removedMsgIDs = append(s.removedMsgIDs, msgID)
+	for recipientID, queued := range s.queued {
+		filtered := make([]*model.Message, 0, len(queued))
+		for _, msg := range queued {
+			if msg == nil || msg.ID != msgID {
+				filtered = append(filtered, msg)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(s.queued, recipientID)
+			continue
+		}
+		s.queued[recipientID] = filtered
+	}
+	delete(s.deliveredByMsg, msgID)
 	return nil
 }
 
@@ -121,10 +147,12 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 }
 
 func newClientForWSHandler() *model.Client {
-	return &model.Client{
+	client := &model.Client{
 		Conn: &wsTestConn{},
 		Send: make(chan []byte, 16),
 	}
+	client.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64)
+	return client
 }
 
 func readQueuedFrame(t *testing.T, c *model.Client) model.WSFrame {
@@ -282,6 +310,90 @@ func TestHandleSendSendOKIncludesCanonicalAndLegacyTimestamps(t *testing.T) {
 	}
 }
 
+func TestHandleSendRejectsInvalidPayloadB64(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	sender := newClientForWSHandler()
+	sender.WayfarerID = "wayfarer-a"
+
+	h.handleSend(sender, &model.WSFrame{
+		Type:       model.FrameTypeSend,
+		To:         "wayfarer-b",
+		PayloadB64: "%%%",
+		TTLSeconds: 120,
+	})
+
+	resp := readQueuedFrame(t, sender)
+	if resp.Type != model.FrameTypeError {
+		t.Fatalf("expected error frame, got %q", resp.Type)
+	}
+	if resp.MsgID != "invalid payload_b64" {
+		t.Fatalf("unexpected error payload: got %q", resp.MsgID)
+	}
+}
+
+func TestHandleSendInfersPayloadEncodingPreference(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    model.PayloadEncodingPref
+	}{
+		{name: "dash implies base64url", payload: "-_8", want: model.PayloadEncodingPrefBase64URL},
+		{name: "plus implies base64", payload: "+/8=", want: model.PayloadEncodingPrefBase64},
+		{name: "unpadded length implies base64url", payload: "Zg", want: model.PayloadEncodingPrefBase64URL},
+		{name: "ambiguous padded defaults base64", payload: "Zm8=", want: model.PayloadEncodingPrefBase64},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newWSHandlerWithSpyStore(t)
+			sender := newClientForWSHandler()
+			sender.WayfarerID = "wayfarer-a"
+
+			h.handleSend(sender, &model.WSFrame{
+				Type:       model.FrameTypeSend,
+				To:         "wayfarer-b",
+				PayloadB64: tt.payload,
+				TTLSeconds: 120,
+			})
+
+			resp := readQueuedFrame(t, sender)
+			if resp.Type != model.FrameTypeSendOK {
+				t.Fatalf("expected send_ok frame, got %q", resp.Type)
+			}
+			if sender.GetPayloadEncodingPref() != tt.want {
+				t.Fatalf("preference mismatch: got %v want %v", sender.GetPayloadEncodingPref(), tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleSendNormalizesPayloadWhitespaceBeforePersist(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	sender := newClientForWSHandler()
+	sender.WayfarerID = "wayfarer-a"
+
+	h.handleSend(sender, &model.WSFrame{
+		Type:       model.FrameTypeSend,
+		To:         "wayfarer-b",
+		PayloadB64: " \n\tQQ==\r ",
+		TTLSeconds: 120,
+	})
+
+	resp := readQueuedFrame(t, sender)
+	if resp.Type != model.FrameTypeSendOK {
+		t.Fatalf("expected send_ok frame, got %q", resp.Type)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.persisted) != 1 {
+		t.Fatalf("expected one persisted message, got %d", len(st.persisted))
+	}
+	if st.persisted[0].Payload != "QQ==" {
+		t.Fatalf("expected normalized payload, got %q", st.persisted[0].Payload)
+	}
+}
+
 func TestDeliverToRecipientIncludesCanonicalAndLegacyMessageTimestamps(t *testing.T) {
 	h, _ := newWSHandlerWithSpyStore(t)
 	recipient := newClientForWSHandler()
@@ -329,6 +441,212 @@ func TestDeliverToRecipientIncludesCanonicalAndLegacyMessageTimestamps(t *testin
 	}
 	if _, ok := decoded["expires_at"]; ok {
 		t.Fatal("message push should not include expires_at")
+	}
+}
+
+func TestDeliverToRecipientEncodesPayloadByRecipientPreference(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	recipientURL := newClientForWSHandler()
+	recipientURL.WayfarerID = "wayfarer-b"
+	recipientURL.DeliveryID = "wayfarer-b"
+	recipientURL.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64URL)
+	h.clients.Register(recipientURL)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if h.clients.Count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if h.clients.Count() == 0 {
+		t.Fatal("expected recipient to be registered")
+	}
+
+	createdAt := time.Unix(1_700_000_789, 0).UTC()
+	h.deliverToRecipient(&model.Message{
+		ID:        "msg-url-pref",
+		From:      "wayfarer-a",
+		To:        "wayfarer-b",
+		Payload:   "+/8=",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	})
+
+	frame := readQueuedFrame(t, recipientURL)
+	if frame.Type != model.FrameTypeMessage {
+		t.Fatalf("expected message frame, got %q", frame.Type)
+	}
+	if frame.PayloadB64 != "-_8" {
+		t.Fatalf("expected base64url payload, got %q", frame.PayloadB64)
+	}
+	if strings.Contains(frame.PayloadB64, "=") {
+		t.Fatalf("base64url payload should be unpadded, got %q", frame.PayloadB64)
+	}
+	decoded, err := model.DecodePayloadB64(frame.PayloadB64)
+	if err != nil {
+		t.Fatalf("decode delivered payload: %v", err)
+	}
+	if base64.StdEncoding.EncodeToString(decoded) != "+/8=" {
+		t.Fatalf("round-trip payload mismatch: got %q", base64.StdEncoding.EncodeToString(decoded))
+	}
+}
+
+func TestHandlePullEncodesPayloadByRecipientPreference(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeliveryID = "wayfarer-b"
+	client.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64URL)
+
+	createdAt := time.Unix(1_700_000_900, 0).UTC()
+	st.queued[client.WayfarerID] = []*model.Message{{
+		ID:        "msg-pull-url-pref",
+		From:      "wayfarer-a",
+		To:        client.WayfarerID,
+		Payload:   "+/8=",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}}
+
+	h.handlePull(client, &model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+
+	frame := readQueuedFrame(t, client)
+	if frame.Type != model.FrameTypeMessages {
+		t.Fatalf("expected messages frame, got %q", frame.Type)
+	}
+	if len(frame.Messages) != 1 {
+		t.Fatalf("expected one message, got %d", len(frame.Messages))
+	}
+	if frame.Messages[0].Payload != "-_8" {
+		t.Fatalf("expected base64url payload in pull response, got %q", frame.Messages[0].Payload)
+	}
+	if strings.Contains(frame.Messages[0].Payload, "=") {
+		t.Fatalf("expected unpadded base64url payload in pull response, got %q", frame.Messages[0].Payload)
+	}
+	decoded, err := model.DecodePayloadB64(frame.Messages[0].Payload)
+	if err != nil {
+		t.Fatalf("decode pulled payload: %v", err)
+	}
+	if base64.StdEncoding.EncodeToString(decoded) != "+/8=" {
+		t.Fatalf("round-trip pulled payload mismatch: got %q", base64.StdEncoding.EncodeToString(decoded))
+	}
+}
+
+func TestHandlePullRemovesCorruptPayloadFromQueue(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeliveryID = "wayfarer-b"
+
+	createdAt := time.Unix(1_700_001_100, 0).UTC()
+	st.queued[client.WayfarerID] = []*model.Message{{
+		ID:        "msg-corrupt-pull",
+		From:      "wayfarer-a",
+		To:        client.WayfarerID,
+		Payload:   "%%%",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}}
+
+	h.handlePull(client, &model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+	first := readQueuedFrame(t, client)
+	if first.Type != model.FrameTypeMessages {
+		t.Fatalf("expected messages frame, got %q", first.Type)
+	}
+	if len(first.Messages) != 0 {
+		t.Fatalf("expected no messages after corrupt payload removal, got %d", len(first.Messages))
+	}
+
+	h.handlePull(client, &model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+	second := readQueuedFrame(t, client)
+	if len(second.Messages) != 0 {
+		t.Fatalf("expected corrupt message to stay removed, got %d messages", len(second.Messages))
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.removedMsgIDs) != 1 || st.removedMsgIDs[0] != "msg-corrupt-pull" {
+		t.Fatalf("unexpected removed message ids: %v", st.removedMsgIDs)
+	}
+	if queued := st.queued[client.WayfarerID]; len(queued) != 0 {
+		t.Fatalf("expected queue to be empty after corruption cleanup, got %d", len(queued))
+	}
+}
+
+func TestDeliverToRecipientRemovesCorruptPayloadFromQueue(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+
+	createdAt := time.Unix(1_700_001_200, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-corrupt-deliver",
+		From:      "wayfarer-a",
+		To:        "wayfarer-b",
+		Payload:   "%%%",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}
+	st.queued[msg.To] = []*model.Message{msg}
+
+	h.deliverToRecipient(msg)
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.removedMsgIDs) != 1 || st.removedMsgIDs[0] != msg.ID {
+		t.Fatalf("unexpected removed message ids: %v", st.removedMsgIDs)
+	}
+	if queued := st.queued[msg.To]; len(queued) != 0 {
+		t.Fatalf("expected queue to be empty after corruption cleanup, got %d", len(queued))
+	}
+}
+
+func TestDropCorruptMessageSkipsEmptyMsgID(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+
+	h.dropCorruptMessage("", "wayfarer-b", "pull", errors.New("decode failed"))
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.removedMsgIDs) != 0 {
+		t.Fatalf("expected no remove calls for empty msg_id, got %v", st.removedMsgIDs)
+	}
+}
+
+func TestDeliverToRecipientDefaultsToLegacyBase64Padding(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	recipient := newClientForWSHandler()
+	recipient.WayfarerID = "wayfarer-b"
+	recipient.DeliveryID = "wayfarer-b"
+	recipient.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64)
+	h.clients.Register(recipient)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if h.clients.Count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if h.clients.Count() == 0 {
+		t.Fatal("expected recipient to be registered")
+	}
+
+	createdAt := time.Unix(1_700_001_000, 0).UTC()
+	h.deliverToRecipient(&model.Message{
+		ID:        "msg-std-pref",
+		From:      "wayfarer-a",
+		To:        "wayfarer-b",
+		Payload:   "-_8",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	})
+
+	frame := readQueuedFrame(t, recipient)
+	if frame.PayloadB64 != "+/8=" {
+		t.Fatalf("expected standard base64 payload, got %q", frame.PayloadB64)
+	}
+	if !strings.Contains(frame.PayloadB64, "=") {
+		t.Fatalf("expected padded standard base64 payload, got %q", frame.PayloadB64)
 	}
 }
 

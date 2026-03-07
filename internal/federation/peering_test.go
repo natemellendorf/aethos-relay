@@ -24,6 +24,7 @@ type mockStore struct {
 	mu        sync.Mutex
 	messages  map[string]*model.Message // msg.ID -> msg
 	delivered map[string]bool           // msgID+recipientID -> delivered
+	removed   []string
 	persisted int
 }
 
@@ -89,6 +90,7 @@ func (m *mockStore) GetQueuedMessages(_ context.Context, to string, limit int) (
 func (m *mockStore) RemoveMessage(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.removed = append(m.removed, id)
 	delete(m.messages, id)
 	return nil
 }
@@ -371,6 +373,42 @@ func TestHandleRelayRequest_ForwardIncludesEnvelopeTimestamps(t *testing.T) {
 	}
 }
 
+func TestHandleRelayRequest_RemovesInvalidStoredPayload(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	createdAt := time.Unix(1_700_000_000, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-request-invalid",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "%%%",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}
+	if err := st.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist message: %v", err)
+	}
+
+	peer := &Peer{ID: "peer-1", Send: make(chan []byte, 1), Done: make(chan struct{})}
+	pm.handleRelayRequest(peer, &model.RelayRequestFrame{
+		Type:       model.FrameTypeRelayRequest,
+		MessageIDs: []string{msg.ID},
+	})
+
+	select {
+	case <-peer.Send:
+		t.Fatal("expected invalid payload to be skipped")
+	default:
+	}
+
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
+		t.Fatal("expected invalid payload message to be removed")
+	}
+}
+
 func TestForwardToPeers_ForwardIncludesEnvelopeTimestamps(t *testing.T) {
 	st := newMockStore()
 	clients := model.NewClientRegistry()
@@ -418,6 +456,91 @@ func TestForwardToPeers_ForwardIncludesEnvelopeTimestamps(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("expected relay_forward frame to be sent")
+	}
+}
+
+func TestForwardToPeers_RemovesInvalidStoredPayload(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	metrics := model.NewPeerMetrics("peer-1")
+	metrics.Connected = true
+	peer := &Peer{ID: "peer-1", Send: make(chan []byte, 1), Done: make(chan struct{}), Metrics: metrics}
+
+	pm.peersMu.Lock()
+	pm.peers[peer.ID] = peer
+	pm.peersMu.Unlock()
+
+	pm.metricsMu.Lock()
+	pm.peerMetrics[peer.ID] = metrics
+	pm.metricsMu.Unlock()
+
+	createdAt := time.Unix(1_700_000_100, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-forward-invalid",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "%%%",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(2 * time.Hour),
+	}
+	if err := st.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist message: %v", err)
+	}
+
+	pm.ForwardToPeers(msg, "")
+
+	select {
+	case <-peer.Send:
+		t.Fatal("expected invalid payload to not be forwarded")
+	default:
+	}
+
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
+		t.Fatal("expected invalid payload message to be removed")
+	}
+}
+
+func TestDeliverMessage_RemovesCorruptPayloadFromQueue(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "msg-deliver-invalid",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "%%%",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := st.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist message: %v", err)
+	}
+
+	pm.deliverMessage(msg)
+
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
+		t.Fatal("expected invalid payload message to be removed")
+	}
+}
+
+func TestDropCorruptMessageSkipsEmptyMsgID(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	pm.dropCorruptMessage("", "relay_request", "peer-1", errors.New("decode failed"))
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.removed) != 0 {
+		t.Fatalf("expected no remove calls for empty msg_id, got %v", st.removed)
 	}
 }
 
@@ -483,6 +606,64 @@ func TestHandleRelayForward_RejectsInvalidFields(t *testing.T) {
 	}
 }
 
+func TestHandleRelayForward_RejectsInvalidPayloadB64(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+	peer := &Peer{ID: "peer-1", Done: make(chan struct{})}
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "invalid-payload-msg",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "%%%",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	pm.handleRelayForward(peer, &model.RelayForwardFrame{
+		Type:    model.FrameTypeRelayForward,
+		Message: msg,
+	})
+
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
+		t.Fatal("expected invalid payload to be rejected")
+	}
+}
+
+func TestHandleRelayForward_NormalizesPayloadWhitespaceBeforePersist(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "normalized-relay-forward",
+		From:      "alice",
+		To:        "bob",
+		Payload:   " \n\t+/8=\r ",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	peer := &Peer{ID: "peer-1", Done: make(chan struct{})}
+	pm.handleRelayForward(peer, &model.RelayForwardFrame{
+		Type:    model.FrameTypeRelayForward,
+		Message: msg,
+	})
+
+	stored, err := st.GetMessageByID(context.Background(), msg.ID)
+	if err != nil {
+		t.Fatalf("expected message to be stored: %v", err)
+	}
+	if stored.Payload != "+/8=" {
+		t.Fatalf("expected normalized payload, got %q", stored.Payload)
+	}
+}
+
 func TestHandleRelayForward_MalformedEnvelopeFallsBackToLegacyMessageTimestamps(t *testing.T) {
 	st := newMockStore()
 	clients := model.NewClientRegistry()
@@ -512,6 +693,71 @@ func TestHandleRelayForward_MalformedEnvelopeFallsBackToLegacyMessageTimestamps(
 	if _, err := st.GetMessageByID(context.Background(), msg.ID); err != nil {
 		t.Fatal("expected valid legacy message timestamps to be accepted when envelope metadata is malformed")
 	}
+}
+
+func TestDeliverMessage_EncodesPayloadByRecipientPreference(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "msg-federation-encoding-pref",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "+/8=",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	urlRecipient := &model.Client{
+		WayfarerID: "bob",
+		DeliveryID: "bob",
+		Send:       make(chan []byte, 1),
+	}
+	urlRecipient.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64URL)
+	clients.Register(urlRecipient)
+
+	stdRecipient := &model.Client{
+		WayfarerID: "bob",
+		DeliveryID: "bob-device",
+		Send:       make(chan []byte, 1),
+	}
+	stdRecipient.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64)
+	clients.Register(stdRecipient)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if clients.Count() == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if clients.Count() != 2 {
+		t.Fatalf("expected two recipients registered, got %d", clients.Count())
+	}
+
+	pm.deliverMessage(msg)
+
+	assertPayload := func(ch <-chan []byte, want string) {
+		t.Helper()
+		select {
+		case raw := <-ch:
+			var frame model.WSFrame
+			if err := json.Unmarshal(raw, &frame); err != nil {
+				t.Fatalf("decode message frame: %v", err)
+			}
+			if frame.PayloadB64 != want {
+				t.Fatalf("payload mismatch: got %q want %q", frame.PayloadB64, want)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected delivered frame")
+		}
+	}
+
+	assertPayload(urlRecipient.Send, "-_8")
+	assertPayload(stdRecipient.Send, "+/8=")
 }
 
 // TestHandleRelayForward_NoReGossip verifies that receiving a forwarded message

@@ -63,6 +63,11 @@ func (e *Engine) PersistMessage(ctx context.Context, msg *model.Message) error {
 	return e.store.PersistMessage(ctx, msg)
 }
 
+// RemoveMessage deletes a queued message by ID.
+func (e *Engine) RemoveMessage(ctx context.Context, msgID string) error {
+	return e.store.RemoveMessage(ctx, msgID)
+}
+
 // PullForDeliveryIdentity returns queued messages for a delivery identity.
 // Expired messages may still be returned until TTL cleanup removes them.
 func (e *Engine) PullForDeliveryIdentity(ctx context.Context, deliveryIdentity string, limit int) ([]*model.Message, error) {
