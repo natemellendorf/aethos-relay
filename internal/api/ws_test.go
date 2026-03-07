@@ -37,6 +37,11 @@ type wsStoreSpy struct {
 	isDeliveredChecks []deliveredCall
 	getQueuedCalls    []string
 	deliveredByMsg    map[string]map[string]bool
+
+	persistErr       error
+	markDeliveredErr error
+	getQueuedErr     error
+	isDeliveredErr   error
 }
 
 func newWSStoreSpy() *wsStoreSpy {
@@ -51,6 +56,9 @@ func (s *wsStoreSpy) Open() error { return nil }
 func (s *wsStoreSpy) Close() error { return nil }
 
 func (s *wsStoreSpy) PersistMessage(ctx context.Context, msg *model.Message) error {
+	if s.persistErr != nil {
+		return s.persistErr
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	copyMsg := *msg
@@ -59,6 +67,9 @@ func (s *wsStoreSpy) PersistMessage(ctx context.Context, msg *model.Message) err
 }
 
 func (s *wsStoreSpy) GetQueuedMessages(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
+	if s.getQueuedErr != nil {
+		return nil, s.getQueuedErr
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.getQueuedCalls = append(s.getQueuedCalls, recipientID)
@@ -74,6 +85,9 @@ func (s *wsStoreSpy) GetQueuedMessages(ctx context.Context, recipientID string, 
 }
 
 func (s *wsStoreSpy) MarkDelivered(ctx context.Context, msgID string, recipientID string) error {
+	if s.markDeliveredErr != nil {
+		return s.markDeliveredErr
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.markDelivered = append(s.markDelivered, deliveredCall{msgID: msgID, recipientID: recipientID})
@@ -85,6 +99,9 @@ func (s *wsStoreSpy) MarkDelivered(ctx context.Context, msgID string, recipientI
 }
 
 func (s *wsStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	if s.isDeliveredErr != nil {
+		return false, s.isDeliveredErr
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.isDeliveredChecks = append(s.isDeliveredChecks, deliveredCall{msgID: msgID, recipientID: recipientID})
@@ -185,6 +202,22 @@ func decodeFrameMap(t *testing.T, payload []byte) map[string]any {
 	return frame
 }
 
+func assertErrorFrameCompat(t *testing.T, frame model.WSFrame, wantCode model.ErrorCode, wantMessage string) {
+	t.Helper()
+	if frame.Type != model.FrameTypeError {
+		t.Fatalf("expected error frame, got %q", frame.Type)
+	}
+	if frame.Code != string(wantCode) {
+		t.Fatalf("error code mismatch: got %q want %q", frame.Code, wantCode)
+	}
+	if frame.Message != wantMessage {
+		t.Fatalf("error message mismatch: got %q want %q", frame.Message, wantMessage)
+	}
+	if frame.MsgID != wantMessage {
+		t.Fatalf("legacy msg_id mismatch: got %q want %q", frame.MsgID, wantMessage)
+	}
+}
+
 func TestHandleHelloAllowsOptionalDeviceID(t *testing.T) {
 	h, _ := newWSHandlerWithSpyStore(t)
 	client := newClientForWSHandler()
@@ -251,6 +284,28 @@ func TestHandlePullAndAckUseDeviceDeliveryIdentity(t *testing.T) {
 	if len(st.markDelivered) == 0 || st.markDelivered[len(st.markDelivered)-1].recipientID != client.DeliveryID {
 		t.Fatalf("ack should mark delivered for tracked device identity, calls=%v", st.markDelivered)
 	}
+}
+
+func TestHandlePullIsDeliveredToFailureMapsToInternalError(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeviceID = "device-a"
+	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+
+	st.queued[client.WayfarerID] = []*model.Message{{
+		ID:        "msg-device",
+		From:      "wayfarer-a",
+		To:        client.WayfarerID,
+		Payload:   "QQ==",
+		CreatedAt: time.Now(),
+	}}
+	st.isDeliveredErr = errors.New("is delivered failed")
+
+	h.handlePull(client, &model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+
+	resp := readQueuedFrame(t, client)
+	assertErrorFrameCompat(t, resp, model.ErrorCodeInternalError, "failed to pull messages")
 }
 
 func TestHandleAckLegacyFallbackUsesWayfarerIdentity(t *testing.T) {
@@ -323,11 +378,161 @@ func TestHandleSendRejectsInvalidPayloadB64(t *testing.T) {
 	})
 
 	resp := readQueuedFrame(t, sender)
-	if resp.Type != model.FrameTypeError {
-		t.Fatalf("expected error frame, got %q", resp.Type)
+	assertErrorFrameCompat(t, resp, model.ErrorCodeInvalidPayload, "invalid payload_b64")
+}
+
+func TestHandleFrameErrorResponsesIncludeCanonicalAndLegacyFields(t *testing.T) {
+	tests := []struct {
+		name        string
+		setupClient func(*model.Client)
+		frame       model.WSFrame
+		wantCode    model.ErrorCode
+		wantMessage string
+	}{
+		{
+			name:        "unknown frame type",
+			frame:       model.WSFrame{Type: "mystery"},
+			wantCode:    model.ErrorCodeInvalidPayload,
+			wantMessage: "unknown frame type",
+		},
+		{
+			name:        "relay frame blocked on client connection",
+			frame:       model.WSFrame{Type: model.FrameTypeRelayHello},
+			wantCode:    model.ErrorCodeInvalidPayload,
+			wantMessage: "relay frame type not allowed on client connections",
+		},
+		{
+			name:        "hello missing wayfarer_id",
+			frame:       model.WSFrame{Type: model.FrameTypeHello},
+			wantCode:    model.ErrorCodeInvalidWayfarerID,
+			wantMessage: "wayfarer_id required",
+		},
+		{
+			name:        "send before hello",
+			frame:       model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: "QQ=="},
+			wantCode:    model.ErrorCodeAuthFailed,
+			wantMessage: "not authenticated",
+		},
+		{
+			name: "send after hello missing to",
+			setupClient: func(client *model.Client) {
+				client.WayfarerID = "wayfarer-a"
+			},
+			frame:       model.WSFrame{Type: model.FrameTypeSend, PayloadB64: "QQ=="},
+			wantCode:    model.ErrorCodeInvalidPayload,
+			wantMessage: "recipient required",
+		},
+		{
+			name: "send after hello missing payload_b64",
+			setupClient: func(client *model.Client) {
+				client.WayfarerID = "wayfarer-a"
+			},
+			frame:       model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b"},
+			wantCode:    model.ErrorCodeInvalidPayload,
+			wantMessage: "payload required",
+		},
+		{
+			name: "ack after hello missing msg_id",
+			setupClient: func(client *model.Client) {
+				client.WayfarerID = "wayfarer-a"
+			},
+			frame:       model.WSFrame{Type: model.FrameTypeAck},
+			wantCode:    model.ErrorCodeInvalidPayload,
+			wantMessage: "msg_id required",
+		},
+		{
+			name:        "pull before hello",
+			frame:       model.WSFrame{Type: model.FrameTypePull},
+			wantCode:    model.ErrorCodeAuthFailed,
+			wantMessage: "not authenticated",
+		},
 	}
-	if resp.MsgID != "invalid payload_b64" {
-		t.Fatalf("unexpected error payload: got %q", resp.MsgID)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newWSHandlerWithSpyStore(t)
+			client := newClientForWSHandler()
+			if tt.setupClient != nil {
+				tt.setupClient(client)
+			}
+
+			h.handleFrame(client, &tt.frame)
+
+			payload := readQueuedPayload(t, client)
+			var resp model.WSFrame
+			if err := json.Unmarshal(payload, &resp); err != nil {
+				t.Fatalf("decode queued frame: %v", err)
+			}
+			assertErrorFrameCompat(t, resp, tt.wantCode, tt.wantMessage)
+
+			decoded := decodeFrameMap(t, payload)
+			if _, ok := decoded["code"]; !ok {
+				t.Fatal("expected canonical code field in error frame")
+			}
+			if _, ok := decoded["message"]; !ok {
+				t.Fatal("expected canonical message field in error frame")
+			}
+			if _, ok := decoded["msg_id"]; !ok {
+				t.Fatal("expected legacy msg_id field in error frame")
+			}
+		})
+	}
+}
+
+func TestHandleFrameInternalFailuresMapToInternalError(t *testing.T) {
+	tests := []struct {
+		name        string
+		configure   func(*wsStoreSpy)
+		frame       model.WSFrame
+		wantMessage string
+	}{
+		{
+			name: "persist failure",
+			configure: func(st *wsStoreSpy) {
+				st.persistErr = errors.New("persist failed")
+			},
+			frame: model.WSFrame{
+				Type:       model.FrameTypeSend,
+				To:         "wayfarer-b",
+				PayloadB64: "QQ==",
+			},
+			wantMessage: "failed to persist message",
+		},
+		{
+			name: "ack failure",
+			configure: func(st *wsStoreSpy) {
+				st.markDeliveredErr = errors.New("ack failed")
+			},
+			frame: model.WSFrame{
+				Type:  model.FrameTypeAck,
+				MsgID: "msg-1",
+			},
+			wantMessage: "failed to acknowledge message",
+		},
+		{
+			name: "pull failure",
+			configure: func(st *wsStoreSpy) {
+				st.getQueuedErr = errors.New("pull failed")
+			},
+			frame:       model.WSFrame{Type: model.FrameTypePull},
+			wantMessage: "failed to pull messages",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, st := newWSHandlerWithSpyStore(t)
+			if tt.configure != nil {
+				tt.configure(st)
+			}
+			client := newClientForWSHandler()
+			client.WayfarerID = "wayfarer-a"
+
+			h.handleFrame(client, &tt.frame)
+
+			resp := readQueuedFrame(t, client)
+			assertErrorFrameCompat(t, resp, model.ErrorCodeInternalError, tt.wantMessage)
+		})
 	}
 }
 

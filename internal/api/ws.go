@@ -197,7 +197,7 @@ func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 
 	// Reject relay-only frame types on client connections.
 	if model.IsRelayFrameType(frame.Type) {
-		h.sendError(client, "relay frame type not allowed on client connections")
+		h.sendError(client, model.ErrorCodeInvalidPayload, "relay frame type not allowed on client connections")
 		return
 	}
 
@@ -212,7 +212,7 @@ func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 	case model.FrameTypePull:
 		h.handlePull(client, frame)
 	default:
-		h.sendError(client, "unknown frame type")
+		h.sendError(client, model.ErrorCodeInvalidPayload, "unknown frame type")
 	}
 }
 
@@ -226,7 +226,7 @@ func deliveryIdentityForClient(client *model.Client) string {
 // handleHello handles the hello frame.
 func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 	if frame.WayfarerID == "" {
-		h.sendError(client, "wayfarer_id required")
+		h.sendError(client, model.ErrorCodeInvalidWayfarerID, "wayfarer_id required")
 		return
 	}
 
@@ -254,22 +254,22 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 // handleSend handles the send frame.
 func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
-		h.sendError(client, "not authenticated")
+		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
 		return
 	}
 	if frame.To == "" {
-		h.sendError(client, "recipient required")
+		h.sendError(client, model.ErrorCodeInvalidPayload, "recipient required")
 		return
 	}
 	if frame.PayloadB64 == "" {
-		h.sendError(client, "payload required")
+		h.sendError(client, model.ErrorCodeInvalidPayload, "payload required")
 		return
 	}
 
 	normalizedPayloadB64 := model.NormalizePayloadB64(frame.PayloadB64)
 	if _, err := model.DecodePayloadB64(normalizedPayloadB64); err != nil {
 		log.Printf("ws: rejecting send from=%s to=%s: invalid payload_b64: %v", client.WayfarerID, frame.To, err)
-		h.sendError(client, "invalid payload_b64")
+		h.sendError(client, model.ErrorCodeInvalidPayload, "invalid payload_b64")
 		return
 	}
 
@@ -283,7 +283,7 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 
 	if err := h.engine.PersistMessage(context.Background(), msg); err != nil {
 		metrics.IncrementStoreErrors()
-		h.sendError(client, "failed to persist message")
+		h.sendError(client, model.ErrorCodeInternalError, "failed to persist message")
 		return
 	}
 	metrics.IncrementPersisted()
@@ -315,11 +315,11 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 // `ack` frame; the server resolves it from tracked delivery state.
 func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
-		h.sendError(client, "not authenticated")
+		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
 		return
 	}
 	if frame.MsgID == "" {
-		h.sendError(client, "msg_id required")
+		h.sendError(client, model.ErrorCodeInvalidPayload, "msg_id required")
 		return
 	}
 
@@ -332,7 +332,7 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 
 	if err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, recipientID); err != nil {
 		metrics.IncrementStoreErrors()
-		h.sendError(client, "failed to acknowledge message")
+		h.sendError(client, model.ErrorCodeInternalError, "failed to acknowledge message")
 		return
 	}
 	metrics.IncrementDelivered()
@@ -349,7 +349,7 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 // handlePull handles the pull frame.
 func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
-		h.sendError(client, "not authenticated")
+		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
 		return
 	}
 
@@ -358,7 +358,7 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), deliveryID, limit)
 	if err != nil {
 		metrics.IncrementStoreErrors()
-		h.sendError(client, "failed to pull messages")
+		h.sendError(client, model.ErrorCodeInternalError, "failed to pull messages")
 		return
 	}
 
@@ -472,10 +472,24 @@ func (h *WSHandler) send(client *model.Client, frame model.WSFrame) {
 	}
 }
 
-// sendError sends an error frame to the client.
-func (h *WSHandler) sendError(client *model.Client, err string) {
+// sendError sends canonical error fields (code/message) and temporarily mirrors
+// message into legacy msg_id for backward compatibility during migration.
+func (h *WSHandler) sendError(client *model.Client, code model.ErrorCode, message string) {
+	if code == "" {
+		code = model.ErrorCodeInternalError
+	}
+	if message == "" {
+		if code == model.ErrorCodeInternalError {
+			message = "internal error"
+		} else {
+			message = string(code)
+		}
+	}
+
 	h.send(client, model.WSFrame{
-		Type:  model.FrameTypeError,
-		MsgID: err,
+		Type:    model.FrameTypeError,
+		Code:    string(code),
+		Message: message,
+		MsgID:   message,
 	})
 }

@@ -27,7 +27,7 @@ This document audits current `aethos-relay` runtime behavior against canonical s
 | TTL default (`ttl_seconds`) | Omitted TTL defaults to `3600` (`CLIENT_RELAY_PROTOCOL_V1.md:29`, `CLIENT_RELAY_PROTOCOL_V1.md:296`). | Omitted/non-positive TTL becomes `maxTTL` (`internal/storeforward/client.go:43`), and process default `maxTTL` is `604800` seconds (`cmd/relay/main.go:40`). | **Diverges** |
 | `expires_at` immutability for a stored `msg_id` | `expires_at` must be immutable once accepted (`CLIENT_RELAY_PROTOCOL_V1.md:300`). | Message is persisted with fixed `ExpiresAt` (`internal/storeforward/client.go:54`, `internal/store/bbolt_store.go:108`), and ack path does not mutate it (`internal/store/bbolt_store.go:189`). | **Matches** |
 | Expired message delivery | Expired messages must not be delivered (`CLIENT_RELAY_PROTOCOL_V1.md:301`). | Pull path explicitly documents expired messages may still be returned before sweep (`internal/storeforward/client.go:67`), and tests pin this behavior (`internal/storeforward/engine_test.go:310`, `internal/storeforward/engine_test.go:315`). Push path does not block expired messages prior to send (`internal/api/ws.go:366`). | **Diverges** |
-| Error frame schema | `error` requires `code` + `message` (`CLIENT_RELAY_PROTOCOL_V1.md:207`, `CLIENT_RELAY_PROTOCOL_V1.md:216`, `CLIENT_RELAY_PROTOCOL_V1.md:225`). | `sendError` populates `type=error` and puts text into `msg_id` (`internal/api/ws.go:409`, `internal/api/ws.go:410`), with no `code` or `message` fields in `WSFrame` (`internal/model/message.go:42`). | **Diverges** |
+| Error frame schema | `error` requires `code` + `message` (`CLIENT_RELAY_PROTOCOL_V1.md:207`, `CLIENT_RELAY_PROTOCOL_V1.md:216`, `CLIENT_RELAY_PROTOCOL_V1.md:225`). | Relay now emits canonical `code` + `message` on `error` frames and temporarily mirrors `message` into legacy `msg_id` for backward compatibility during migration (`internal/api/ws.go`, `internal/model/message.go`). Follow-up: remove legacy `msg_id` once all clients consume canonical fields. | **Partially aligned (compat mode)** |
 | Idempotency via `client_msg_id` | Relay must dedupe by `(sender_wayfarer_id, client_msg_id)` when present (`CLIENT_RELAY_PROTOCOL_V1.md:260`, `CLIENT_RELAY_PROTOCOL_V1.md:266`). | `WSFrame` has no `client_msg_id` field (`internal/model/message.go:35`), and no idempotency logic or `IDEMPOTENCY_MISMATCH` handling exists in relay code (repo-wide search). | **Diverges** |
 
 ## Federation audit
@@ -88,7 +88,7 @@ These are implementation/runtime limits and policies; they are not canonical pro
 
 ### Confirmed divergences
 
-1. Client wire shape still diverges on strict canonical identity requirements (`device_id` remains optional for backward compatibility) and error schema (`msg_id` string instead of `code`/`message`), while timestamp fields are now dual-emitted in compatibility mode.
+1. Client wire shape still diverges on strict canonical identity requirements (`device_id` remains optional for backward compatibility); error frames now dual-emit canonical `code`/`message` plus legacy `msg_id`, and timestamp fields are also dual-emitted in compatibility mode.
 2. Payload semantics are in compatibility mode: relay tolerates base64url and legacy base64 and can emit either per connection, but still does not decode/validate canonical `EnvelopeV1` bytes.
 3. TTL semantics diverge: default TTL tracks relay `maxTTL` instead of canonical `3600`; expired messages can still be delivered before sweep.
 4. Idempotency diverges: `client_msg_id` is not represented or enforced.
@@ -106,7 +106,7 @@ These are implementation/runtime limits and policies; they are not canonical pro
 ### Recommended future alignment beads (prioritized)
 
 1. **Client identity cutover bead:** Require `device_id` in `hello` at protocol cutover and remove legacy wayfarer-only fallback behavior.
-2. **Client frame normalization bead:** Align `hello_ok`, `send_ok`, `message`, `messages`, and `error` fields/timestamp names to canonical v1.
+2. **Client frame normalization bead:** Align `hello_ok`, `send_ok`, `message`, and `messages` fields/timestamp names fully to canonical v1, then remove remaining compatibility aliases.
 3. **Encoding negotiation/idempotency bead:** Add explicit payload-encoding negotiation (to remove legacy base64 fallback safely) and implement `client_msg_id` dedupe semantics.
 4. **TTL semantics bead:** Switch default TTL to `3600` and prevent delivery of expired messages before sweep.
 5. **Federation envelope protocol bead:** Move from inventory/request/message-forward model to canonical envelope-based `relay_forward` + invariants (`hop_count`, `seen_relays`, destination checks).
