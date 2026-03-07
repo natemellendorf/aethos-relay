@@ -416,3 +416,117 @@ func TestRemoveMessageClearsPerDeviceDeliveryState(t *testing.T) {
 		t.Fatalf("expected queued message ID %s, got %s", msgID, messages[0].ID)
 	}
 }
+
+func TestRemoveMessageClearsPerDeviceAckState(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	msgID := "acked-msg-id"
+	recipientID := "recipient-1\x00device-a"
+	now := time.Now().Truncate(time.Second)
+
+	msg := &model.Message{
+		ID:        msgID,
+		From:      "sender-1",
+		To:        "recipient-1",
+		Payload:   "SGVsbG8=",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := store.PersistMessage(nil, msg); err != nil {
+		t.Fatalf("failed to persist message: %v", err)
+	}
+
+	transitioned, err := store.MarkAcked(nil, msgID, recipientID)
+	if err != nil {
+		t.Fatalf("failed to mark acked: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("expected first ack transition")
+	}
+
+	if err := store.RemoveMessage(nil, msgID); err != nil {
+		t.Fatalf("failed to remove message: %v", err)
+	}
+
+	acked, err := store.IsAckedBy(nil, msgID, recipientID)
+	if err != nil {
+		t.Fatalf("failed to check ack state: %v", err)
+	}
+	if acked {
+		t.Fatal("expected ack state to be cleared after remove")
+	}
+}
+
+func TestRemoveMessagePrefixDeleteDoesNotTouchOtherMessageIDs(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().Truncate(time.Second)
+	msgA := &model.Message{ID: "abc", From: "s1", To: "recipient-1", Payload: "QQ==", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	msgB := &model.Message{ID: "abc1", From: "s2", To: "recipient-1", Payload: "Qg==", CreatedAt: now.Add(time.Second), ExpiresAt: now.Add(2 * time.Hour)}
+
+	if err := store.PersistMessage(nil, msgA); err != nil {
+		t.Fatalf("persist msgA: %v", err)
+	}
+	if err := store.PersistMessage(nil, msgB); err != nil {
+		t.Fatalf("persist msgB: %v", err)
+	}
+
+	if err := store.MarkDelivered(nil, msgA.ID, "recipient-1"); err != nil {
+		t.Fatalf("mark delivered msgA: %v", err)
+	}
+	if err := store.MarkDelivered(nil, msgB.ID, "recipient-1"); err != nil {
+		t.Fatalf("mark delivered msgB: %v", err)
+	}
+	if _, err := store.MarkAcked(nil, msgA.ID, "recipient-1\x00device-a"); err != nil {
+		t.Fatalf("mark acked msgA: %v", err)
+	}
+	if _, err := store.MarkAcked(nil, msgB.ID, "recipient-1\x00device-a"); err != nil {
+		t.Fatalf("mark acked msgB: %v", err)
+	}
+
+	if err := store.RemoveMessage(nil, msgA.ID); err != nil {
+		t.Fatalf("remove msgA: %v", err)
+	}
+
+	if _, err := store.GetMessageByID(nil, msgB.ID); err != nil {
+		t.Fatalf("msgB should remain after removing msgA: %v", err)
+	}
+	deliveredB, err := store.IsDeliveredTo(nil, msgB.ID, "recipient-1")
+	if err != nil {
+		t.Fatalf("check msgB delivered state: %v", err)
+	}
+	if !deliveredB {
+		t.Fatal("msgB delivered state should remain after removing msgA")
+	}
+	ackedB, err := store.IsAckedBy(nil, msgB.ID, "recipient-1\x00device-a")
+	if err != nil {
+		t.Fatalf("check msgB ack state: %v", err)
+	}
+	if !ackedB {
+		t.Fatal("msgB ack state should remain after removing msgA")
+	}
+}

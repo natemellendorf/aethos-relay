@@ -180,6 +180,12 @@ func (pm *PeerManager) SetEnvelopeStore(envelopeStore store.EnvelopeStore) {
 	pm.engine.ConfigureFederation(pm.relayID, envelopeStore)
 }
 
+// SetAckDrivenSuppression enables canonical ack-driven suppression semantics
+// for local client delivery paths.
+func (pm *PeerManager) SetAckDrivenSuppression(enabled bool) {
+	pm.engine.SetAckDrivenSuppression(enabled)
+}
+
 // Run starts the peer manager.
 func (pm *PeerManager) Run() {
 	// Start gossip ticker
@@ -847,8 +853,10 @@ func (pm *PeerManager) deliverMessage(msg *model.Message) {
 		select {
 		case r.Send <- data:
 			r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
-			if err := pm.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
-				log.Printf("federation: failed to mark delivered for %s: %v", recipientID, err)
+			if !pm.engine.IsAckDrivenSuppression() {
+				if err := pm.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
+					log.Printf("federation: failed to mark delivered for %s: %v", recipientID, err)
+				}
 			}
 		default:
 		}

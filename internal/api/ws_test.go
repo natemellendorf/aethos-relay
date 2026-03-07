@@ -5,13 +5,17 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/storeforward"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 type wsTestConn struct{}
@@ -37,17 +41,21 @@ type wsStoreSpy struct {
 	isDeliveredChecks []deliveredCall
 	getQueuedCalls    []string
 	deliveredByMsg    map[string]map[string]bool
+	ackedByMsg        map[string]map[string]bool
 
 	persistErr       error
 	markDeliveredErr error
+	markAckedErr     error
 	getQueuedErr     error
 	isDeliveredErr   error
+	isAckedErr       error
 }
 
 func newWSStoreSpy() *wsStoreSpy {
 	return &wsStoreSpy{
 		queued:         make(map[string][]*model.Message),
 		deliveredByMsg: make(map[string]map[string]bool),
+		ackedByMsg:     make(map[string]map[string]bool),
 	}
 }
 
@@ -84,6 +92,10 @@ func (s *wsStoreSpy) GetQueuedMessages(ctx context.Context, recipientID string, 
 	return result, nil
 }
 
+func (s *wsStoreSpy) GetQueuedMessagesRaw(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
+	return s.GetQueuedMessages(ctx, recipientID, limit)
+}
+
 func (s *wsStoreSpy) MarkDelivered(ctx context.Context, msgID string, recipientID string) error {
 	if s.markDeliveredErr != nil {
 		return s.markDeliveredErr
@@ -108,6 +120,31 @@ func (s *wsStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientI
 	return s.deliveredByMsg[msgID][recipientID], nil
 }
 
+func (s *wsStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	if s.markAckedErr != nil {
+		return false, s.markAckedErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ackedByMsg[msgID] == nil {
+		s.ackedByMsg[msgID] = make(map[string]bool)
+	}
+	if s.ackedByMsg[msgID][recipientID] {
+		return false, nil
+	}
+	s.ackedByMsg[msgID][recipientID] = true
+	return true, nil
+}
+
+func (s *wsStoreSpy) IsAckedBy(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	if s.isAckedErr != nil {
+		return false, s.isAckedErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackedByMsg[msgID][recipientID], nil
+}
+
 func (s *wsStoreSpy) GetMessageByID(ctx context.Context, msgID string) (*model.Message, error) {
 	return nil, nil
 }
@@ -130,6 +167,7 @@ func (s *wsStoreSpy) RemoveMessage(ctx context.Context, msgID string) error {
 		s.queued[recipientID] = filtered
 	}
 	delete(s.deliveredByMsg, msgID)
+	delete(s.ackedByMsg, msgID)
 	return nil
 }
 
@@ -200,6 +238,26 @@ func decodeFrameMap(t *testing.T, payload []byte) map[string]any {
 		t.Fatalf("decode queued frame map: %v", err)
 	}
 	return frame
+}
+
+func readCounterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := counter.Write(m); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if m.Counter == nil {
+		t.Fatal("counter metric is nil")
+	}
+	return m.Counter.GetValue()
+}
+
+func requireCounterDelta(t *testing.T, before, after, wantDelta float64, name string) {
+	t.Helper()
+	delta := after - before
+	if math.Abs(delta-wantDelta) > 1e-9 {
+		t.Fatalf("%s delta mismatch: got %.0f want %.0f", name, delta, wantDelta)
+	}
 }
 
 func assertErrorFrameCompat(t *testing.T, frame model.WSFrame, wantCode model.ErrorCode, wantMessage string) {
@@ -282,7 +340,7 @@ func TestHandlePullAndAckUseDeviceDeliveryIdentity(t *testing.T) {
 		t.Fatalf("pull should filter by device delivery identity, checks=%v", st.isDeliveredChecks)
 	}
 	if len(st.markDelivered) == 0 || st.markDelivered[len(st.markDelivered)-1].recipientID != client.DeliveryID {
-		t.Fatalf("ack should mark delivered for tracked device identity, calls=%v", st.markDelivered)
+		t.Fatalf("ack should mark delivered for connection device identity, calls=%v", st.markDelivered)
 	}
 }
 
@@ -308,14 +366,32 @@ func TestHandlePullIsDeliveredToFailureMapsToInternalError(t *testing.T) {
 	assertErrorFrameCompat(t, resp, model.ErrorCodeInternalError, "failed to pull messages")
 }
 
-func TestHandleAckLegacyFallbackUsesWayfarerIdentity(t *testing.T) {
+func TestHandleAckUsesConnectionDeliveryIdentityWithoutTracking(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	client := newClientForWSHandler()
 	client.WayfarerID = "wayfarer-b"
 	client.DeviceID = "device-a"
 	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+	client.ResetDeliveryTracking()
 
 	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-legacy"})
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.markDelivered) != 1 {
+		t.Fatalf("expected one ack delivery write, got %d", len(st.markDelivered))
+	}
+	if st.markDelivered[0].recipientID != client.DeliveryID {
+		t.Fatalf("ack should use connection delivery identity, got %q want %q", st.markDelivered[0].recipientID, client.DeliveryID)
+	}
+}
+
+func TestHandleAckFallsBackToWayfarerWhenDeliveryIdentityEmpty(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-wayfarer"})
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -325,6 +401,136 @@ func TestHandleAckLegacyFallbackUsesWayfarerIdentity(t *testing.T) {
 	if st.markDelivered[0].recipientID != client.WayfarerID {
 		t.Fatalf("fallback should use wayfarer identity, got %q want %q", st.markDelivered[0].recipientID, client.WayfarerID)
 	}
+}
+
+func TestHandleAckOKShapeStable(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-ack-shape"})
+
+	payload := readQueuedPayload(t, client)
+	decoded := decodeFrameMap(t, payload)
+	if decoded["type"] != model.FrameTypeAckOK {
+		t.Fatalf("expected ack_ok type, got %v", decoded["type"])
+	}
+	if decoded["msg_id"] != "msg-ack-shape" {
+		t.Fatalf("expected ack_ok msg_id, got %v", decoded["msg_id"])
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("ack_ok should only include type and msg_id, got %v", decoded)
+	}
+}
+
+func TestHandleAckCanonicalModeIsIdempotent(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	h.SetAckDrivenSuppression(true)
+
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeviceID = "device-a"
+	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-idempotent"})
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-idempotent"})
+
+	first := readQueuedFrame(t, client)
+	second := readQueuedFrame(t, client)
+	if first.Type != model.FrameTypeAckOK || second.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected ack_ok responses, got %q and %q", first.Type, second.Type)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.markDelivered) != 0 {
+		t.Fatalf("canonical mode should not write legacy delivery state on ack, got %v", st.markDelivered)
+	}
+	if !st.ackedByMsg["msg-idempotent"][client.DeliveryID] {
+		t.Fatalf("canonical mode should persist ack state for delivery identity %q", client.DeliveryID)
+	}
+}
+
+func TestLegacyModeDeliveryMetricsPushOnlyAndAckNoIncrementAfterPush(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+
+	recipient := newClientForWSHandler()
+	recipient.WayfarerID = "wayfarer-b"
+	recipient.DeviceID = "device-a"
+	recipient.DeliveryID = storeforward.DeliveryIdentity(recipient.WayfarerID, recipient.DeviceID)
+	h.clients.Register(recipient)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if h.clients.Count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if h.clients.Count() == 0 {
+		t.Fatal("expected recipient to be registered")
+	}
+
+	beforePush := readCounterValue(t, metrics.MessagesDeliveredTotal)
+
+	createdAt := time.Unix(1_700_010_000, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-legacy-metric",
+		From:      "wayfarer-a",
+		To:        "wayfarer-b",
+		Payload:   "QQ==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}
+	h.deliverToRecipient(msg)
+	_ = readQueuedFrame(t, recipient)
+
+	afterPush := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, beforePush, afterPush, 1, "legacy push delivered")
+
+	st.mu.Lock()
+	if len(st.markDelivered) != 1 {
+		st.mu.Unlock()
+		t.Fatalf("expected exactly one legacy MarkDelivered call, got %d", len(st.markDelivered))
+	}
+	st.mu.Unlock()
+
+	h.handleAck(recipient, &model.WSFrame{Type: model.FrameTypeAck, MsgID: msg.ID})
+	resp := readQueuedFrame(t, recipient)
+	if resp.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected ack_ok, got %q", resp.Type)
+	}
+
+	afterAck := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, afterPush, afterAck, 0, "legacy ack after push delivered")
+}
+
+func TestAckDrivenModeMetricsIncrementOnAckTransitionOnly(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	h.SetAckDrivenSuppression(true)
+
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeviceID = "device-a"
+	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+
+	beforeAck := readCounterValue(t, metrics.MessagesDeliveredTotal)
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-canonical-metric"})
+	first := readQueuedFrame(t, client)
+	if first.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected first ack_ok, got %q", first.Type)
+	}
+	afterFirst := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, beforeAck, afterFirst, 1, "canonical first ack delivered")
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-canonical-metric"})
+	second := readQueuedFrame(t, client)
+	if second.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected second ack_ok, got %q", second.Type)
+	}
+	afterSecond := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, afterFirst, afterSecond, 0, "canonical second ack delivered")
 }
 
 func TestHandleSendSendOKIncludesCanonicalAndLegacyTimestamps(t *testing.T) {

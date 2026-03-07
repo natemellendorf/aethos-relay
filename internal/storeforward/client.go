@@ -72,22 +72,42 @@ func (e *Engine) RemoveMessage(ctx context.Context, msgID string) error {
 // Expired messages may still be returned until TTL cleanup removes them.
 func (e *Engine) PullForDeliveryIdentity(ctx context.Context, deliveryIdentity string, limit int) ([]*model.Message, error) {
 	queueRecipient := QueueRecipient(deliveryIdentity)
-	messages, err := e.store.GetQueuedMessages(ctx, queueRecipient, NormalizePullLimit(limit))
+	fetchQueued := e.store.GetQueuedMessages
+	if e.ackDrivenSuppression {
+		fetchQueued = e.store.GetQueuedMessagesRaw
+	}
+
+	messages, err := fetchQueued(ctx, queueRecipient, NormalizePullLimit(limit))
 	if err != nil {
 		return nil, err
 	}
 
-	if deliveryIdentity == queueRecipient {
+	if !e.ackDrivenSuppression && deliveryIdentity == queueRecipient {
 		return messages, nil
 	}
 
 	var filtered []*model.Message
 	for _, msg := range messages {
-		delivered, err := e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
-		if err != nil {
-			return nil, err
+		isSuppressed := false
+		var err error
+		if e.ackDrivenSuppression {
+			acked, ackErr := e.store.IsAckedBy(ctx, msg.ID, deliveryIdentity)
+			if ackErr != nil {
+				return nil, ackErr
+			}
+			legacyDelivered, deliveredErr := e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
+			if deliveredErr != nil {
+				return nil, deliveredErr
+			}
+			isSuppressed = acked || legacyDelivered
+		} else {
+			isSuppressed, err = e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
+			if err != nil {
+				return nil, err
+			}
 		}
-		if delivered {
+
+		if isSuppressed {
 			continue
 		}
 		filtered = append(filtered, msg)
@@ -97,8 +117,24 @@ func (e *Engine) PullForDeliveryIdentity(ctx context.Context, deliveryIdentity s
 }
 
 // AckClientDelivery records a client `ack` for a single delivery identity.
-func (e *Engine) AckClientDelivery(ctx context.Context, msgID string, deliveryIdentity string) error {
-	return e.store.MarkDelivered(ctx, msgID, deliveryIdentity)
+func (e *Engine) AckClientDelivery(ctx context.Context, msgID string, deliveryIdentity string) (bool, error) {
+	if e.ackDrivenSuppression {
+		return e.store.MarkAcked(ctx, msgID, deliveryIdentity)
+	}
+
+	delivered, err := e.store.IsDeliveredTo(ctx, msgID, deliveryIdentity)
+	if err != nil {
+		return false, err
+	}
+	if delivered {
+		return false, nil
+	}
+
+	if err := e.store.MarkDelivered(ctx, msgID, deliveryIdentity); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // MarkDelivery records delivery for a single delivery identity.

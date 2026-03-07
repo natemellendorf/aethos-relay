@@ -24,6 +24,7 @@ type mockStore struct {
 	mu        sync.Mutex
 	messages  map[string]*model.Message // msg.ID -> msg
 	delivered map[string]bool           // msgID+recipientID -> delivered
+	acked     map[string]bool           // msgID+recipientID -> acked
 	removed   []string
 	persisted int
 }
@@ -32,6 +33,7 @@ func newMockStore() *mockStore {
 	return &mockStore{
 		messages:  make(map[string]*model.Message),
 		delivered: make(map[string]bool),
+		acked:     make(map[string]bool),
 	}
 }
 
@@ -85,6 +87,38 @@ func (m *mockStore) GetQueuedMessages(_ context.Context, to string, limit int) (
 		}
 	}
 	return result, nil
+}
+
+func (m *mockStore) GetQueuedMessagesRaw(_ context.Context, to string, limit int) ([]*model.Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []*model.Message
+	for _, msg := range m.messages {
+		if msg.To == to {
+			result = append(result, msg)
+			if len(result) >= limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func (m *mockStore) MarkAcked(_ context.Context, id string, recipientID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := id + "\x00" + recipientID
+	if m.acked[key] {
+		return false, nil
+	}
+	m.acked[key] = true
+	return true, nil
+}
+
+func (m *mockStore) IsAckedBy(_ context.Context, id string, recipientID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.acked[id+"\x00"+recipientID], nil
 }
 
 func (m *mockStore) RemoveMessage(_ context.Context, id string) error {

@@ -90,9 +90,21 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 	}
 }
 
+// SetAckDrivenSuppression enables canonical ack-driven suppression semantics.
+// When disabled, relay keeps legacy mark-on-push suppression behavior.
+func (h *WSHandler) SetAckDrivenSuppression(enabled bool) {
+	h.engine.SetAckDrivenSuppression(enabled)
+	if h.federationManager != nil {
+		h.federationManager.SetAckDrivenSuppression(enabled)
+	}
+}
+
 // SetFederationManager sets the federation peer manager for relaying messages.
 func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
 	h.federationManager = mgr
+	if h.federationManager != nil {
+		h.federationManager.SetAckDrivenSuppression(h.engine.IsAckDrivenSuppression())
+	}
 }
 
 // SetAutoDeliverQueued controls automatic queued delivery on hello.
@@ -207,7 +219,7 @@ func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 	case model.FrameTypeSend:
 		h.handleSend(client, frame)
 	case model.FrameTypeAck:
-		// `ack` marks the message delivered for the tracked recipient identity on this connection.
+		// `ack` marks the message delivered for this connection's recipient identity.
 		h.handleAck(client, frame)
 	case model.FrameTypePull:
 		h.handlePull(client, frame)
@@ -249,6 +261,16 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 	if h.autoDeliverQueued {
 		go h.deliverQueuedMessages(client)
 	}
+}
+
+// relayReceivedAtUnix returns the client-facing receipt timestamp.
+// The relay currently stores CreatedAt as the ingestion timestamp for queued
+// client messages, and that value is what we expose as received_at.
+func relayReceivedAtUnix(msg *model.Message) int64 {
+	if msg == nil {
+		return 0
+	}
+	return msg.CreatedAt.Unix()
 }
 
 // handleSend handles the send frame.
@@ -293,8 +315,9 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		h.deliverToRecipient(msg)
 	}
 
-	// Send send_ok
-	receivedAt := msg.CreatedAt.Unix()
+	// Send send_ok after durable persistence. Keep legacy `at` as alias of
+	// canonical `received_at` during compatibility window.
+	receivedAt := relayReceivedAtUnix(msg)
 	h.send(client, model.WSFrame{
 		Type:       model.FrameTypeSendOK,
 		MsgID:      msg.ID,
@@ -312,7 +335,7 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 // handleAck handles the ack frame.
 // `ack` marks the message delivered for the recipient identity associated with
 // this WebSocket connection. The client does not provide a recipient in the
-// `ack` frame; the server resolves it from tracked delivery state.
+// `ack` frame; the server resolves it from connection identity.
 func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
 		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
@@ -323,19 +346,20 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	recipientID := client.ConsumeMessageDeliveryRecipient(frame.MsgID)
+	recipientID := deliveryIdentityForClient(client)
 	if recipientID == "" {
-		// Legacy fallback: if this ack cannot be tied to a tracked delivery event,
-		// write ack state under the wayfarer bucket to preserve existing behavior.
 		recipientID = client.WayfarerID
 	}
 
-	if err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, recipientID); err != nil {
+	transitioned, err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, recipientID)
+	if err != nil {
 		metrics.IncrementStoreErrors()
 		h.sendError(client, model.ErrorCodeInternalError, "failed to acknowledge message")
 		return
 	}
-	metrics.IncrementDelivered()
+	if transitioned {
+		metrics.IncrementDelivered()
+	}
 
 	log.Printf("ws: ack msg_id=%s from=%s recipient_id=%s ttl=%ds", frame.MsgID, client.WayfarerID, recipientID, 0)
 
@@ -375,7 +399,7 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 		}
 		wireMessage := *m
 		wireMessage.Payload = model.EncodePayloadB64(decodedPayload, client.GetPayloadEncodingPref())
-		receivedAt := m.CreatedAt.Unix()
+		receivedAt := relayReceivedAtUnix(m)
 		client.TrackMessageDeliveryRecipient(wireMessage.ID, deliveryID)
 		msgs = append(msgs, model.WSPullMessage{
 			Message:    wireMessage,
@@ -392,7 +416,7 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 // deliverQueuedMessages delivers any queued messages when a client connects.
 func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
 	// Queue indexing remains wayfarer-scoped today; PullForDeliveryIdentity
-	// applies per-device filtering via delivery-state checks when device_id is set.
+	// applies per-device filtering via suppression state checks when device_id is set.
 	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), deliveryIdentityForClient(client), 100)
 	if err != nil {
 		log.Printf("ws: failed to get queued messages: %v", err)
@@ -422,7 +446,7 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 		}
 		log.Printf("ws: deliver msg_id=%s from=%s to=%s recipient_id=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, recipientID, remainingTTL)
 		r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
-		receivedAt := msg.CreatedAt.Unix()
+		receivedAt := relayReceivedAtUnix(msg)
 		h.send(r, model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
@@ -431,13 +455,26 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			At:         receivedAt,
 			ReceivedAt: receivedAt,
 		})
-		// Mark as delivered to this specific recipient
-		if err := h.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
-			metrics.IncrementStoreErrors()
-			log.Printf("ws: failed to mark delivered: %v", err)
-			continue
+		if !h.engine.IsAckDrivenSuppression() {
+			alreadyDelivered, err := h.store.IsDeliveredTo(context.Background(), msg.ID, recipientID)
+			if err != nil {
+				metrics.IncrementStoreErrors()
+				log.Printf("ws: failed to check prior delivery state: %v", err)
+				continue
+			}
+			if alreadyDelivered {
+				continue
+			}
+
+			// Legacy suppression path: mark on push so reconnect/pull flows continue
+			// to suppress as before until canonical mode is enabled.
+			if err := h.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
+				metrics.IncrementStoreErrors()
+				log.Printf("ws: failed to mark delivered: %v", err)
+				continue
+			}
+			metrics.IncrementDelivered()
 		}
-		metrics.IncrementDelivered()
 	}
 }
 
