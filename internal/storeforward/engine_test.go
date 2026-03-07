@@ -188,7 +188,7 @@ func TestClientAckTracksSingleDeliveryIdentity(t *testing.T) {
 	}
 }
 
-func TestAckDrivenSuppressionUsesAckStateAndIsIdempotent(t *testing.T) {
+func TestAckDrivenSuppressionUsesAckOrLegacyDeliveredStateAndIsIdempotent(t *testing.T) {
 	h := newEngineHarness(t, time.Hour)
 	h.engine.SetAckDrivenSuppression(true)
 
@@ -212,8 +212,8 @@ func TestAckDrivenSuppressionUsesAckStateAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pull before ack: %v", err)
 	}
-	if len(stillVisible) != 1 {
-		t.Fatalf("canonical mode should not suppress on push state, got %d", len(stillVisible))
+	if len(stillVisible) != 0 {
+		t.Fatalf("canonical mode should suppress when legacy delivered state exists, got %d", len(stillVisible))
 	}
 
 	firstTransition, err := h.engine.AckClientDelivery(context.Background(), msg.ID, deviceA)
@@ -247,6 +247,36 @@ func TestAckDrivenSuppressionUsesAckStateAndIsIdempotent(t *testing.T) {
 	}
 	if len(deviceBMessages) != 1 {
 		t.Fatalf("device-b queue should still contain message, got %d", len(deviceBMessages))
+	}
+}
+
+func TestAckDrivenSuppressionRespectsLegacyStateAfterModeToggle(t *testing.T) {
+	h := newEngineHarness(t, time.Hour)
+
+	msg := &model.Message{
+		ID:        "msg-toggle",
+		From:      "alice",
+		To:        "wayfarer-1",
+		Payload:   "QQ==",
+		CreatedAt: h.now,
+		ExpiresAt: h.now.Add(10 * time.Minute),
+	}
+	persistTestMessage(t, h, msg)
+
+	deviceA := DeliveryIdentity("wayfarer-1", "device-a")
+	if err := h.engine.MarkDelivery(context.Background(), msg.ID, deviceA); err != nil {
+		t.Fatalf("legacy mark delivery write: %v", err)
+	}
+
+	canonicalEngine := New(h.messageStore, time.Hour)
+	canonicalEngine.SetAckDrivenSuppression(true)
+
+	messages, err := canonicalEngine.PullForDeliveryIdentity(context.Background(), deviceA, 10)
+	if err != nil {
+		t.Fatalf("pull after mode toggle: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("expected no duplicate delivery after mode toggle, got %d", len(messages))
 	}
 }
 

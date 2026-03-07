@@ -263,9 +263,9 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 	}
 }
 
-// relayReceivedAtUnix returns relay receipt time for client-facing timestamps.
-// Today this is backed by message CreatedAt because Message has no distinct
-// ReceivedAt field yet.
+// relayReceivedAtUnix returns the client-facing receipt timestamp.
+// The relay currently stores CreatedAt as the ingestion timestamp for queued
+// client messages, and that value is what we expose as received_at.
 func relayReceivedAtUnix(msg *model.Message) int64 {
 	if msg == nil {
 		return 0
@@ -456,6 +456,16 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			ReceivedAt: receivedAt,
 		})
 		if !h.engine.IsAckDrivenSuppression() {
+			alreadyDelivered, err := h.store.IsDeliveredTo(context.Background(), msg.ID, recipientID)
+			if err != nil {
+				metrics.IncrementStoreErrors()
+				log.Printf("ws: failed to check prior delivery state: %v", err)
+				continue
+			}
+			if alreadyDelivered {
+				continue
+			}
+
 			// Legacy suppression path: mark on push so reconnect/pull flows continue
 			// to suppress as before until canonical mode is enabled.
 			if err := h.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
@@ -463,6 +473,7 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 				log.Printf("ws: failed to mark delivered: %v", err)
 				continue
 			}
+			metrics.IncrementDelivered()
 		}
 	}
 }

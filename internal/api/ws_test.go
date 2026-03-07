@@ -5,13 +5,17 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/storeforward"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 type wsTestConn struct{}
@@ -236,6 +240,26 @@ func decodeFrameMap(t *testing.T, payload []byte) map[string]any {
 	return frame
 }
 
+func readCounterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := counter.Write(m); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if m.Counter == nil {
+		t.Fatal("counter metric is nil")
+	}
+	return m.Counter.GetValue()
+}
+
+func requireCounterDelta(t *testing.T, before, after, wantDelta float64, name string) {
+	t.Helper()
+	delta := after - before
+	if math.Abs(delta-wantDelta) > 1e-9 {
+		t.Fatalf("%s delta mismatch: got %.0f want %.0f", name, delta, wantDelta)
+	}
+}
+
 func assertErrorFrameCompat(t *testing.T, frame model.WSFrame, wantCode model.ErrorCode, wantMessage string) {
 	t.Helper()
 	if frame.Type != model.FrameTypeError {
@@ -425,6 +449,88 @@ func TestHandleAckCanonicalModeIsIdempotent(t *testing.T) {
 	if !st.ackedByMsg["msg-idempotent"][client.DeliveryID] {
 		t.Fatalf("canonical mode should persist ack state for delivery identity %q", client.DeliveryID)
 	}
+}
+
+func TestLegacyModeDeliveryMetricsPushOnlyAndAckNoIncrementAfterPush(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+
+	recipient := newClientForWSHandler()
+	recipient.WayfarerID = "wayfarer-b"
+	recipient.DeviceID = "device-a"
+	recipient.DeliveryID = storeforward.DeliveryIdentity(recipient.WayfarerID, recipient.DeviceID)
+	h.clients.Register(recipient)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if h.clients.Count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if h.clients.Count() == 0 {
+		t.Fatal("expected recipient to be registered")
+	}
+
+	beforePush := readCounterValue(t, metrics.MessagesDeliveredTotal)
+
+	createdAt := time.Unix(1_700_010_000, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-legacy-metric",
+		From:      "wayfarer-a",
+		To:        "wayfarer-b",
+		Payload:   "QQ==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}
+	h.deliverToRecipient(msg)
+	_ = readQueuedFrame(t, recipient)
+
+	afterPush := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, beforePush, afterPush, 1, "legacy push delivered")
+
+	st.mu.Lock()
+	if len(st.markDelivered) != 1 {
+		st.mu.Unlock()
+		t.Fatalf("expected exactly one legacy MarkDelivered call, got %d", len(st.markDelivered))
+	}
+	st.mu.Unlock()
+
+	h.handleAck(recipient, &model.WSFrame{Type: model.FrameTypeAck, MsgID: msg.ID})
+	resp := readQueuedFrame(t, recipient)
+	if resp.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected ack_ok, got %q", resp.Type)
+	}
+
+	afterAck := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, afterPush, afterAck, 0, "legacy ack after push delivered")
+}
+
+func TestAckDrivenModeMetricsIncrementOnAckTransitionOnly(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	h.SetAckDrivenSuppression(true)
+
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeviceID = "device-a"
+	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+
+	beforeAck := readCounterValue(t, metrics.MessagesDeliveredTotal)
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-canonical-metric"})
+	first := readQueuedFrame(t, client)
+	if first.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected first ack_ok, got %q", first.Type)
+	}
+	afterFirst := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, beforeAck, afterFirst, 1, "canonical first ack delivered")
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-canonical-metric"})
+	second := readQueuedFrame(t, client)
+	if second.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected second ack_ok, got %q", second.Type)
+	}
+	afterSecond := readCounterValue(t, metrics.MessagesDeliveredTotal)
+	requireCounterDelta(t, afterFirst, afterSecond, 0, "canonical second ack delivered")
 }
 
 func TestHandleSendSendOKIncludesCanonicalAndLegacyTimestamps(t *testing.T) {

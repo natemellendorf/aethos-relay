@@ -91,13 +91,22 @@ func (e *Engine) PullForDeliveryIdentity(ctx context.Context, deliveryIdentity s
 		isSuppressed := false
 		var err error
 		if e.ackDrivenSuppression {
-			isSuppressed, err = e.store.IsAckedBy(ctx, msg.ID, deliveryIdentity)
+			acked, ackErr := e.store.IsAckedBy(ctx, msg.ID, deliveryIdentity)
+			if ackErr != nil {
+				return nil, ackErr
+			}
+			legacyDelivered, deliveredErr := e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
+			if deliveredErr != nil {
+				return nil, deliveredErr
+			}
+			isSuppressed = acked || legacyDelivered
 		} else {
 			isSuppressed, err = e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
+			if err != nil {
+				return nil, err
+			}
 		}
-		if err != nil {
-			return nil, err
-		}
+
 		if isSuppressed {
 			continue
 		}

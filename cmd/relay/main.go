@@ -93,6 +93,9 @@ func main() {
 	log.Printf("Allowed origins: %s", *allowedOrigins)
 	log.Printf("Dev mode: %v", *devMode)
 	log.Printf("Ack-driven suppression: %v", *ackDrivenSuppression)
+	if *ackDrivenSuppression {
+		log.Printf("WARNING: ack-driven suppression enabled: queue suppression uses ack_state and legacy delivery_state during migration")
+	}
 	log.Printf("Auto peer discovery: %v", *autoPeerDiscovery)
 	log.Printf("Max envelope size: %d bytes", *maxEnvelopeSize)
 	log.Printf("Max federation peers: %d", *maxFederationPeers)
