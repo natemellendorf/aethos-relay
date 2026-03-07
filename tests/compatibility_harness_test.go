@@ -21,7 +21,7 @@ import (
 )
 
 func TestRelayLinkCompatibilityPayloadIntegrityAndAck(t *testing.T) {
-	relay, wsURL := startRelayForTest(t, "relay-single", false, "")
+	relay, wsURL := startRelayForTest(t, "relay-single", false, "", false)
 	defer relay.close()
 
 	fixture := mustReadFixture(t)
@@ -43,6 +43,15 @@ func TestRelayLinkCompatibilityPayloadIntegrityAndAck(t *testing.T) {
 	mustType(t, sendOK, model.FrameTypeSendOK)
 	if sendOK.MsgID == "" {
 		t.Fatal("send_ok must include msg_id")
+	}
+	if sendOK.ReceivedAt == 0 || sendOK.ExpiresAt == 0 {
+		t.Fatal("send_ok must include received_at and expires_at")
+	}
+	if sendOK.At == 0 {
+		t.Fatal("send_ok must preserve legacy at alias")
+	}
+	if sendOK.At != sendOK.ReceivedAt {
+		t.Fatalf("legacy at alias should equal received_at: at=%d received_at=%d", sendOK.At, sendOK.ReceivedAt)
 	}
 
 	stored, err := relay.store.GetMessageByID(context.Background(), sendOK.MsgID)
@@ -78,7 +87,11 @@ func TestRelayLinkCompatibilityPayloadIntegrityAndAck(t *testing.T) {
 	}
 
 	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeAck, MsgID: sendOK.MsgID})
-	mustType(t, readFrame(t, b), model.FrameTypeAckOK)
+	ackOK := readFrame(t, b)
+	mustType(t, ackOK, model.FrameTypeAckOK)
+	if ackOK.MsgID != sendOK.MsgID {
+		t.Fatalf("ack_ok must echo msg_id: got %q want %q", ackOK.MsgID, sendOK.MsgID)
+	}
 
 	legacyDelivered, err := relay.store.IsDeliveredTo(context.Background(), sendOK.MsgID, "wayfarer-b")
 	if err != nil {
@@ -97,7 +110,7 @@ func TestRelayLinkCompatibilityPayloadIntegrityAndAck(t *testing.T) {
 }
 
 func TestRelayLinkCompatibilityDeviceScopedDeliveryAndAck(t *testing.T) {
-	relay, wsURL := startRelayForTest(t, "relay-device", false, "")
+	relay, wsURL := startRelayForTest(t, "relay-device", false, "", false)
 	defer relay.close()
 
 	fixture := mustReadFixture(t)
@@ -153,14 +166,67 @@ func TestRelayLinkCompatibilityDeviceScopedDeliveryAndAck(t *testing.T) {
 	}
 }
 
+func TestRelayLinkCompatibilityCanonicalModePushDoesNotSuppressUntilAck(t *testing.T) {
+	relay, wsURL := startRelayForTest(t, "relay-canonical", false, "", true)
+	defer relay.close()
+
+	a := mustDial(t, wsURL)
+	defer a.Close()
+	b := mustDial(t, wsURL)
+	defer b.Close()
+
+	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a"})
+	mustType(t, readFrame(t, a), model.FrameTypeHelloOK)
+
+	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-b", DeviceID: "device-a"})
+	mustType(t, readFrame(t, b), model.FrameTypeHelloOK)
+
+	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: "QQ==", TTLSeconds: 120})
+	sendOK := readFrame(t, a)
+	mustType(t, sendOK, model.FrameTypeSendOK)
+
+	push := readFrame(t, b)
+	mustType(t, push, model.FrameTypeMessage)
+	if push.MsgID != sendOK.MsgID {
+		t.Fatalf("push msg_id mismatch: got %q want %q", push.MsgID, sendOK.MsgID)
+	}
+
+	writeFrame(t, b, model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+	pulledBeforeAck := readFrame(t, b)
+	mustType(t, pulledBeforeAck, model.FrameTypeMessages)
+	if len(pulledBeforeAck.Messages) != 1 {
+		t.Fatalf("canonical mode should not suppress before ack, got %d", len(pulledBeforeAck.Messages))
+	}
+
+	deliveryID := storeforward.DeliveryIdentity("wayfarer-b", "device-a")
+	deliveredBeforeAck, err := relay.store.IsDeliveredTo(context.Background(), sendOK.MsgID, deliveryID)
+	if err != nil {
+		t.Fatalf("check legacy delivered before ack: %v", err)
+	}
+	if deliveredBeforeAck {
+		t.Fatal("canonical mode should not mark delivered on push")
+	}
+
+	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeAck, MsgID: sendOK.MsgID})
+	ackOK := readFrame(t, b)
+	mustType(t, ackOK, model.FrameTypeAckOK)
+
+	writeFrame(t, b, model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+	pulledAfterAck := readFrame(t, b)
+	mustType(t, pulledAfterAck, model.FrameTypeMessages)
+	if len(pulledAfterAck.Messages) != 0 {
+		t.Fatalf("expected suppression after durable ack, got %d", len(pulledAfterAck.Messages))
+	}
+}
+
 func TestRelayLinkCompatibilityFederationOptional(t *testing.T) {
 	if os.Getenv("AETHOS_RELAY_TEST_FEDERATION") != "1" {
 		t.Skip("set AETHOS_RELAY_TEST_FEDERATION=1 to enable federation integration test")
 	}
 
-	relay2, ws2 := startRelayForTest(t, "relay-2", true, "")
+	relay2, ws2 := startRelayForTest(t, "relay-2", true, "", false)
 	defer relay2.close()
-	relay1, ws1 := startRelayForTest(t, "relay-1", true, relay2.fedURL)
+	relay1, ws1 := startRelayForTest(t, "relay-1", true, relay2.fedURL, false)
 	defer relay1.close()
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -231,7 +297,7 @@ func (r *relayHarness) close() {
 	_ = r.store.Close()
 }
 
-func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, peerURL string) (*relayHarness, string) {
+func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, peerURL string, ackDrivenSuppression bool) (*relayHarness, string) {
 	t.Helper()
 	dir := t.TempDir()
 	st := store.NewBBoltStore(filepath.Join(dir, "relay.db"))
@@ -241,6 +307,7 @@ func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, pee
 	clients := model.NewClientRegistry()
 	go clients.Run()
 	wsHandler := api.NewWSHandler(st, clients, 24*time.Hour, "", true)
+	wsHandler.SetAckDrivenSuppression(ackDrivenSuppression)
 	wsHandler.SetAutoDeliverQueued(false)
 
 	mux := http.NewServeMux()
@@ -249,6 +316,7 @@ func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, pee
 	var pm *federation.PeerManager
 	if federationEnabled {
 		pm = federation.NewPeerManager(relayID, st, clients, 24*time.Hour)
+		pm.SetAckDrivenSuppression(ackDrivenSuppression)
 		wsHandler.SetFederationManager(pm)
 		mux.HandleFunc("/federation/ws", pm.HandleInboundPeer)
 		go pm.Run()

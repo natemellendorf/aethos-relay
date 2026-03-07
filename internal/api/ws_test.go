@@ -37,17 +37,21 @@ type wsStoreSpy struct {
 	isDeliveredChecks []deliveredCall
 	getQueuedCalls    []string
 	deliveredByMsg    map[string]map[string]bool
+	ackedByMsg        map[string]map[string]bool
 
 	persistErr       error
 	markDeliveredErr error
+	markAckedErr     error
 	getQueuedErr     error
 	isDeliveredErr   error
+	isAckedErr       error
 }
 
 func newWSStoreSpy() *wsStoreSpy {
 	return &wsStoreSpy{
 		queued:         make(map[string][]*model.Message),
 		deliveredByMsg: make(map[string]map[string]bool),
+		ackedByMsg:     make(map[string]map[string]bool),
 	}
 }
 
@@ -84,6 +88,10 @@ func (s *wsStoreSpy) GetQueuedMessages(ctx context.Context, recipientID string, 
 	return result, nil
 }
 
+func (s *wsStoreSpy) GetQueuedMessagesRaw(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
+	return s.GetQueuedMessages(ctx, recipientID, limit)
+}
+
 func (s *wsStoreSpy) MarkDelivered(ctx context.Context, msgID string, recipientID string) error {
 	if s.markDeliveredErr != nil {
 		return s.markDeliveredErr
@@ -108,6 +116,31 @@ func (s *wsStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientI
 	return s.deliveredByMsg[msgID][recipientID], nil
 }
 
+func (s *wsStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	if s.markAckedErr != nil {
+		return false, s.markAckedErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ackedByMsg[msgID] == nil {
+		s.ackedByMsg[msgID] = make(map[string]bool)
+	}
+	if s.ackedByMsg[msgID][recipientID] {
+		return false, nil
+	}
+	s.ackedByMsg[msgID][recipientID] = true
+	return true, nil
+}
+
+func (s *wsStoreSpy) IsAckedBy(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	if s.isAckedErr != nil {
+		return false, s.isAckedErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackedByMsg[msgID][recipientID], nil
+}
+
 func (s *wsStoreSpy) GetMessageByID(ctx context.Context, msgID string) (*model.Message, error) {
 	return nil, nil
 }
@@ -130,6 +163,7 @@ func (s *wsStoreSpy) RemoveMessage(ctx context.Context, msgID string) error {
 		s.queued[recipientID] = filtered
 	}
 	delete(s.deliveredByMsg, msgID)
+	delete(s.ackedByMsg, msgID)
 	return nil
 }
 
@@ -282,7 +316,7 @@ func TestHandlePullAndAckUseDeviceDeliveryIdentity(t *testing.T) {
 		t.Fatalf("pull should filter by device delivery identity, checks=%v", st.isDeliveredChecks)
 	}
 	if len(st.markDelivered) == 0 || st.markDelivered[len(st.markDelivered)-1].recipientID != client.DeliveryID {
-		t.Fatalf("ack should mark delivered for tracked device identity, calls=%v", st.markDelivered)
+		t.Fatalf("ack should mark delivered for connection device identity, calls=%v", st.markDelivered)
 	}
 }
 
@@ -308,12 +342,13 @@ func TestHandlePullIsDeliveredToFailureMapsToInternalError(t *testing.T) {
 	assertErrorFrameCompat(t, resp, model.ErrorCodeInternalError, "failed to pull messages")
 }
 
-func TestHandleAckLegacyFallbackUsesWayfarerIdentity(t *testing.T) {
+func TestHandleAckUsesConnectionDeliveryIdentityWithoutTracking(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	client := newClientForWSHandler()
 	client.WayfarerID = "wayfarer-b"
 	client.DeviceID = "device-a"
 	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+	client.ResetDeliveryTracking()
 
 	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-legacy"})
 
@@ -322,8 +357,73 @@ func TestHandleAckLegacyFallbackUsesWayfarerIdentity(t *testing.T) {
 	if len(st.markDelivered) != 1 {
 		t.Fatalf("expected one ack delivery write, got %d", len(st.markDelivered))
 	}
+	if st.markDelivered[0].recipientID != client.DeliveryID {
+		t.Fatalf("ack should use connection delivery identity, got %q want %q", st.markDelivered[0].recipientID, client.DeliveryID)
+	}
+}
+
+func TestHandleAckFallsBackToWayfarerWhenDeliveryIdentityEmpty(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-wayfarer"})
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.markDelivered) != 1 {
+		t.Fatalf("expected one ack delivery write, got %d", len(st.markDelivered))
+	}
 	if st.markDelivered[0].recipientID != client.WayfarerID {
 		t.Fatalf("fallback should use wayfarer identity, got %q want %q", st.markDelivered[0].recipientID, client.WayfarerID)
+	}
+}
+
+func TestHandleAckOKShapeStable(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-ack-shape"})
+
+	payload := readQueuedPayload(t, client)
+	decoded := decodeFrameMap(t, payload)
+	if decoded["type"] != model.FrameTypeAckOK {
+		t.Fatalf("expected ack_ok type, got %v", decoded["type"])
+	}
+	if decoded["msg_id"] != "msg-ack-shape" {
+		t.Fatalf("expected ack_ok msg_id, got %v", decoded["msg_id"])
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("ack_ok should only include type and msg_id, got %v", decoded)
+	}
+}
+
+func TestHandleAckCanonicalModeIsIdempotent(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	h.SetAckDrivenSuppression(true)
+
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeviceID = "device-a"
+	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
+
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-idempotent"})
+	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-idempotent"})
+
+	first := readQueuedFrame(t, client)
+	second := readQueuedFrame(t, client)
+	if first.Type != model.FrameTypeAckOK || second.Type != model.FrameTypeAckOK {
+		t.Fatalf("expected ack_ok responses, got %q and %q", first.Type, second.Type)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.markDelivered) != 0 {
+		t.Fatalf("canonical mode should not write legacy delivery state on ack, got %v", st.markDelivered)
+	}
+	if !st.ackedByMsg["msg-idempotent"][client.DeliveryID] {
+		t.Fatalf("canonical mode should persist ack state for delivery identity %q", client.DeliveryID)
 	}
 }
 

@@ -18,6 +18,7 @@ var (
 	BucketMessages         = []byte("messages")
 	BucketQueueByRecipient = []byte("queue_by_recipient")
 	BucketDeliveryState    = []byte("delivery_state")
+	BucketAckState         = []byte("ack_state")
 	BucketExpiryIndex      = []byte("expiry_index")
 	BucketMsgIDIndex       = []byte("msgid_index")
 	BucketMeta             = []byte("meta")
@@ -56,6 +57,7 @@ func (s *BBoltStore) Open() error {
 			BucketMessages,
 			BucketQueueByRecipient,
 			BucketDeliveryState,
+			BucketAckState,
 			BucketExpiryIndex,
 			BucketMsgIDIndex,
 			BucketMeta,
@@ -150,12 +152,51 @@ func (s *BBoltStore) GetQueuedMessages(ctx context.Context, recipientID string, 
 				continue // Skip malformed messages
 			}
 
-			// Check per-device delivery state - only return if not delivered to this specific recipient
+			// Legacy suppression path: delivered state gates queue visibility.
 			deliveryKey := EncodeDeliveryKey(msgID, recipientID)
 			delivered := tx.Bucket(BucketDeliveryState).Get(deliveryKey)
 			if delivered == nil {
 				messages = append(messages, msg)
 			}
+			count++
+		}
+		return nil
+	})
+
+	return messages, err
+}
+
+// GetQueuedMessagesRaw retrieves queued messages without delivery-state filtering.
+func (s *BBoltStore) GetQueuedMessagesRaw(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
+	var messages []*model.Message
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		// Prefix scan the queue bucket
+		c := tx.Bucket(BucketQueueByRecipient).Cursor()
+		prefix := []byte(recipientID + recipientDelimiter)
+
+		count := 0
+		for k, v := c.Seek(prefix); k != nil && count < limit; k, v = c.Next() {
+			// Check if we've moved past our prefix
+			if len(k) < len(prefix) {
+				break
+			}
+			if string(k[:len(prefix)]) != string(prefix) {
+				break
+			}
+
+			msgID := string(v)
+			msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+			if msgBytes == nil {
+				continue
+			}
+
+			msg, err := DecodeMessage(msgBytes)
+			if err != nil {
+				continue // Skip malformed messages
+			}
+
+			messages = append(messages, msg)
 			count++
 		}
 		return nil
@@ -202,6 +243,55 @@ func (s *BBoltStore) MarkDelivered(ctx context.Context, msgID string, recipientI
 	})
 }
 
+// MarkAcked marks a message as acknowledged to a specific recipient identity.
+// Returns true only when this call records a new durable ack transition.
+func (s *BBoltStore) MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	transitioned := false
+
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
+		if msgBytes == nil {
+			return fmt.Errorf("message not found: %s", msgID)
+		}
+
+		ackKey := EncodeDeliveryKey(msgID, recipientID)
+		ackBucket := tx.Bucket(BucketAckState)
+		if ackBucket == nil {
+			return xerrors.New("ack state bucket missing")
+		}
+		if ackBucket.Get(ackKey) != nil {
+			return nil
+		}
+
+		now := time.Now()
+		nowBytes, _ := now.MarshalBinary()
+		if err := ackBucket.Put(ackKey, nowBytes); err != nil {
+			return xerrors.Errorf("failed to update ack state: %w", err)
+		}
+		transitioned = true
+
+		msg, err := DecodeMessage(msgBytes)
+		if err != nil {
+			return xerrors.Errorf("failed to decode message: %w", err)
+		}
+
+		if msg.DeliveredAt == nil {
+			msg.DeliveredAt = &now
+			updatedBytes, err := EncodeMessage(msg)
+			if err != nil {
+				return xerrors.Errorf("failed to encode message: %w", err)
+			}
+			if err := tx.Bucket(BucketMessages).Put([]byte(msgID), updatedBytes); err != nil {
+				return xerrors.Errorf("failed to update message: %w", err)
+			}
+		}
+
+		return nil
+	})
+
+	return transitioned, err
+}
+
 // IsDeliveredTo checks if a message has been delivered to a specific recipient.
 func (s *BBoltStore) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
 	var delivered bool
@@ -212,6 +302,22 @@ func (s *BBoltStore) IsDeliveredTo(ctx context.Context, msgID string, recipientI
 		return nil
 	})
 	return delivered, err
+}
+
+// IsAckedBy checks if a message has been acknowledged by a specific recipient identity.
+func (s *BBoltStore) IsAckedBy(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	var acked bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		ackKey := EncodeDeliveryKey(msgID, recipientID)
+		ackBucket := tx.Bucket(BucketAckState)
+		if ackBucket == nil {
+			return xerrors.New("ack state bucket missing")
+		}
+		result := ackBucket.Get(ackKey)
+		acked = result != nil
+		return nil
+	})
+	return acked, err
 }
 
 // RemoveMessage removes a message from all buckets.
@@ -240,22 +346,33 @@ func (s *BBoltStore) RemoveMessage(ctx context.Context, msgID string) error {
 		tx.Bucket(BucketMessages).Delete([]byte(msgID))
 
 		// Remove from msgid index
-		tx.Bucket(BucketMsgIDIndex).Delete([]byte(msgID))
-
-		// Remove from delivery state.
-		deliveryStateBucket := tx.Bucket(BucketDeliveryState)
-		deliveryStateBucket.Delete([]byte(msgID))
+		tx.Bucket(BucketMsgIDIndex).Delete(EncodeMsgIDKey(msgID))
 
 		deliveryStateKeyPrefix := []byte(msgID + recipientDelimiter)
-		cursor := deliveryStateBucket.Cursor()
-		for k, _ := cursor.Seek(deliveryStateKeyPrefix); k != nil && bytes.HasPrefix(k, deliveryStateKeyPrefix); k, _ = cursor.Next() {
-			if err := cursor.Delete(); err != nil {
-				return xerrors.Errorf("failed to remove delivery state for msg_id=%s: %w", msgID, err)
-			}
+		if err := deleteKeyPrefix(tx.Bucket(BucketDeliveryState), deliveryStateKeyPrefix, "delivery", msgID); err != nil {
+			return err
+		}
+		if err := deleteKeyPrefix(tx.Bucket(BucketAckState), deliveryStateKeyPrefix, "ack", msgID); err != nil {
+			return err
 		}
 
 		return nil
 	})
+}
+
+func deleteKeyPrefix(bucket *bolt.Bucket, prefix []byte, stateName string, msgID string) error {
+	if bucket == nil {
+		return nil
+	}
+
+	cursor := bucket.Cursor()
+	for k, _ := cursor.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = cursor.Next() {
+		if err := cursor.Delete(); err != nil {
+			return xerrors.Errorf("failed to remove %s state for msg_id=%s: %w", stateName, msgID, err)
+		}
+	}
+
+	return nil
 }
 
 // GetExpiredMessages returns messages that have expired.

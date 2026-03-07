@@ -26,6 +26,7 @@ func main() {
 	boolFlags := map[string]struct{}{
 		"log-json":                 {},
 		"dev-mode":                 {},
+		"ack-driven-suppression":   {},
 		"auto-peer-discovery":      {},
 		"federation-pad-enabled":   {},
 		"federation-cover-enabled": {},
@@ -41,6 +42,7 @@ func main() {
 	logJSON := flag.Bool("log-json", false, "JSON logging output")
 	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated list of allowed WebSocket origins (e.g., 'https://app.aethos.io,https://aethos.app')")
 	devMode := flag.Bool("dev-mode", false, "Enable development mode (allows all origins, for local development only)")
+	ackDrivenSuppression := flag.Bool("ack-driven-suppression", false, "Use canonical ack-driven delivery suppression (default legacy mark-on-push)")
 
 	// Federation flags
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
@@ -90,6 +92,7 @@ func main() {
 	log.Printf("Max TTL: %d seconds", *maxTTLSecs)
 	log.Printf("Allowed origins: %s", *allowedOrigins)
 	log.Printf("Dev mode: %v", *devMode)
+	log.Printf("Ack-driven suppression: %v", *ackDrivenSuppression)
 	log.Printf("Auto peer discovery: %v", *autoPeerDiscovery)
 	log.Printf("Max envelope size: %d bytes", *maxEnvelopeSize)
 	log.Printf("Max federation peers: %d", *maxFederationPeers)
@@ -239,7 +242,9 @@ func main() {
 
 	// Initialize handlers
 	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL, *allowedOrigins, *devMode)
+	wsHandler.SetAckDrivenSuppression(*ackDrivenSuppression)
 	wsHandler.SetFederationManager(federationManager)
+	federationManager.SetAckDrivenSuppression(*ackDrivenSuppression)
 	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)
 
 	// Set up HTTP server with WebSocket and API handlers

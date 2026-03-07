@@ -416,3 +416,55 @@ func TestRemoveMessageClearsPerDeviceDeliveryState(t *testing.T) {
 		t.Fatalf("expected queued message ID %s, got %s", msgID, messages[0].ID)
 	}
 }
+
+func TestRemoveMessageClearsPerDeviceAckState(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	msgID := "acked-msg-id"
+	recipientID := "recipient-1\x00device-a"
+	now := time.Now().Truncate(time.Second)
+
+	msg := &model.Message{
+		ID:        msgID,
+		From:      "sender-1",
+		To:        "recipient-1",
+		Payload:   "SGVsbG8=",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := store.PersistMessage(nil, msg); err != nil {
+		t.Fatalf("failed to persist message: %v", err)
+	}
+
+	transitioned, err := store.MarkAcked(nil, msgID, recipientID)
+	if err != nil {
+		t.Fatalf("failed to mark acked: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("expected first ack transition")
+	}
+
+	if err := store.RemoveMessage(nil, msgID); err != nil {
+		t.Fatalf("failed to remove message: %v", err)
+	}
+
+	acked, err := store.IsAckedBy(nil, msgID, recipientID)
+	if err != nil {
+		t.Fatalf("failed to check ack state: %v", err)
+	}
+	if acked {
+		t.Fatal("expected ack state to be cleared after remove")
+	}
+}

@@ -22,12 +22,22 @@ type Store interface {
 	// The recipientID parameter ensures per-device delivery tracking.
 	GetQueuedMessages(ctx context.Context, recipientID string, limit int) ([]*model.Message, error)
 
+	// GetQueuedMessagesRaw retrieves queued messages for a recipient without delivery-state filtering.
+	GetQueuedMessagesRaw(ctx context.Context, recipientID string, limit int) ([]*model.Message, error)
+
 	// MarkDelivered marks a message as delivered to a specific recipient.
 	// This enables per-device delivery tracking - each device/session must ACK separately.
 	MarkDelivered(ctx context.Context, msgID string, recipientID string) error
 
+	// MarkAcked marks a message as acknowledged by a specific recipient identity.
+	// Returns true when this call records a new durable ack transition.
+	MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error)
+
 	// IsDeliveredTo checks if a message has been delivered to a specific recipient.
 	IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error)
+
+	// IsAckedBy checks if a message has been acknowledged by a specific recipient identity.
+	IsAckedBy(ctx context.Context, msgID string, recipientID string) (bool, error)
 
 	// GetMessageByID retrieves a message by its ID.
 	GetMessageByID(ctx context.Context, msgID string) (*model.Message, error)

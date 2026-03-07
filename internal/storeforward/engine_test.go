@@ -147,8 +147,12 @@ func TestClientAckTracksSingleDeliveryIdentity(t *testing.T) {
 	deviceA := DeliveryIdentity("wayfarer-1", "device-a")
 	deviceB := DeliveryIdentity("wayfarer-1", "device-b")
 
-	if err := h.engine.AckClientDelivery(context.Background(), msg.ID, deviceA); err != nil {
+	transitioned, err := h.engine.AckClientDelivery(context.Background(), msg.ID, deviceA)
+	if err != nil {
 		t.Fatalf("ack device-a: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("expected first ack to transition state")
 	}
 
 	deliveredA, err := h.messageStore.IsDeliveredTo(context.Background(), msg.ID, deviceA)
@@ -175,6 +179,68 @@ func TestClientAckTracksSingleDeliveryIdentity(t *testing.T) {
 		t.Fatalf("device-a queue should be empty, got %d", len(deviceAMessages))
 	}
 
+	deviceBMessages, err := h.engine.PullForDeliveryIdentity(context.Background(), deviceB, 10)
+	if err != nil {
+		t.Fatalf("pull device-b: %v", err)
+	}
+	if len(deviceBMessages) != 1 {
+		t.Fatalf("device-b queue should still contain message, got %d", len(deviceBMessages))
+	}
+}
+
+func TestAckDrivenSuppressionUsesAckStateAndIsIdempotent(t *testing.T) {
+	h := newEngineHarness(t, time.Hour)
+	h.engine.SetAckDrivenSuppression(true)
+
+	msg := &model.Message{
+		ID:        "msg-ack-driven",
+		From:      "alice",
+		To:        "wayfarer-1",
+		Payload:   "QQ==",
+		CreatedAt: h.now,
+		ExpiresAt: h.now.Add(10 * time.Minute),
+	}
+	persistTestMessage(t, h, msg)
+
+	deviceA := DeliveryIdentity("wayfarer-1", "device-a")
+
+	if err := h.engine.MarkDelivery(context.Background(), msg.ID, deviceA); err != nil {
+		t.Fatalf("legacy mark delivery write: %v", err)
+	}
+
+	stillVisible, err := h.engine.PullForDeliveryIdentity(context.Background(), deviceA, 10)
+	if err != nil {
+		t.Fatalf("pull before ack: %v", err)
+	}
+	if len(stillVisible) != 1 {
+		t.Fatalf("canonical mode should not suppress on push state, got %d", len(stillVisible))
+	}
+
+	firstTransition, err := h.engine.AckClientDelivery(context.Background(), msg.ID, deviceA)
+	if err != nil {
+		t.Fatalf("first ack: %v", err)
+	}
+	if !firstTransition {
+		t.Fatal("expected first ack to transition")
+	}
+
+	secondTransition, err := h.engine.AckClientDelivery(context.Background(), msg.ID, deviceA)
+	if err != nil {
+		t.Fatalf("second ack: %v", err)
+	}
+	if secondTransition {
+		t.Fatal("expected second ack to be idempotent")
+	}
+
+	deviceAMessages, err := h.engine.PullForDeliveryIdentity(context.Background(), deviceA, 10)
+	if err != nil {
+		t.Fatalf("pull after ack: %v", err)
+	}
+	if len(deviceAMessages) != 0 {
+		t.Fatalf("device-a queue should be empty after durable ack, got %d", len(deviceAMessages))
+	}
+
+	deviceB := DeliveryIdentity("wayfarer-1", "device-b")
 	deviceBMessages, err := h.engine.PullForDeliveryIdentity(context.Background(), deviceB, 10)
 	if err != nil {
 		t.Fatalf("pull device-b: %v", err)
