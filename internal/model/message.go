@@ -35,6 +35,8 @@ type DeliveryState struct {
 // WSFrame represents a WebSocket frame (protocol v1).
 type WSFrame struct {
 	Type       string          `json:"type"`
+	Code       string          `json:"code,omitempty"`
+	Message    string          `json:"message,omitempty"`
 	WayfarerID string          `json:"wayfarer_id,omitempty"`
 	DeviceID   string          `json:"device_id,omitempty"`
 	From       string          `json:"from,omitempty"`
