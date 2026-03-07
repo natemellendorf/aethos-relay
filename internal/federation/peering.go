@@ -686,6 +686,10 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
 		return
 	}
+	if _, err := model.DecodePayloadB64(msg.Payload); err != nil {
+		log.Printf("federation: rejecting relay_forward %s from %s: invalid payload_b64: %v", msg.ID, peerRelayID(peer), err)
+		return
+	}
 
 	peer.healthMu.Lock()
 	peer.Health.MessagesReceived++
@@ -805,18 +809,25 @@ func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
 
 // deliverMessage delivers a message to local recipients.
 func (pm *PeerManager) deliverMessage(msg *model.Message) {
+	decodedPayload, err := model.DecodePayloadB64(msg.Payload)
+	if err != nil {
+		log.Printf("federation: dropping invalid stored payload for msg_id=%s recipient=%s: %v", msg.ID, msg.To, err)
+		return
+	}
+
 	recipients := pm.clients.GetClients(msg.To)
 	for _, r := range recipients {
 		recipientID := deliveryIdentityForClient(r)
 		if recipientID == "" {
 			continue
 		}
+		payloadB64 := model.EncodePayloadB64(decodedPayload, r.PayloadEncodingPref)
 		receivedAt := msg.CreatedAt.Unix()
 		data, _ := json.Marshal(model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
 			From:       msg.From,
-			PayloadB64: msg.Payload,
+			PayloadB64: payloadB64,
 			At:         receivedAt,
 			ReceivedAt: receivedAt,
 		})

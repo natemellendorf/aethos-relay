@@ -483,6 +483,33 @@ func TestHandleRelayForward_RejectsInvalidFields(t *testing.T) {
 	}
 }
 
+func TestHandleRelayForward_RejectsInvalidPayloadB64(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+	peer := &Peer{ID: "peer-1", Done: make(chan struct{})}
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "invalid-payload-msg",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "%%%",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	pm.handleRelayForward(peer, &model.RelayForwardFrame{
+		Type:    model.FrameTypeRelayForward,
+		Message: msg,
+	})
+
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
+		t.Fatal("expected invalid payload to be rejected")
+	}
+}
+
 func TestHandleRelayForward_MalformedEnvelopeFallsBackToLegacyMessageTimestamps(t *testing.T) {
 	st := newMockStore()
 	clients := model.NewClientRegistry()
@@ -512,6 +539,71 @@ func TestHandleRelayForward_MalformedEnvelopeFallsBackToLegacyMessageTimestamps(
 	if _, err := st.GetMessageByID(context.Background(), msg.ID); err != nil {
 		t.Fatal("expected valid legacy message timestamps to be accepted when envelope metadata is malformed")
 	}
+}
+
+func TestDeliverMessage_EncodesPayloadByRecipientPreference(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "msg-federation-encoding-pref",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "+/8=",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	urlRecipient := &model.Client{
+		WayfarerID:          "bob",
+		DeliveryID:          "bob",
+		Send:                make(chan []byte, 1),
+		PayloadEncodingPref: model.PayloadEncodingPrefBase64URL,
+	}
+	clients.Register(urlRecipient)
+
+	stdRecipient := &model.Client{
+		WayfarerID:          "bob",
+		DeliveryID:          "bob-device",
+		Send:                make(chan []byte, 1),
+		PayloadEncodingPref: model.PayloadEncodingPrefBase64,
+	}
+	clients.Register(stdRecipient)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if clients.Count() == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if clients.Count() != 2 {
+		t.Fatalf("expected two recipients registered, got %d", clients.Count())
+	}
+
+	pm.deliverMessage(msg)
+
+	assertPayload := func(ch <-chan []byte, want string) {
+		t.Helper()
+		select {
+		case raw := <-ch:
+			var frame model.WSFrame
+			if err := json.Unmarshal(raw, &frame); err != nil {
+				t.Fatalf("decode message frame: %v", err)
+			}
+			if frame.PayloadB64 != want {
+				t.Fatalf("payload mismatch: got %q want %q", frame.PayloadB64, want)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected delivered frame")
+		}
+	}
+
+	assertPayload(urlRecipient.Send, "-_8")
+	assertPayload(stdRecipient.Send, "+/8=")
 }
 
 // TestHandleRelayForward_NoReGossip verifies that receiving a forwarded message

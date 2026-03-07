@@ -18,7 +18,7 @@ This document audits current `aethos-relay` runtime behavior against canonical s
 | --- | --- | --- | --- |
 | `hello` / `device_id` | `hello` requires both `wayfarer_id` and `device_id` (`CLIENT_RELAY_PROTOCOL_V1.md:42`, `CLIENT_RELAY_PROTOCOL_V1.md:52`). | Wire frame now accepts optional `device_id` (`internal/model/message.go`), server still requires `wayfarer_id` and computes delivery identity from `(wayfarer_id, device_id)` when present (`internal/api/ws.go`); legacy clients without `device_id` fall back to wayfarer-only delivery identity for backward compatibility. | **Partially aligned (compat mode)** |
 | `hello_ok` fields | `hello_ok` requires `relay_id` (`CLIENT_RELAY_PROTOCOL_V1.md:114`, `CLIENT_RELAY_PROTOCOL_V1.md:122`). | Relay returns only `{ "type": "hello_ok" }` (`internal/api/ws.go:230`). | **Diverges** |
-| Payload encoding (`payload_b64`) | Must be base64url (no padding) and decode to canonical `EnvelopeV1` bytes (`CLIENT_RELAY_PROTOCOL_V1.md:15`, `CLIENT_RELAY_PROTOCOL_V1.md:16`, `CLIENT_RELAY_PROTOCOL_V1.md:70`; canonical bytes in `protocol.md:16`). | Server checks only non-empty payload (`internal/api/ws.go:248`), then stores payload string as-is (`internal/storeforward/client.go:52`). Compatibility tests use standard base64 (not base64url) encode/decode (`tests/compatibility_harness_test.go:27`, `tests/compatibility_harness_test.go:71`). | **Diverges** |
+| Payload encoding (`payload_b64`) | Must be base64url (no padding) and decode to canonical `EnvelopeV1` bytes (`CLIENT_RELAY_PROTOCOL_V1.md:15`, `CLIENT_RELAY_PROTOCOL_V1.md:16`, `CLIENT_RELAY_PROTOCOL_V1.md:70`; canonical bytes in `protocol.md:16`). | Relay now validates inbound payloads by tolerant decode (base64url/base64, padded/unpadded) on client `send` and federation `relay_forward`; storage remains verbatim string. Client-facing outbound re-encodes per connection preference inferred from observed client `send`, defaulting to legacy padded base64 for receive-only/unknown clients (`internal/model/payload_b64.go`, `internal/api/ws.go`, `internal/federation/peering.go`). | **Partially aligned (compat mode)** |
 | `send_ok` timestamp names/shape | `send_ok` uses `msg_id` and optional `received_at`/`expires_at` pair (`CLIENT_RELAY_PROTOCOL_V1.md:128`, `CLIENT_RELAY_PROTOCOL_V1.md:142`, `CLIENT_RELAY_PROTOCOL_V1.md:144`). | Relay now emits `send_ok` with `msg_id`, canonical `received_at`/`expires_at` (Unix seconds), and retains legacy `at` as an alias of `received_at` during transition (`internal/api/ws.go`, `internal/model/message.go`). | **Partially aligned (compat alias retained)** |
 | `message` timestamp names/shape | `message` requires `received_at` epoch seconds (`CLIENT_RELAY_PROTOCOL_V1.md:150`, `CLIENT_RELAY_PROTOCOL_V1.md:164`). | Push delivery now emits canonical `received_at` (Unix seconds) and retains legacy `at` alias for compatibility (`internal/api/ws.go`, `internal/federation/peering.go`, `internal/model/message.go`). | **Partially aligned (compat alias retained)** |
 | `messages` object fields | Each pulled message should expose `msg_id`, `from`, `payload_b64`, `received_at` (`CLIENT_RELAY_PROTOCOL_V1.md:170`, `CLIENT_RELAY_PROTOCOL_V1.md:185`). | Pull response remains backward-compatible by marshaling legacy `model.Message` fields (including RFC3339 `at`, `expires_at`, `delivered`, etc.) and now adds canonical `received_at` (Unix seconds) alongside them during migration (`internal/api/ws.go`, `internal/model/message.go`). | **Partially aligned (migration dual-surface)** |
@@ -44,6 +44,13 @@ This document audits current `aethos-relay` runtime behavior against canonical s
 | TTL non-extension | `expires_at` is immutable and must not be extended (`FEDERATION_PROTOCOL_V1.md:107`). | Forward acceptance persists incoming `msg.ExpiresAt` as-is (`internal/storeforward/federation_forwarding.go:63`, `internal/storeforward/federation_forwarding.go:199`), and tests pin expiry preservation (`internal/storeforward/engine_test.go:224`). | **Matches** |
 | Expiry rejection boundary | Expired envelope threshold is `now_ms >= expires_at` (`FEDERATION_PROTOCOL_V1.md:108`). | Runtime expiry check is `now.After(expires_at)` (`internal/storeforward/federation_forwarding.go:45`), which differs at exact-equality boundary. | **Diverges** |
 | `relay_cover` usage and shape | Requires `relay_id` and `sent_at` (Unix ms), optional padding (`FEDERATION_PROTOCOL_V1.md:93`, `FEDERATION_PROTOCOL_V1.md:94`, `FEDERATION_PROTOCOL_V1.md:98`). | Cover frame now dual-emits legacy `ts` (seconds) and canonical `sent_at` (ms), plus existing `nonce`; receive path still treats cover as no-op heartbeat (`internal/model/message.go`, `internal/federation/tar.go`, `internal/federation/peering.go:369`). | **Partially aligned (dual-surface compat mode)** |
+
+## CRP-PAYLOAD-BASE64URL
+
+- Canonical spec: `payload_b64` is RFC4648 base64url without padding.
+- Relay now accepts both base64url and legacy base64 (padded or unpadded) for inbound client `send` and federation `relay_forward` payloads.
+- Outbound to clients is per-connection: preference is inferred from observed client `send` payload encoding; unknown/receive-only clients default to legacy padded base64 for compatibility.
+- Remaining gap: no explicit hello/handshake capability negotiation for payload encoding; future bead should add explicit negotiation before removing compatibility fallback.
 
 ## Receipts audit
 
@@ -80,7 +87,7 @@ These are implementation/runtime limits and policies; they are not canonical pro
 ### Confirmed divergences
 
 1. Client wire shape still diverges on strict canonical identity requirements (`device_id` remains optional for backward compatibility) and error schema (`msg_id` string instead of `code`/`message`), while timestamp fields are now dual-emitted in compatibility mode.
-2. Payload semantics diverge: no base64url enforcement and no canonical `EnvelopeV1` decode validation on client `send`.
+2. Payload semantics are in compatibility mode: relay tolerates base64url and legacy base64 and can emit either per connection, but still does not decode/validate canonical `EnvelopeV1` bytes.
 3. TTL semantics diverge: default TTL tracks relay `maxTTL` instead of canonical `3600`; expired messages can still be delivered before sweep.
 4. Idempotency diverges: `client_msg_id` is not represented or enforced.
 5. Federation protocol diverges structurally: runtime is inventory/request/message-forward oriented rather than canonical envelope-forward protocol, though timestamp metadata is now dual-emitted via optional `envelope` fields.
@@ -98,7 +105,7 @@ These are implementation/runtime limits and policies; they are not canonical pro
 
 1. **Client identity cutover bead:** Require `device_id` in `hello` at protocol cutover and remove legacy wayfarer-only fallback behavior.
 2. **Client frame normalization bead:** Align `hello_ok`, `send_ok`, `message`, `messages`, and `error` fields/timestamp names to canonical v1.
-3. **Encoding/idempotency bead:** Enforce base64url canonical payload handling and implement `client_msg_id` dedupe semantics.
+3. **Encoding negotiation/idempotency bead:** Add explicit payload-encoding negotiation (to remove legacy base64 fallback safely) and implement `client_msg_id` dedupe semantics.
 4. **TTL semantics bead:** Switch default TTL to `3600` and prevent delivery of expired messages before sweep.
 5. **Federation envelope protocol bead:** Move from inventory/request/message-forward model to canonical envelope-based `relay_forward` + invariants (`hop_count`, `seen_relays`, destination checks).
 6. **Federation ack alignment bead:** Emit canonical `relay_ack(status=accepted|rejected, code?, message?)` for forward outcomes.

@@ -177,6 +177,8 @@ type Client struct {
 	}
 	Send chan []byte
 
+	PayloadEncodingPref PayloadEncodingPref
+
 	deliveryMu               sync.Mutex
 	deliveryRecipientByMsgID map[string]string
 }

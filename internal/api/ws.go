@@ -129,9 +129,10 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer metrics.ConnectionsCurrent.Dec()
 
 	client := &model.Client{
-		Conn:       conn,
-		Send:       make(chan []byte, 256),
-		WayfarerID: "",
+		Conn:                conn,
+		Send:                make(chan []byte, 256),
+		WayfarerID:          "",
+		PayloadEncodingPref: model.PayloadEncodingPrefBase64,
 	}
 
 	// Start writer goroutine
@@ -264,6 +265,12 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		h.sendError(client, "payload required")
 		return
 	}
+	if _, err := model.DecodePayloadB64(frame.PayloadB64); err != nil {
+		h.sendError(client, "invalid payload_b64")
+		return
+	}
+
+	client.PayloadEncodingPref = model.DetectPayloadB64EncodingPref(frame.PayloadB64)
 
 	msg, ttl := h.engine.AcceptClientSend(client.WayfarerID, frame.To, frame.PayloadB64, frame.TTLSeconds)
 
@@ -358,10 +365,17 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 		if m == nil {
 			continue
 		}
+		decodedPayload, err := model.DecodePayloadB64(m.Payload)
+		if err != nil {
+			log.Printf("ws: dropping invalid stored payload for msg_id=%s recipient=%s: %v", m.ID, deliveryID, err)
+			continue
+		}
+		wireMessage := *m
+		wireMessage.Payload = model.EncodePayloadB64(decodedPayload, client.PayloadEncodingPref)
 		receivedAt := m.CreatedAt.Unix()
-		client.TrackMessageDeliveryRecipient(m.ID, deliveryID)
+		client.TrackMessageDeliveryRecipient(wireMessage.ID, deliveryID)
 		msgs = append(msgs, model.WSPullMessage{
-			Message:    *m,
+			Message:    wireMessage,
 			ReceivedAt: receivedAt,
 		})
 	}
@@ -389,9 +403,16 @@ func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
 
 // deliverToRecipient delivers a message to the recipient if online.
 func (h *WSHandler) deliverToRecipient(msg *model.Message) {
+	decodedPayload, err := model.DecodePayloadB64(msg.Payload)
+	if err != nil {
+		log.Printf("ws: dropping invalid stored payload for msg_id=%s recipient=%s: %v", msg.ID, msg.To, err)
+		return
+	}
+
 	recipients := h.clients.GetClients(msg.To)
 	for _, r := range recipients {
 		recipientID := deliveryIdentityForClient(r)
+		payloadB64 := model.EncodePayloadB64(decodedPayload, r.PayloadEncodingPref)
 		remainingTTL := int(time.Until(msg.ExpiresAt).Seconds())
 		if remainingTTL < 0 {
 			remainingTTL = 0
@@ -403,7 +424,7 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
 			From:       msg.From,
-			PayloadB64: msg.Payload,
+			PayloadB64: payloadB64,
 			At:         receivedAt,
 			ReceivedAt: receivedAt,
 		})
