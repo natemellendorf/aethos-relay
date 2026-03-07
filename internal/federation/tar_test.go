@@ -1,9 +1,12 @@
 package federation
 
 import (
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
 func TestPeerBatcherEnqueueAndDrain(t *testing.T) {
@@ -129,4 +132,58 @@ func TestPeerBatcherQueueLength(t *testing.T) {
 	}
 
 	batcher.Stop()
+}
+
+func TestPeerBatcherCoverFramesIncludeLegacyAndCanonicalTimestamps(t *testing.T) {
+	config := &TARConfig{
+		CoverEnabled: true,
+		CoverMax:     1,
+	}
+	config.Validate()
+
+	batcher := NewPeerBatcher("test-peer", 10, config)
+	batcher.randIntn = func(max int) int {
+		if max <= 1 {
+			return 0
+		}
+		return 1
+	}
+	batcher.randInt63 = func() int64 {
+		return 42
+	}
+
+	var sent []model.RelayCoverFrame
+	sendFunc := func(data []byte) {
+		var cover model.RelayCoverFrame
+		if err := json.Unmarshal(data, &cover); err != nil {
+			t.Fatalf("decode cover frame: %v", err)
+		}
+		sent = append(sent, cover)
+	}
+
+	batcher.sendCoverFrames(sendFunc)
+
+	if len(sent) != 1 {
+		t.Fatalf("expected exactly one deterministic cover frame, got %d", len(sent))
+	}
+
+	cover := sent[0]
+	if cover.Type != model.FrameTypeRelayCover {
+		t.Fatalf("expected relay_cover frame, got %q", cover.Type)
+	}
+	if cover.Timestamp == 0 {
+		t.Fatal("expected legacy ts field to be populated")
+	}
+	if cover.SentAt == 0 {
+		t.Fatal("expected canonical sent_at field to be populated")
+	}
+	if cover.SentAt < 1_000_000_000_000 {
+		t.Fatalf("expected sent_at to be millisecond-scale, got %d", cover.SentAt)
+	}
+	if cover.SentAt/1000 != uint64(cover.Timestamp) {
+		t.Fatalf("expected sent_at and ts to align, got sent_at=%d ts=%d", cover.SentAt, cover.Timestamp)
+	}
+	if cover.Nonce != 42 {
+		t.Fatalf("expected deterministic nonce, got %d", cover.Nonce)
+	}
 }

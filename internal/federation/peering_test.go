@@ -24,6 +24,7 @@ type mockStore struct {
 	mu        sync.Mutex
 	messages  map[string]*model.Message // msg.ID -> msg
 	delivered map[string]bool           // msgID+recipientID -> delivered
+	persisted int
 }
 
 func newMockStore() *mockStore {
@@ -39,6 +40,7 @@ func (m *mockStore) Close() error { return nil }
 func (m *mockStore) PersistMessage(_ context.Context, msg *model.Message) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.persisted++
 	m.messages[msg.ID] = msg
 	return nil
 }
@@ -209,7 +211,7 @@ func TestHandleRelayForward_StoresAndDeduplicates(t *testing.T) {
 		Done: make(chan struct{}),
 	}
 
-	// First forward – should persist.
+	// First forward – should persist once.
 	pm.handleRelayForward(peer, &model.RelayForwardFrame{
 		Type:    model.FrameTypeRelayForward,
 		Message: msg,
@@ -218,15 +220,204 @@ func TestHandleRelayForward_StoresAndDeduplicates(t *testing.T) {
 	if _, err := st.GetMessageByID(context.Background(), "msg-1"); err != nil {
 		t.Fatal("expected message to be stored after first forward, got error:", err)
 	}
+	if st.persisted != 1 {
+		t.Fatalf("expected one persist call after first forward, got %d", st.persisted)
+	}
 
 	// Second forward of same message – should be deduped (PersistMessage not called again).
-	before := len(st.messages)
+	before := st.persisted
 	pm.handleRelayForward(peer, &model.RelayForwardFrame{
 		Type:    model.FrameTypeRelayForward,
 		Message: msg,
 	})
-	if len(st.messages) != before {
-		t.Error("expected duplicate forward to be ignored, but store size changed")
+	if st.persisted != before {
+		t.Errorf("expected duplicate forward to avoid persist call, got %d calls (want %d)", st.persisted, before)
+	}
+}
+
+func TestDecodeWarningRawPrefix_BoundsAndSanitizes(t *testing.T) {
+	leadingWhitespace := strings.Repeat(" ", DecodeWarningRawPrefixLimit+8)
+	raw := json.RawMessage([]byte(leadingWhitespace + `{"type":"relay_forward","x":"y"}` + "\n\t" + strings.Repeat("z", DecodeWarningRawPrefixLimit)))
+
+	prefix := decodeWarningRawPrefix(raw)
+	if len(prefix) > DecodeWarningRawPrefixLimit {
+		t.Fatalf("prefix length exceeded limit: got %d want <= %d", len(prefix), DecodeWarningRawPrefixLimit)
+	}
+	if strings.ContainsAny(prefix, "\n\r\t") {
+		t.Fatalf("prefix should normalize control whitespace, got %q", prefix)
+	}
+	if !strings.Contains(prefix, `{"type":"relay_forward"`) {
+		t.Fatalf("expected trimmed preview to include content, got %q", prefix)
+	}
+}
+
+func TestDeliverMessage_TracksAndMarksDeliveryIdentity(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "msg-federation-push-identity",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := st.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist message: %v", err)
+	}
+
+	deliveryID := "bob\x00device-1"
+	recipient := &model.Client{
+		WayfarerID: "bob",
+		DeliveryID: deliveryID,
+		Send:       make(chan []byte, 1),
+	}
+	clients.Register(recipient)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if clients.Count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if clients.Count() == 0 {
+		t.Fatal("expected recipient to be registered")
+	}
+
+	pm.deliverMessage(msg)
+
+	select {
+	case <-recipient.Send:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected delivered message frame")
+	}
+
+	if got := recipient.ConsumeMessageDeliveryRecipient(msg.ID); got != deliveryID {
+		t.Fatalf("tracked recipient identity mismatch: got %q want %q", got, deliveryID)
+	}
+
+	deliveredToDevice, err := st.IsDeliveredTo(context.Background(), msg.ID, deliveryID)
+	if err != nil {
+		t.Fatalf("check device delivery state: %v", err)
+	}
+	if !deliveredToDevice {
+		t.Fatal("expected delivery state under device identity")
+	}
+
+	deliveredToWayfarer, err := st.IsDeliveredTo(context.Background(), msg.ID, recipient.WayfarerID)
+	if err != nil {
+		t.Fatalf("check wayfarer delivery state: %v", err)
+	}
+	if deliveredToWayfarer {
+		t.Fatal("did not expect delivery state under fallback wayfarer identity")
+	}
+
+	pulled, err := pm.engine.PullForDeliveryIdentity(context.Background(), deliveryID, 10)
+	if err != nil {
+		t.Fatalf("pull for delivery identity failed: %v", err)
+	}
+	if len(pulled) != 0 {
+		t.Fatalf("expected message to be filtered as delivered for %q, got %d queued", deliveryID, len(pulled))
+	}
+}
+
+func TestHandleRelayRequest_ForwardIncludesEnvelopeTimestamps(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	createdAt := time.Unix(1_700_000_000, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-forward-1",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}
+	if err := st.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist message: %v", err)
+	}
+
+	peer := &Peer{ID: "peer-1", Send: make(chan []byte, 1), Done: make(chan struct{})}
+	pm.handleRelayRequest(peer, &model.RelayRequestFrame{
+		Type:       model.FrameTypeRelayRequest,
+		MessageIDs: []string{msg.ID},
+	})
+
+	select {
+	case data := <-peer.Send:
+		var forward model.RelayForwardFrame
+		if err := json.Unmarshal(data, &forward); err != nil {
+			t.Fatalf("decode relay_forward: %v", err)
+		}
+		if forward.Envelope == nil {
+			t.Fatal("expected relay_forward envelope timestamps")
+		}
+		if forward.Envelope.CreatedAt != uint64(msg.CreatedAt.UnixMilli()) {
+			t.Fatalf("created_at mismatch: got %d want %d", forward.Envelope.CreatedAt, uint64(msg.CreatedAt.UnixMilli()))
+		}
+		if forward.Envelope.ExpiresAt != uint64(msg.ExpiresAt.UnixMilli()) {
+			t.Fatalf("expires_at mismatch: got %d want %d", forward.Envelope.ExpiresAt, uint64(msg.ExpiresAt.UnixMilli()))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected relay_forward frame to be sent")
+	}
+}
+
+func TestForwardToPeers_ForwardIncludesEnvelopeTimestamps(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	metrics := model.NewPeerMetrics("peer-1")
+	metrics.Connected = true
+	peer := &Peer{ID: "peer-1", Send: make(chan []byte, 1), Done: make(chan struct{}), Metrics: metrics}
+
+	pm.peersMu.Lock()
+	pm.peers[peer.ID] = peer
+	pm.peersMu.Unlock()
+
+	pm.metricsMu.Lock()
+	pm.peerMetrics[peer.ID] = metrics
+	pm.metricsMu.Unlock()
+
+	createdAt := time.Unix(1_700_000_100, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-forward-selected",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(2 * time.Hour),
+	}
+
+	pm.ForwardToPeers(msg, "")
+
+	select {
+	case data := <-peer.Send:
+		var forward model.RelayForwardFrame
+		if err := json.Unmarshal(data, &forward); err != nil {
+			t.Fatalf("decode relay_forward: %v", err)
+		}
+		if forward.Envelope == nil {
+			t.Fatal("expected relay_forward envelope timestamps")
+		}
+		if forward.Envelope.CreatedAt != uint64(msg.CreatedAt.UnixMilli()) {
+			t.Fatalf("created_at mismatch: got %d want %d", forward.Envelope.CreatedAt, uint64(msg.CreatedAt.UnixMilli()))
+		}
+		if forward.Envelope.ExpiresAt != uint64(msg.ExpiresAt.UnixMilli()) {
+			t.Fatalf("expires_at mismatch: got %d want %d", forward.Envelope.ExpiresAt, uint64(msg.ExpiresAt.UnixMilli()))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected relay_forward frame to be sent")
 	}
 }
 
@@ -289,6 +480,37 @@ func TestHandleRelayForward_RejectsInvalidFields(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandleRelayForward_MalformedEnvelopeFallsBackToLegacyMessageTimestamps(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "msg-envelope-expired",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	peer := &Peer{ID: "peer-1", Done: make(chan struct{})}
+	pm.handleRelayForward(peer, &model.RelayForwardFrame{
+		Type:    model.FrameTypeRelayForward,
+		Message: msg,
+		Envelope: &model.RelayForwardEnvelopeMetadata{
+			CreatedAt: uint64(now.Unix()),
+			ExpiresAt: uint64(now.Add(time.Hour).Unix()),
+		},
+	})
+
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err != nil {
+		t.Fatal("expected valid legacy message timestamps to be accepted when envelope metadata is malformed")
 	}
 }
 
@@ -429,6 +651,86 @@ func TestHandleRelayInventory_RequestsMissingMessages(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("expected relay_request to be sent but none received")
+	}
+}
+
+func TestReadLoop_MalformedRelayForwardContinuesProcessing(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	_ = st.PersistMessage(context.Background(), &model.Message{
+		ID:        "msg-local",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	})
+
+	peerReady := make(chan *Peer, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+
+		peer := &Peer{
+			ID:   "peer-readloop",
+			URL:  r.RemoteAddr,
+			Conn: conn,
+			Send: make(chan []byte, 1),
+			Done: make(chan struct{}),
+		}
+		peerReady <- peer
+		go pm.readLoop(peer)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	var peer *Peer
+	select {
+	case peer = <-peerReady:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("timed out waiting for server peer")
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"relay_forward","message":"bad"}`)); err != nil {
+		t.Fatalf("write malformed relay_forward failed: %v", err)
+	}
+
+	if err := conn.WriteJSON(model.RelayInventoryFrame{
+		Type:        model.FrameTypeRelayInventory,
+		RecipientID: "bob",
+		MessageIDs:  []string{"msg-local", "msg-remote"},
+	}); err != nil {
+		t.Fatalf("write relay_inventory failed: %v", err)
+	}
+
+	select {
+	case data := <-peer.Send:
+		var req model.RelayRequestFrame
+		if err := json.Unmarshal(data, &req); err != nil {
+			t.Fatalf("decode relay_request failed: %v", err)
+		}
+		if req.Type != model.FrameTypeRelayRequest {
+			t.Fatalf("expected relay_request, got %q", req.Type)
+		}
+		if len(req.MessageIDs) != 1 || req.MessageIDs[0] != "msg-remote" {
+			t.Fatalf("expected relay_request for msg-remote, got %v", req.MessageIDs)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected relay_request after malformed relay_forward")
 	}
 }
 

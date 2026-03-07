@@ -129,17 +129,32 @@ func newClientForWSHandler() *model.Client {
 
 func readQueuedFrame(t *testing.T, c *model.Client) model.WSFrame {
 	t.Helper()
+	payload := readQueuedPayload(t, c)
+	var frame model.WSFrame
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		t.Fatalf("decode queued frame: %v", err)
+	}
+	return frame
+}
+
+func readQueuedPayload(t *testing.T, c *model.Client) []byte {
+	t.Helper()
 	select {
 	case payload := <-c.Send:
-		var frame model.WSFrame
-		if err := json.Unmarshal(payload, &frame); err != nil {
-			t.Fatalf("decode queued frame: %v", err)
-		}
-		return frame
+		return payload
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for queued frame")
 	}
-	return model.WSFrame{}
+	return nil
+}
+
+func decodeFrameMap(t *testing.T, payload []byte) map[string]any {
+	t.Helper()
+	var frame map[string]any
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		t.Fatalf("decode queued frame map: %v", err)
+	}
+	return frame
 }
 
 func TestHandleHelloAllowsOptionalDeviceID(t *testing.T) {
@@ -226,5 +241,144 @@ func TestHandleAckLegacyFallbackUsesWayfarerIdentity(t *testing.T) {
 	}
 	if st.markDelivered[0].recipientID != client.WayfarerID {
 		t.Fatalf("fallback should use wayfarer identity, got %q want %q", st.markDelivered[0].recipientID, client.WayfarerID)
+	}
+}
+
+func TestHandleSendSendOKIncludesCanonicalAndLegacyTimestamps(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	sender := newClientForWSHandler()
+	sender.WayfarerID = "wayfarer-a"
+
+	h.handleSend(sender, &model.WSFrame{
+		Type:       model.FrameTypeSend,
+		To:         "wayfarer-b",
+		PayloadB64: "QQ==",
+		TTLSeconds: 120,
+	})
+
+	payload := readQueuedPayload(t, sender)
+	decoded := decodeFrameMap(t, payload)
+
+	if decoded["type"] != model.FrameTypeSendOK {
+		t.Fatalf("expected send_ok frame, got %v", decoded["type"])
+	}
+	at, ok := decoded["at"].(float64)
+	if !ok {
+		t.Fatalf("expected numeric at field, got %T", decoded["at"])
+	}
+	receivedAt, ok := decoded["received_at"].(float64)
+	if !ok {
+		t.Fatalf("expected numeric received_at field, got %T", decoded["received_at"])
+	}
+	expiresAt, ok := decoded["expires_at"].(float64)
+	if !ok {
+		t.Fatalf("expected numeric expires_at field, got %T", decoded["expires_at"])
+	}
+	if at != receivedAt {
+		t.Fatalf("expected at and received_at to match, got at=%v received_at=%v", at, receivedAt)
+	}
+	if expiresAt <= receivedAt {
+		t.Fatalf("expected expires_at > received_at, got expires_at=%v received_at=%v", expiresAt, receivedAt)
+	}
+}
+
+func TestDeliverToRecipientIncludesCanonicalAndLegacyMessageTimestamps(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	recipient := newClientForWSHandler()
+	recipient.WayfarerID = "wayfarer-b"
+	recipient.DeliveryID = "wayfarer-b"
+	h.clients.Register(recipient)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if h.clients.Count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if h.clients.Count() == 0 {
+		t.Fatal("expected recipient to be registered")
+	}
+
+	createdAt := time.Unix(1_700_000_123, 0).UTC()
+	h.deliverToRecipient(&model.Message{
+		ID:        "msg-1",
+		From:      "wayfarer-a",
+		To:        "wayfarer-b",
+		Payload:   "QQ==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	})
+
+	payload := readQueuedPayload(t, recipient)
+	decoded := decodeFrameMap(t, payload)
+
+	if decoded["type"] != model.FrameTypeMessage {
+		t.Fatalf("expected message frame, got %v", decoded["type"])
+	}
+	at, ok := decoded["at"].(float64)
+	if !ok {
+		t.Fatalf("expected numeric at field, got %T", decoded["at"])
+	}
+	receivedAt, ok := decoded["received_at"].(float64)
+	if !ok {
+		t.Fatalf("expected numeric received_at field, got %T", decoded["received_at"])
+	}
+	if int64(at) != createdAt.Unix() || int64(receivedAt) != createdAt.Unix() {
+		t.Fatalf("unexpected timestamps, got at=%v received_at=%v want=%d", at, receivedAt, createdAt.Unix())
+	}
+	if _, ok := decoded["expires_at"]; ok {
+		t.Fatal("message push should not include expires_at")
+	}
+}
+
+func TestHandlePullMessagesKeepLegacyAndAddCanonicalTimestamps(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-b"
+	client.DeliveryID = "wayfarer-b"
+
+	createdAt := time.Unix(1_700_000_456, 0).UTC()
+	st.queued[client.WayfarerID] = []*model.Message{{
+		ID:        "msg-pull-1",
+		From:      "wayfarer-a",
+		To:        client.WayfarerID,
+		Payload:   "QQ==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}}
+
+	h.handlePull(client, &model.WSFrame{Type: model.FrameTypePull, Limit: 10})
+
+	payload := readQueuedPayload(t, client)
+	decoded := decodeFrameMap(t, payload)
+
+	if decoded["type"] != model.FrameTypeMessages {
+		t.Fatalf("expected messages frame, got %v", decoded["type"])
+	}
+	messages, ok := decoded["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("expected one pulled message, got %#v", decoded["messages"])
+	}
+	entry, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected message entry object, got %T", messages[0])
+	}
+	at, ok := entry["at"].(string)
+	if !ok {
+		t.Fatalf("expected string at field, got %T", entry["at"])
+	}
+	receivedAt, ok := entry["received_at"].(float64)
+	if !ok {
+		t.Fatalf("expected numeric received_at field, got %T", entry["received_at"])
+	}
+	if at != createdAt.Format(time.RFC3339Nano) || int64(receivedAt) != createdAt.Unix() {
+		t.Fatalf("unexpected pulled timestamps, got at=%v received_at=%v want=%d", at, receivedAt, createdAt.Unix())
+	}
+	if expiresAt, ok := entry["expires_at"].(string); !ok || expiresAt == "" {
+		t.Fatalf("expected legacy expires_at string field, got %#v", entry["expires_at"])
+	}
+	if delivered, ok := entry["delivered"].(bool); !ok || delivered {
+		t.Fatalf("expected legacy delivered=false field, got %#v", entry["delivered"])
 	}
 }
