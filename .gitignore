@@ -12,3 +12,5 @@ relay.db.descriptors
 relay.db.envelopes
 
 /relaylink
+client
+.worktrees/
