@@ -2,6 +2,8 @@ package model
 
 import (
 	"bytes"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -81,7 +83,7 @@ func TestDetectPayloadB64EncodingPref(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := DetectPayloadB64EncodingPref(tt.input); got != tt.want {
-				t.Fatalf("preference mismatch: got %q want %q", got, tt.want)
+				t.Fatalf("preference mismatch: got %v want %v", got, tt.want)
 			}
 		})
 	}
@@ -95,5 +97,18 @@ func TestEncodePayloadB64_RespectsPreference(t *testing.T) {
 	}
 	if got := EncodePayloadB64(payload, PayloadEncodingPrefBase64); got != "+/8=" {
 		t.Fatalf("base64 encode mismatch: got %q want %q", got, "+/8=")
+	}
+}
+
+func TestDecodePayloadB64_InvalidIncludesDetail(t *testing.T) {
+	_, err := DecodePayloadB64("%%%")
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	if !errors.Is(err, errInvalidPayloadB64) {
+		t.Fatalf("expected wrapped invalid payload error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "illegal base64 data") {
+		t.Fatalf("expected decode detail in error, got %q", err.Error())
 	}
 }

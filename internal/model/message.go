@@ -2,6 +2,7 @@ package model
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -177,10 +178,33 @@ type Client struct {
 	}
 	Send chan []byte
 
-	PayloadEncodingPref PayloadEncodingPref
+	payloadEncodingPref atomic.Uint32
 
 	deliveryMu               sync.Mutex
 	deliveryRecipientByMsgID map[string]string
+}
+
+// GetPayloadEncodingPref returns the connection's outbound payload encoding preference.
+func (c *Client) GetPayloadEncodingPref() PayloadEncodingPref {
+	if c == nil {
+		return PayloadEncodingPrefBase64
+	}
+	pref := PayloadEncodingPref(c.payloadEncodingPref.Load())
+	if pref == PayloadEncodingPrefBase64URL {
+		return pref
+	}
+	return PayloadEncodingPrefBase64
+}
+
+// SetPayloadEncodingPref updates the connection's outbound payload encoding preference.
+func (c *Client) SetPayloadEncodingPref(pref PayloadEncodingPref) {
+	if c == nil {
+		return
+	}
+	if pref != PayloadEncodingPrefBase64URL {
+		pref = PayloadEncodingPrefBase64
+	}
+	c.payloadEncodingPref.Store(uint32(pref))
 }
 
 // TrackMessageDeliveryRecipient records which recipient identity was used when
