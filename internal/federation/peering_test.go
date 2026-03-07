@@ -558,6 +558,86 @@ func TestHandleRelayInventory_RequestsMissingMessages(t *testing.T) {
 	}
 }
 
+func TestReadLoop_MalformedRelayForwardContinuesProcessing(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	_ = st.PersistMessage(context.Background(), &model.Message{
+		ID:        "msg-local",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	})
+
+	peerReady := make(chan *Peer, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+
+		peer := &Peer{
+			ID:   "peer-readloop",
+			URL:  r.RemoteAddr,
+			Conn: conn,
+			Send: make(chan []byte, 1),
+			Done: make(chan struct{}),
+		}
+		peerReady <- peer
+		go pm.readLoop(peer)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	var peer *Peer
+	select {
+	case peer = <-peerReady:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("timed out waiting for server peer")
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"relay_forward","message":"bad"}`)); err != nil {
+		t.Fatalf("write malformed relay_forward failed: %v", err)
+	}
+
+	if err := conn.WriteJSON(model.RelayInventoryFrame{
+		Type:        model.FrameTypeRelayInventory,
+		RecipientID: "bob",
+		MessageIDs:  []string{"msg-local", "msg-remote"},
+	}); err != nil {
+		t.Fatalf("write relay_inventory failed: %v", err)
+	}
+
+	select {
+	case data := <-peer.Send:
+		var req model.RelayRequestFrame
+		if err := json.Unmarshal(data, &req); err != nil {
+			t.Fatalf("decode relay_request failed: %v", err)
+		}
+		if req.Type != model.FrameTypeRelayRequest {
+			t.Fatalf("expected relay_request, got %q", req.Type)
+		}
+		if len(req.MessageIDs) != 1 || req.MessageIDs[0] != "msg-remote" {
+			t.Fatalf("expected relay_request for msg-remote, got %v", req.MessageIDs)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected relay_request after malformed relay_forward")
+	}
+}
+
 // TestInboundPeer_HandshakeValidation verifies that inbound peers must present
 // a valid relay_hello frame with a non-empty relay_id.
 func TestInboundPeer_HandshakeValidation(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,13 @@ const (
 	// MaxForwardedPayloadSize is the maximum allowed byte length of a forwarded
 	// message's base64-encoded payload.
 	MaxForwardedPayloadSize = 64 * 1024
+
+	// DecodeWarningInterval is the minimum time between repeated malformed-frame
+	// warnings for the same peer and decode stage.
+	DecodeWarningInterval = 10 * time.Second
+
+	// DecodeWarningRawPrefixLimit bounds raw frame preview logging.
+	DecodeWarningRawPrefixLimit = 160
 )
 
 // Peer represents a connected relay peer.
@@ -115,6 +123,9 @@ type PeerManager struct {
 	peerMetrics map[string]*model.PeerMetrics
 	metricsMu   sync.RWMutex
 	engine      *storeforward.Engine
+
+	decodeWarningsMu sync.Mutex
+	decodeWarnings   map[string]time.Time
 }
 
 // NewPeerManager creates a new peer manager.
@@ -149,6 +160,7 @@ func NewPeerManagerWithConfig(relayID string, store store.Store, clients *model.
 		forwardingStrategy: NewForwardingStrategy(forwardingConfig),
 		peerMetrics:        make(map[string]*model.PeerMetrics),
 		engine:             engine,
+		decodeWarnings:     make(map[string]time.Time),
 	}
 }
 
@@ -326,6 +338,7 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(rawMsg, &frameType); err != nil {
+			pm.logDecodeWarning(peer, "frame_type", err, rawMsg)
 			continue
 		}
 
@@ -355,6 +368,7 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 		case model.FrameTypeRelayForward:
 			var frame model.RelayForwardFrame
 			if err := json.Unmarshal(rawMsg, &frame); err != nil {
+				pm.logDecodeWarning(peer, "relay_forward", err, rawMsg)
 				continue
 			}
 			pm.handleRelayForward(peer, &frame)
@@ -371,6 +385,76 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 			// Just update last seen
 		}
 	}
+}
+
+func (pm *PeerManager) logDecodeWarning(peer *Peer, stage string, err error, rawMsg json.RawMessage) {
+	if !pm.shouldLogDecodeWarning(peer, stage) {
+		return
+	}
+	log.Printf(
+		"federation: dropped malformed %s frame from relay_id=%s addr=%s: %v raw_prefix=%q",
+		stage,
+		peerRelayID(peer),
+		peerAddr(peer),
+		err,
+		decodeWarningRawPrefix(rawMsg),
+	)
+}
+
+func (pm *PeerManager) shouldLogDecodeWarning(peer *Peer, stage string) bool {
+	key := stage + "|" + decodeWarningPeerKey(peer)
+	now := time.Now()
+
+	pm.decodeWarningsMu.Lock()
+	defer pm.decodeWarningsMu.Unlock()
+
+	last, ok := pm.decodeWarnings[key]
+	if ok && now.Sub(last) < DecodeWarningInterval {
+		return false
+	}
+	pm.decodeWarnings[key] = now
+	return true
+}
+
+func decodeWarningPeerKey(peer *Peer) string {
+	if peer == nil {
+		return "unknown"
+	}
+	if peer.ID != "" {
+		return "relay_id:" + peer.ID
+	}
+	if peer.URL != "" {
+		return "addr:" + peer.URL
+	}
+	return "unknown"
+}
+
+func peerRelayID(peer *Peer) string {
+	if peer == nil || peer.ID == "" {
+		return "unknown"
+	}
+	return peer.ID
+}
+
+func peerAddr(peer *Peer) string {
+	if peer == nil || peer.URL == "" {
+		return "unknown"
+	}
+	return peer.URL
+}
+
+func decodeWarningRawPrefix(rawMsg json.RawMessage) string {
+	if len(rawMsg) == 0 {
+		return ""
+	}
+	prefix := strings.TrimSpace(string(rawMsg))
+	prefix = strings.ReplaceAll(prefix, "\n", " ")
+	prefix = strings.ReplaceAll(prefix, "\r", " ")
+	prefix = strings.ReplaceAll(prefix, "\t", " ")
+	if len(prefix) <= DecodeWarningRawPrefixLimit {
+		return prefix
+	}
+	return prefix[:DecodeWarningRawPrefixLimit-3] + "..."
 }
 
 // writeLoop writes messages to a peer.
