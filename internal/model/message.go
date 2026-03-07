@@ -50,12 +50,8 @@ type WSFrame struct {
 
 // WSPullMessage represents a message entry in a `messages` pull response.
 type WSPullMessage struct {
-	ID         string `json:"msg_id"`
-	From       string `json:"from"`
-	To         string `json:"to"`
-	Payload    string `json:"payload_b64"`
-	ReceivedAt int64  `json:"received_at"`
-	At         int64  `json:"at"`
+	Message
+	ReceivedAt int64 `json:"received_at"`
 }
 
 // Frame types (protocol v1)

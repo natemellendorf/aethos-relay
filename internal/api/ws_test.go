@@ -332,7 +332,7 @@ func TestDeliverToRecipientIncludesCanonicalAndLegacyMessageTimestamps(t *testin
 	}
 }
 
-func TestHandlePullMessagesUseUnixSecondsTimestamps(t *testing.T) {
+func TestHandlePullMessagesKeepLegacyAndAddCanonicalTimestamps(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	client := newClientForWSHandler()
 	client.WayfarerID = "wayfarer-b"
@@ -364,18 +364,21 @@ func TestHandlePullMessagesUseUnixSecondsTimestamps(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected message entry object, got %T", messages[0])
 	}
-	at, ok := entry["at"].(float64)
+	at, ok := entry["at"].(string)
 	if !ok {
-		t.Fatalf("expected numeric at field, got %T", entry["at"])
+		t.Fatalf("expected string at field, got %T", entry["at"])
 	}
 	receivedAt, ok := entry["received_at"].(float64)
 	if !ok {
 		t.Fatalf("expected numeric received_at field, got %T", entry["received_at"])
 	}
-	if int64(at) != createdAt.Unix() || int64(receivedAt) != createdAt.Unix() {
+	if at != createdAt.Format(time.RFC3339Nano) || int64(receivedAt) != createdAt.Unix() {
 		t.Fatalf("unexpected pulled timestamps, got at=%v received_at=%v want=%d", at, receivedAt, createdAt.Unix())
 	}
-	if _, ok := entry["expires_at"]; ok {
-		t.Fatal("pull messages should not include expires_at")
+	if expiresAt, ok := entry["expires_at"].(string); !ok || expiresAt == "" {
+		t.Fatalf("expected legacy expires_at string field, got %#v", entry["expires_at"])
+	}
+	if delivered, ok := entry["delivered"].(bool); !ok || delivered {
+		t.Fatalf("expected legacy delivered=false field, got %#v", entry["delivered"])
 	}
 }

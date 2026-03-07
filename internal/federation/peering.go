@@ -553,8 +553,17 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 
 // handleRelayForward handles incoming forwarded messages.
 func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardFrame) {
-	if !isValidRelayForwardEnvelope(frame.Envelope, time.Now()) {
-		return
+	now := time.Now()
+	if envelopeErr := relayForwardEnvelopeValidationError(frame.Envelope, now); envelopeErr != "" {
+		peerID := "unknown"
+		if peer != nil && peer.ID != "" {
+			peerID = peer.ID
+		}
+		if !hasValidLegacyRelayForwardTimestamps(frame.Message, now) {
+			log.Printf("federation: rejecting relay_forward from peer %s: invalid envelope metadata (%s) and invalid legacy message timestamps", peerID, envelopeErr)
+			return
+		}
+		log.Printf("federation: warning invalid relay_forward envelope from peer %s: %s; falling back to legacy message timestamps", peerID, envelopeErr)
 	}
 
 	msg := frame.Message
@@ -565,6 +574,9 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 		return
 	}
 	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
+		return
+	}
+	if msg.CreatedAt.After(msg.ExpiresAt) {
 		return
 	}
 	if len(msg.Payload) > MaxForwardedPayloadSize {
@@ -623,20 +635,36 @@ func relayForwardEnvelopeFromMessage(msg *model.Message) *model.RelayForwardEnve
 	}
 }
 
-func isValidRelayForwardEnvelope(envelope *model.RelayForwardEnvelopeMetadata, now time.Time) bool {
+func relayForwardEnvelopeValidationError(envelope *model.RelayForwardEnvelopeMetadata, now time.Time) string {
 	if envelope == nil {
-		return true
+		return ""
 	}
 	if envelope.CreatedAt == 0 || envelope.ExpiresAt == 0 {
-		return false
+		return "missing created_at or expires_at"
 	}
 	if envelope.CreatedAt > envelope.ExpiresAt {
-		return false
+		return "created_at is after expires_at"
 	}
 	if now.UnixMilli() < 0 {
+		return "invalid local clock"
+	}
+	if uint64(now.UnixMilli()) >= envelope.ExpiresAt {
+		return "envelope is expired"
+	}
+	return ""
+}
+
+func hasValidLegacyRelayForwardTimestamps(msg *model.Message, now time.Time) bool {
+	if msg == nil {
 		return false
 	}
-	return uint64(now.UnixMilli()) < envelope.ExpiresAt
+	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
+		return false
+	}
+	if msg.CreatedAt.After(msg.ExpiresAt) {
+		return false
+	}
+	return !now.After(msg.ExpiresAt)
 }
 
 // handleRelayAck handles relay acknowledgment frames.

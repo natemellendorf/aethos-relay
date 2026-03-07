@@ -142,6 +142,15 @@ func TestPeerBatcherCoverFramesIncludeLegacyAndCanonicalTimestamps(t *testing.T)
 	config.Validate()
 
 	batcher := NewPeerBatcher("test-peer", 10, config)
+	batcher.randIntn = func(max int) int {
+		if max <= 1 {
+			return 0
+		}
+		return 1
+	}
+	batcher.randInt63 = func() int64 {
+		return 42
+	}
 
 	var sent []model.RelayCoverFrame
 	sendFunc := func(data []byte) {
@@ -152,12 +161,10 @@ func TestPeerBatcherCoverFramesIncludeLegacyAndCanonicalTimestamps(t *testing.T)
 		sent = append(sent, cover)
 	}
 
-	for i := 0; i < 20 && len(sent) == 0; i++ {
-		batcher.sendCoverFrames(sendFunc)
-	}
+	batcher.sendCoverFrames(sendFunc)
 
-	if len(sent) == 0 {
-		t.Fatal("expected at least one cover frame")
+	if len(sent) != 1 {
+		t.Fatalf("expected exactly one deterministic cover frame, got %d", len(sent))
 	}
 
 	cover := sent[0]
@@ -175,5 +182,8 @@ func TestPeerBatcherCoverFramesIncludeLegacyAndCanonicalTimestamps(t *testing.T)
 	}
 	if cover.SentAt/1000 != uint64(cover.Timestamp) {
 		t.Fatalf("expected sent_at and ts to align, got sent_at=%d ts=%d", cover.SentAt, cover.Timestamp)
+	}
+	if cover.Nonce != 42 {
+		t.Fatalf("expected deterministic nonce, got %d", cover.Nonce)
 	}
 }

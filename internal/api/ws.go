@@ -354,15 +354,14 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 	// Convert to response wire format.
 	msgs := make([]model.WSPullMessage, 0, len(messages))
 	for _, m := range messages {
+		if m == nil {
+			continue
+		}
 		receivedAt := m.CreatedAt.Unix()
 		client.TrackMessageDeliveryRecipient(m.ID, deliveryID)
 		msgs = append(msgs, model.WSPullMessage{
-			ID:         m.ID,
-			From:       m.From,
-			To:         m.To,
-			Payload:    m.Payload,
+			Message:    *m,
 			ReceivedAt: receivedAt,
-			At:         receivedAt,
 		})
 	}
 

@@ -387,7 +387,7 @@ func TestHandleRelayForward_RejectsInvalidFields(t *testing.T) {
 	}
 }
 
-func TestHandleRelayForward_RejectsExpiredEnvelopeTimestamps(t *testing.T) {
+func TestHandleRelayForward_MalformedEnvelopeFallsBackToLegacyMessageTimestamps(t *testing.T) {
 	st := newMockStore()
 	clients := model.NewClientRegistry()
 	go clients.Run()
@@ -408,13 +408,13 @@ func TestHandleRelayForward_RejectsExpiredEnvelopeTimestamps(t *testing.T) {
 		Type:    model.FrameTypeRelayForward,
 		Message: msg,
 		Envelope: &model.RelayForwardEnvelopeMetadata{
-			CreatedAt: uint64(now.Add(-2 * time.Hour).UnixMilli()),
-			ExpiresAt: uint64(now.Add(-1 * time.Hour).UnixMilli()),
+			CreatedAt: uint64(now.Unix()),
+			ExpiresAt: uint64(now.Add(time.Hour).Unix()),
 		},
 	})
 
-	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
-		t.Fatal("expected expired envelope metadata to be rejected")
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err != nil {
+		t.Fatal("expected valid legacy message timestamps to be accepted when envelope metadata is malformed")
 	}
 }
 
