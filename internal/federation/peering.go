@@ -44,7 +44,13 @@ const (
 
 	// DecodeWarningRawPrefixLimit bounds raw frame preview logging.
 	DecodeWarningRawPrefixLimit = 160
+
+	// decodeWarningRawPrefixTrimSlack captures nearby non-whitespace bytes when
+	// leading/trailing whitespace is trimmed from malformed frame previews.
+	decodeWarningRawPrefixTrimSlack = 32
 )
+
+var decodeWarningWhitespaceReplacer = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
 
 // Peer represents a connected relay peer.
 type Peer struct {
@@ -225,6 +231,7 @@ func (pm *PeerManager) dialPeer(url string) {
 			delay = min(delay*2, ReconnectMaxDelay)
 			continue
 		}
+		conn.SetReadLimit(model.WebSocketReadLimitBytes)
 
 		peerID := uuid.New().String()
 		peer := &Peer{
@@ -447,14 +454,26 @@ func decodeWarningRawPrefix(rawMsg json.RawMessage) string {
 	if len(rawMsg) == 0 {
 		return ""
 	}
+	rawPrefixLimit := DecodeWarningRawPrefixLimit + decodeWarningRawPrefixTrimSlack
+	if len(rawMsg) > rawPrefixLimit {
+		rawMsg = rawMsg[:rawPrefixLimit]
+	}
 	prefix := strings.TrimSpace(string(rawMsg))
-	prefix = strings.ReplaceAll(prefix, "\n", " ")
-	prefix = strings.ReplaceAll(prefix, "\r", " ")
-	prefix = strings.ReplaceAll(prefix, "\t", " ")
+	prefix = decodeWarningWhitespaceReplacer.Replace(prefix)
 	if len(prefix) <= DecodeWarningRawPrefixLimit {
 		return prefix
 	}
 	return prefix[:DecodeWarningRawPrefixLimit-3] + "..."
+}
+
+func deliveryIdentityForClient(client *model.Client) string {
+	if client == nil {
+		return ""
+	}
+	if client.DeliveryID != "" {
+		return client.DeliveryID
+	}
+	return client.WayfarerID
 }
 
 // writeLoop writes messages to a peer.
@@ -788,6 +807,10 @@ func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
 func (pm *PeerManager) deliverMessage(msg *model.Message) {
 	recipients := pm.clients.GetClients(msg.To)
 	for _, r := range recipients {
+		recipientID := deliveryIdentityForClient(r)
+		if recipientID == "" {
+			continue
+		}
 		receivedAt := msg.CreatedAt.Unix()
 		data, _ := json.Marshal(model.WSFrame{
 			Type:       model.FrameTypeMessage,
@@ -799,8 +822,9 @@ func (pm *PeerManager) deliverMessage(msg *model.Message) {
 		})
 		select {
 		case r.Send <- data:
-			if err := pm.engine.MarkDelivery(context.Background(), msg.ID, r.WayfarerID); err != nil {
-				log.Printf("federation: failed to mark delivered for %s: %v", r.WayfarerID, err)
+			r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
+			if err := pm.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
+				log.Printf("federation: failed to mark delivered for %s: %v", recipientID, err)
 			}
 		default:
 		}
@@ -948,6 +972,7 @@ func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request)
 		log.Printf("federation: upgrade failed: %v", err)
 		return
 	}
+	conn.SetReadLimit(model.WebSocketReadLimitBytes)
 
 	peerID := uuid.New().String()
 	peer := &Peer{

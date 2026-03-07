@@ -122,6 +122,7 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ws: failed to upgrade: %v", err)
 		return
 	}
+	conn.SetReadLimit(model.WebSocketReadLimitBytes)
 	defer conn.Close()
 
 	metrics.ConnectionsCurrent.Inc()

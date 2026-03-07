@@ -2,15 +2,15 @@
 
 Last audited: 2026-03-07
 
-This document audits current `aethos-relay` runtime behavior against canonical specs in local `aethos` worktrees.
+This document audits current `aethos-relay` runtime behavior against canonical specs in `aethos`.
 
 ## Canonical spec sources audited
 
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md`
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/spec/FEDERATION_PROTOCOL_V1.md`
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/spec/RECEIPTS.md`
-- `/Users/natemellendorf/opencode/wt-aethos-aethos-dmm/docs/migration/protocol_update.md` (draft migration plan; planning input only, not protocol contract)
-- `/Users/natemellendorf/opencode/aethos/docs/protocol.md` (canonical structures and canonical bytes)
+- `https://github.com/natemellendorf/aethos/blob/main/docs/spec/CLIENT_RELAY_PROTOCOL_V1.md`
+- `https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md`
+- `https://github.com/natemellendorf/aethos/blob/main/docs/spec/RECEIPTS.md`
+- `https://github.com/natemellendorf/aethos/blob/main/docs/migration/protocol_update.md` (draft migration plan; planning input only, not protocol contract)
+- `https://github.com/natemellendorf/aethos/blob/main/docs/protocol.md` (canonical structures and canonical bytes)
 
 ## Client <-> Relay audit
 
