@@ -149,6 +149,28 @@ func TestFederationFrameDecodeEncode(t *testing.T) {
 			},
 		},
 		{
+			name: "relay_forward with envelope timestamps",
+			raw: `{"type":"relay_forward","message":{"msg_id":"msg-1","from":"alice","to":"bob","payload_b64":"dGVzdA==","at":"` +
+				now.Format(time.RFC3339Nano) + `","expires_at":"` + now.Add(time.Hour).Format(time.RFC3339Nano) + `"},"envelope":{"created_at":1704067200000,"expires_at":1704070800000}}`,
+			wantType: FrameTypeRelayForward,
+			decodeRun: func(t *testing.T, payload []byte) {
+				var frame RelayForwardFrame
+				if err := json.Unmarshal(payload, &frame); err != nil {
+					t.Fatalf("decode relay_forward with envelope: %v", err)
+				}
+				if frame.Envelope == nil {
+					t.Fatal("relay_forward missing envelope timestamps")
+				}
+				if frame.Envelope.CreatedAt != 1704067200000 {
+					t.Fatalf("created_at mismatch: got %d", frame.Envelope.CreatedAt)
+				}
+				if frame.Envelope.ExpiresAt != 1704070800000 {
+					t.Fatalf("expires_at mismatch: got %d", frame.Envelope.ExpiresAt)
+				}
+				assertRoundTripType(t, frame, FrameTypeRelayForward)
+			},
+		},
+		{
 			name:     "relay_ack",
 			raw:      `{"type":"relay_ack","envelope_id":"env-1","destination":"wayfarer-b","status":"accepted"}`,
 			wantType: FrameTypeRelayAck,

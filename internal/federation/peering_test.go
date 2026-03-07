@@ -230,6 +230,101 @@ func TestHandleRelayForward_StoresAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestHandleRelayRequest_ForwardIncludesEnvelopeTimestamps(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	createdAt := time.Unix(1_700_000_000, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-forward-1",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(time.Hour),
+	}
+	if err := st.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist message: %v", err)
+	}
+
+	peer := &Peer{ID: "peer-1", Send: make(chan []byte, 1), Done: make(chan struct{})}
+	pm.handleRelayRequest(peer, &model.RelayRequestFrame{
+		Type:       model.FrameTypeRelayRequest,
+		MessageIDs: []string{msg.ID},
+	})
+
+	select {
+	case data := <-peer.Send:
+		var forward model.RelayForwardFrame
+		if err := json.Unmarshal(data, &forward); err != nil {
+			t.Fatalf("decode relay_forward: %v", err)
+		}
+		if forward.Envelope == nil {
+			t.Fatal("expected relay_forward envelope timestamps")
+		}
+		if forward.Envelope.CreatedAt != uint64(msg.CreatedAt.UnixMilli()) {
+			t.Fatalf("created_at mismatch: got %d want %d", forward.Envelope.CreatedAt, uint64(msg.CreatedAt.UnixMilli()))
+		}
+		if forward.Envelope.ExpiresAt != uint64(msg.ExpiresAt.UnixMilli()) {
+			t.Fatalf("expires_at mismatch: got %d want %d", forward.Envelope.ExpiresAt, uint64(msg.ExpiresAt.UnixMilli()))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected relay_forward frame to be sent")
+	}
+}
+
+func TestForwardToPeers_ForwardIncludesEnvelopeTimestamps(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	metrics := model.NewPeerMetrics("peer-1")
+	metrics.Connected = true
+	peer := &Peer{ID: "peer-1", Send: make(chan []byte, 1), Done: make(chan struct{}), Metrics: metrics}
+
+	pm.peersMu.Lock()
+	pm.peers[peer.ID] = peer
+	pm.peersMu.Unlock()
+
+	pm.metricsMu.Lock()
+	pm.peerMetrics[peer.ID] = metrics
+	pm.metricsMu.Unlock()
+
+	createdAt := time.Unix(1_700_000_100, 0).UTC()
+	msg := &model.Message{
+		ID:        "msg-forward-selected",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: createdAt,
+		ExpiresAt: createdAt.Add(2 * time.Hour),
+	}
+
+	pm.ForwardToPeers(msg, "")
+
+	select {
+	case data := <-peer.Send:
+		var forward model.RelayForwardFrame
+		if err := json.Unmarshal(data, &forward); err != nil {
+			t.Fatalf("decode relay_forward: %v", err)
+		}
+		if forward.Envelope == nil {
+			t.Fatal("expected relay_forward envelope timestamps")
+		}
+		if forward.Envelope.CreatedAt != uint64(msg.CreatedAt.UnixMilli()) {
+			t.Fatalf("created_at mismatch: got %d want %d", forward.Envelope.CreatedAt, uint64(msg.CreatedAt.UnixMilli()))
+		}
+		if forward.Envelope.ExpiresAt != uint64(msg.ExpiresAt.UnixMilli()) {
+			t.Fatalf("expires_at mismatch: got %d want %d", forward.Envelope.ExpiresAt, uint64(msg.ExpiresAt.UnixMilli()))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected relay_forward frame to be sent")
+	}
+}
+
 // TestHandleRelayForward_RejectsExpired verifies that an already-expired
 // message is not stored.
 func TestHandleRelayForward_RejectsExpired(t *testing.T) {
@@ -289,6 +384,37 @@ func TestHandleRelayForward_RejectsInvalidFields(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandleRelayForward_RejectsExpiredEnvelopeTimestamps(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	now := time.Now()
+	msg := &model.Message{
+		ID:        "msg-envelope-expired",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "dGVzdA==",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	peer := &Peer{ID: "peer-1", Done: make(chan struct{})}
+	pm.handleRelayForward(peer, &model.RelayForwardFrame{
+		Type:    model.FrameTypeRelayForward,
+		Message: msg,
+		Envelope: &model.RelayForwardEnvelopeMetadata{
+			CreatedAt: uint64(now.Add(-2 * time.Hour).UnixMilli()),
+			ExpiresAt: uint64(now.Add(-1 * time.Hour).UnixMilli()),
+		},
+	})
+
+	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
+		t.Fatal("expected expired envelope metadata to be rejected")
 	}
 }
 

@@ -178,9 +178,11 @@ func (b *PeerBatcher) sendCoverFrames(sendFunc func([]byte)) {
 	}
 
 	for i := 0; i < numCover; i++ {
+		now := time.Now()
 		cover := model.RelayCoverFrame{
 			Type:      model.FrameTypeRelayCover,
-			Timestamp: time.Now().Unix(),
+			Timestamp: now.Unix(),
+			SentAt:    uint64(now.UnixMilli()),
 			Nonce:     rand.Int63(),
 		}
 		data, err := json.Marshal(cover)

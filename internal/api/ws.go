@@ -283,10 +283,13 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 	}
 
 	// Send send_ok
+	receivedAt := msg.CreatedAt.Unix()
 	h.send(client, model.WSFrame{
-		Type:  model.FrameTypeSendOK,
-		MsgID: msg.ID,
-		At:    msg.CreatedAt.Unix(),
+		Type:       model.FrameTypeSendOK,
+		MsgID:      msg.ID,
+		At:         receivedAt,
+		ReceivedAt: receivedAt,
+		ExpiresAt:  msg.ExpiresAt.Unix(),
 	})
 
 	// Announce to federation peers (if federation is enabled)
@@ -348,17 +351,18 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	// Convert to response format
-	var msgs []model.Message
+	// Convert to response wire format.
+	msgs := make([]model.WSPullMessage, 0, len(messages))
 	for _, m := range messages {
+		receivedAt := m.CreatedAt.Unix()
 		client.TrackMessageDeliveryRecipient(m.ID, deliveryID)
-		msgs = append(msgs, model.Message{
-			ID:        m.ID,
-			From:      m.From,
-			To:        m.To,
-			Payload:   m.Payload,
-			CreatedAt: m.CreatedAt,
-			Delivered: m.Delivered,
+		msgs = append(msgs, model.WSPullMessage{
+			ID:         m.ID,
+			From:       m.From,
+			To:         m.To,
+			Payload:    m.Payload,
+			ReceivedAt: receivedAt,
+			At:         receivedAt,
 		})
 	}
 
@@ -394,12 +398,14 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 		}
 		log.Printf("ws: deliver msg_id=%s from=%s to=%s recipient_id=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, recipientID, remainingTTL)
 		r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
+		receivedAt := msg.CreatedAt.Unix()
 		h.send(r, model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
 			From:       msg.From,
 			PayloadB64: msg.Payload,
-			At:         msg.CreatedAt.Unix(),
+			At:         receivedAt,
+			ReceivedAt: receivedAt,
 		})
 		// Mark as delivered to this specific recipient
 		if err := h.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {

@@ -531,8 +531,9 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 		}
 
 		forward := model.RelayForwardFrame{
-			Type:    model.FrameTypeRelayForward,
-			Message: msg,
+			Type:     model.FrameTypeRelayForward,
+			Message:  msg,
+			Envelope: relayForwardEnvelopeFromMessage(msg),
 		}
 		data, err := json.Marshal(forward)
 		if err != nil {
@@ -552,6 +553,10 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 
 // handleRelayForward handles incoming forwarded messages.
 func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardFrame) {
+	if !isValidRelayForwardEnvelope(frame.Envelope, time.Now()) {
+		return
+	}
+
 	msg := frame.Message
 	if msg == nil {
 		return
@@ -608,6 +613,32 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	// Do not re-gossip forwarded messages to avoid message loops.
 }
 
+func relayForwardEnvelopeFromMessage(msg *model.Message) *model.RelayForwardEnvelopeMetadata {
+	if msg == nil {
+		return nil
+	}
+	return &model.RelayForwardEnvelopeMetadata{
+		CreatedAt: uint64(msg.CreatedAt.UnixMilli()),
+		ExpiresAt: uint64(msg.ExpiresAt.UnixMilli()),
+	}
+}
+
+func isValidRelayForwardEnvelope(envelope *model.RelayForwardEnvelopeMetadata, now time.Time) bool {
+	if envelope == nil {
+		return true
+	}
+	if envelope.CreatedAt == 0 || envelope.ExpiresAt == 0 {
+		return false
+	}
+	if envelope.CreatedAt > envelope.ExpiresAt {
+		return false
+	}
+	if now.UnixMilli() < 0 {
+		return false
+	}
+	return uint64(now.UnixMilli()) < envelope.ExpiresAt
+}
+
 // handleRelayAck handles relay acknowledgment frames.
 // `relay_ack` is relay-level acceptance telemetry for a forwarded envelope payload
 // (called `envelope` in the spec; this implementation currently forwards it in `message`).
@@ -645,12 +676,14 @@ func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
 func (pm *PeerManager) deliverMessage(msg *model.Message) {
 	recipients := pm.clients.GetClients(msg.To)
 	for _, r := range recipients {
+		receivedAt := msg.CreatedAt.Unix()
 		data, _ := json.Marshal(model.WSFrame{
 			Type:       model.FrameTypeMessage,
 			MsgID:      msg.ID,
 			From:       msg.From,
 			PayloadB64: msg.Payload,
-			At:         msg.CreatedAt.Unix(),
+			At:         receivedAt,
+			ReceivedAt: receivedAt,
 		})
 		select {
 		case r.Send <- data:
@@ -894,8 +927,9 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 
 		// Create forward frame
 		forward := model.RelayForwardFrame{
-			Type:    model.FrameTypeRelayForward,
-			Message: msg,
+			Type:     model.FrameTypeRelayForward,
+			Message:  msg,
+			Envelope: relayForwardEnvelopeFromMessage(msg),
 		}
 
 		// Apply padding if enabled
