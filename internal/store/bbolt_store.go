@@ -242,8 +242,17 @@ func (s *BBoltStore) RemoveMessage(ctx context.Context, msgID string) error {
 		// Remove from msgid index
 		tx.Bucket(BucketMsgIDIndex).Delete([]byte(msgID))
 
-		// Remove from delivery state
-		tx.Bucket(BucketDeliveryState).Delete([]byte(msgID))
+		// Remove from delivery state.
+		deliveryStateBucket := tx.Bucket(BucketDeliveryState)
+		deliveryStateBucket.Delete([]byte(msgID))
+
+		deliveryStateKeyPrefix := []byte(msgID + recipientDelimiter)
+		cursor := deliveryStateBucket.Cursor()
+		for k, _ := cursor.Seek(deliveryStateKeyPrefix); k != nil && bytes.HasPrefix(k, deliveryStateKeyPrefix); k, _ = cursor.Next() {
+			if err := cursor.Delete(); err != nil {
+				return xerrors.Errorf("failed to remove delivery state for msg_id=%s: %w", msgID, err)
+			}
+		}
 
 		return nil
 	})

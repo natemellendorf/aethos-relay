@@ -43,7 +43,7 @@ func DecodePayloadB64(s string) ([]byte, error) {
 	return nil, fmt.Errorf("%w: %v", errInvalidPayloadB64, lastErr)
 }
 
-// NormalizePayloadB64 trims surrounding ASCII whitespace from payload_b64.
+// NormalizePayloadB64 trims surrounding Unicode whitespace from payload_b64.
 func NormalizePayloadB64(s string) string {
 	return strings.TrimSpace(s)
 }

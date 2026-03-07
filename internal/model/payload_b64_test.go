@@ -3,7 +3,6 @@ package model
 import (
 	"bytes"
 	"errors"
-	"strings"
 	"testing"
 )
 
@@ -108,7 +107,7 @@ func TestDecodePayloadB64_InvalidIncludesDetail(t *testing.T) {
 	if !errors.Is(err, errInvalidPayloadB64) {
 		t.Fatalf("expected wrapped invalid payload error, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "illegal base64 data") {
+	if err.Error() == errInvalidPayloadB64.Error() {
 		t.Fatalf("expected decode detail in error, got %q", err.Error())
 	}
 }

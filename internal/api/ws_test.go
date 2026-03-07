@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -596,6 +597,18 @@ func TestDeliverToRecipientRemovesCorruptPayloadFromQueue(t *testing.T) {
 	}
 	if queued := st.queued[msg.To]; len(queued) != 0 {
 		t.Fatalf("expected queue to be empty after corruption cleanup, got %d", len(queued))
+	}
+}
+
+func TestDropCorruptMessageSkipsEmptyMsgID(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+
+	h.dropCorruptMessage("", "wayfarer-b", "pull", errors.New("decode failed"))
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.removedMsgIDs) != 0 {
+		t.Fatalf("expected no remove calls for empty msg_id, got %v", st.removedMsgIDs)
 	}
 }
 

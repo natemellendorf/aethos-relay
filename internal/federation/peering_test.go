@@ -24,6 +24,7 @@ type mockStore struct {
 	mu        sync.Mutex
 	messages  map[string]*model.Message // msg.ID -> msg
 	delivered map[string]bool           // msgID+recipientID -> delivered
+	removed   []string
 	persisted int
 }
 
@@ -89,6 +90,7 @@ func (m *mockStore) GetQueuedMessages(_ context.Context, to string, limit int) (
 func (m *mockStore) RemoveMessage(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.removed = append(m.removed, id)
 	delete(m.messages, id)
 	return nil
 }
@@ -524,6 +526,21 @@ func TestDeliverMessage_RemovesCorruptPayloadFromQueue(t *testing.T) {
 
 	if _, err := st.GetMessageByID(context.Background(), msg.ID); err == nil {
 		t.Fatal("expected invalid payload message to be removed")
+	}
+}
+
+func TestDropCorruptMessageSkipsEmptyMsgID(t *testing.T) {
+	st := newMockStore()
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	pm := NewPeerManager("relay-a", st, clients, time.Hour)
+
+	pm.dropCorruptMessage("", "relay_request", "peer-1", errors.New("decode failed"))
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.removed) != 0 {
+		t.Fatalf("expected no remove calls for empty msg_id, got %v", st.removed)
 	}
 }
 

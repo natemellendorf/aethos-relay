@@ -442,6 +442,11 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 }
 
 func (h *WSHandler) dropCorruptMessage(msgID, recipientID, stage string, decodeErr error) {
+	if msgID == "" {
+		log.Printf("ws: skipping corrupt payload removal with empty msg_id recipient=%s stage=%s: %v", recipientID, stage, decodeErr)
+		return
+	}
+
 	log.Printf("ws: dropping corrupt payload msg_id=%s recipient=%s stage=%s: %v", msgID, recipientID, stage, decodeErr)
 	if err := h.engine.RemoveMessage(context.Background(), msgID); err != nil {
 		metrics.IncrementStoreErrors()

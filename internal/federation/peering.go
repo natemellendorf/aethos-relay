@@ -856,6 +856,11 @@ func (pm *PeerManager) deliverMessage(msg *model.Message) {
 }
 
 func (pm *PeerManager) dropCorruptMessage(msgID, stage, peerContext string, decodeErr error) {
+	if msgID == "" {
+		log.Printf("federation: skipping corrupt payload removal with empty msg_id stage=%s peer=%s: %v", stage, peerContext, decodeErr)
+		return
+	}
+
 	log.Printf("federation: dropping corrupt payload msg_id=%s stage=%s peer=%s: %v", msgID, stage, peerContext, decodeErr)
 	if err := pm.engine.RemoveMessage(context.Background(), msgID); err != nil {
 		log.Printf("federation: failed to remove corrupt payload msg_id=%s stage=%s: %v", msgID, stage, err)

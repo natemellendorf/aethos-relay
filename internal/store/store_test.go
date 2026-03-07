@@ -347,3 +347,72 @@ func TestPerDeviceDelivery(t *testing.T) {
 		t.Fatalf("expected 0 messages after delivery to device A, got %d", len(messages))
 	}
 }
+
+func TestRemoveMessageClearsPerDeviceDeliveryState(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	msgID := "reused-msg-id"
+	recipientID := "recipient-1"
+	now := time.Now().Truncate(time.Second)
+
+	first := &model.Message{
+		ID:        msgID,
+		From:      "sender-1",
+		To:        recipientID,
+		Payload:   "SGVsbG8=",
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	if err := store.PersistMessage(nil, first); err != nil {
+		t.Fatalf("failed to persist first message: %v", err)
+	}
+	if err := store.MarkDelivered(nil, msgID, recipientID); err != nil {
+		t.Fatalf("failed to mark first message delivered: %v", err)
+	}
+	if err := store.RemoveMessage(nil, msgID); err != nil {
+		t.Fatalf("failed to remove first message: %v", err)
+	}
+
+	second := &model.Message{
+		ID:        msgID,
+		From:      "sender-2",
+		To:        recipientID,
+		Payload:   "V29ybGQ=",
+		CreatedAt: now.Add(time.Second),
+		ExpiresAt: now.Add(2 * time.Hour),
+	}
+	if err := store.PersistMessage(nil, second); err != nil {
+		t.Fatalf("failed to persist second message: %v", err)
+	}
+
+	delivered, err := store.IsDeliveredTo(nil, msgID, recipientID)
+	if err != nil {
+		t.Fatalf("failed to check delivery state: %v", err)
+	}
+	if delivered {
+		t.Fatal("expected delivery state to be cleared after remove")
+	}
+
+	messages, err := store.GetQueuedMessages(nil, recipientID, 10)
+	if err != nil {
+		t.Fatalf("failed to get queued messages: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 queued message after repersist, got %d", len(messages))
+	}
+	if messages[0].ID != msgID {
+		t.Fatalf("expected queued message ID %s, got %s", msgID, messages[0].ID)
+	}
+}
