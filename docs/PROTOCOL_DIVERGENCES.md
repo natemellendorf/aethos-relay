@@ -4,23 +4,34 @@ Last audited: 2026-03-08
 
 This document tracks implementation deltas versus canonical protocol specs in `aethos`.
 
-## Client <-> Relay status after legacy cleanup
+## Client <-> Relay runtime modes
 
-The following previously transitional behaviors are now canonical-only in relay runtime:
+Default runtime remains compatibility-first. Legacy behavior is still present unless strict mode is enabled.
 
-- `hello` requires both `wayfarer_id` and `device_id`.
-- `hello_ok` includes `relay_id`.
-- `send_ok` and `message` no longer emit legacy `at` alias.
-- `messages[]` entries are canonical-only (`msg_id`, `from`, `payload_b64`, `received_at`).
-- Client `payload_b64` validation is strict RFC4648 base64url raw (unpadded, no whitespace).
-- Outbound client `payload_b64` is always canonical base64url raw.
-- Error frames emit only canonical fields (`type`, `code`, `message`), with no `msg_id` alias.
-- Client `ack` recipient binding is canonical connection identity `(wayfarer_id, device_id)`.
-- Client suppression semantics are canonical ack-driven.
+### Default mode (compatibility, strict mode OFF)
+
+- Existing compatibility paths remain available (legacy payload acceptance, legacy timestamp alias emission, legacy error `msg_id` alias, and ack fallback behavior).
+- No legacy compatibility was removed in this bead because the cleanup plan currently has no greenlit removals.
+
+### Strict mode (canonical-only)
+
+Enable with `AETHOS_CLIENT_RELAY_STRICT_V1=1`.
+
+When enabled, client WebSocket v1 behavior is canonical-only:
+
+- Handshake enforces `hello` first; non-hello pre-handshake frames receive canonical `error {type,code,message}` and connection close.
+- `hello` requires `device_id` and validates `wayfarer_id`/`send.to` as lowercase 64-hex.
+- Client `payload_b64` must be RFC4648 base64url raw (unpadded, no whitespace).
+- `send.to` must match decoded EnvelopeV1 recipient (`TO_MISMATCH` on mismatch).
+- Error frames emit canonical `code`+`message` only (no legacy `msg_id` alias).
+- `send_ok`, pushed `message`, and pull entries do not emit legacy `at` field.
+- Strict TTL behavior: default `ttl_seconds=3600` when omitted; expired messages (`now_seconds >= expires_at`) are not deliverable.
+- Ack is bound to authenticated `(wayfarer_id, device_id)` only.
+- Pull default limit is 50 when omitted; strict pull entries use canonical shape.
 
 ## Remaining notable divergences
 
-- Client TTL default still follows relay `maxTTL` instead of canonical `3600`.
-- Expired messages may still be visible prior to sweep.
+- In default compatibility mode, client TTL default follows relay `maxTTL` (strict mode uses canonical 3600).
+- In default compatibility mode, expired messages may still be visible prior to sweep.
 - `client_msg_id` idempotency contract is not implemented.
 - Federation protocol remains inventory/request/message-forward based (not full canonical envelope-forward model).

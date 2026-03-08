@@ -46,6 +46,7 @@ type WSFrame struct {
 	MsgID      string          `json:"msg_id,omitempty"`
 	Limit      int             `json:"limit,omitempty"`
 	Messages   []WSPullMessage `json:"messages,omitempty"`
+	At         int64           `json:"at,omitempty"`
 	ReceivedAt int64           `json:"received_at,omitempty"`
 	ExpiresAt  int64           `json:"expires_at,omitempty"`
 }
@@ -54,8 +55,11 @@ type WSFrame struct {
 type WSPullMessage struct {
 	MsgID      string `json:"msg_id"`
 	From       string `json:"from"`
+	To         string `json:"to,omitempty"`
 	PayloadB64 string `json:"payload_b64"`
+	At         int64  `json:"at,omitempty"`
 	ReceivedAt int64  `json:"received_at"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
 }
 
 // Frame types (protocol v1)
@@ -194,28 +198,31 @@ func (c *Client) SetPayloadEncodingPref(pref PayloadEncodingPref) {
 	_ = pref
 }
 
-// TrackMessageDeliveryRecipient is kept for compatibility and is a no-op.
+// TrackMessageDeliveryRecipient records which recipient identity was used when
+// sending a specific message to this connection.
 func (c *Client) TrackMessageDeliveryRecipient(msgID, recipientID string) {
 	_ = c
 	_ = msgID
 	_ = recipientID
 }
 
-// ConsumeMessageDeliveryRecipient is kept for compatibility and always returns empty.
+// ConsumeMessageDeliveryRecipient returns and removes the tracked recipient
+// identity for a message.
 func (c *Client) ConsumeMessageDeliveryRecipient(msgID string) string {
 	_ = c
 	_ = msgID
 	return ""
 }
 
-// MessageDeliveryRecipient is kept for compatibility and always returns empty.
+// MessageDeliveryRecipient returns the tracked recipient identity for a
+// message without mutating tracking state.
 func (c *Client) MessageDeliveryRecipient(msgID string) string {
 	_ = c
 	_ = msgID
 	return ""
 }
 
-// ResetDeliveryTracking is kept for compatibility and is a no-op.
+// ResetDeliveryTracking clears per-message recipient identity tracking.
 func (c *Client) ResetDeliveryTracking() {
 	_ = c
 }

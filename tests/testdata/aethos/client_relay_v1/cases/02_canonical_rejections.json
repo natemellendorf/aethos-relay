@@ -57,7 +57,7 @@
       "client": "sender",
       "frame_ref": "frames/client_to_relay/send.json",
       "to_client": "sender",
-      "payload_ref": "payloads/envelope_v1_canonical_example_01.b64url.txt"
+      "payload_ref": "payloads/envelope_v1_to_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.b64url.txt"
     },
     {
       "op": "expect_frame",

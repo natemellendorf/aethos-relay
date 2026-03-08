@@ -19,7 +19,7 @@ import (
 )
 
 func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
-	relay, wsURL := startRelayForTest(t, "relay-harness", false, "", true)
+	relay, wsURL := startRelayForTest(t, "relay-harness", false, "", true, true)
 	defer relay.close()
 
 	a := mustDial(t, wsURL)
@@ -27,19 +27,20 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	b := mustDial(t, wsURL)
 	defer b.Close()
 
-	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a", DeviceID: "device-a"})
+	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeviceID: "device-a"})
 	aHelloOK := readFrame(t, a)
 	if aHelloOK.RelayID == "" {
 		t.Fatal("hello_ok must include relay_id")
 	}
 
-	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-b", DeviceID: "device-b"})
+	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", DeviceID: "device-b"})
 	bHelloOK := readFrame(t, b)
 	if bHelloOK.RelayID == "" {
 		t.Fatal("hello_ok must include relay_id")
 	}
 
-	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: "QQ", TTLSeconds: 120})
+	payload := "AQEBAAAAILu7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7AgAAABNtYW5pZmVzdC1maXhlZC0wMDAxAwAAAAxoZWxsby1hZXRob3M"
+	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeSend, To: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PayloadB64: payload, TTLSeconds: 120})
 	sendOK := readFrame(t, a)
 	if sendOK.Type != model.FrameTypeSendOK {
 		t.Fatalf("expected send_ok, got %q", sendOK.Type)
@@ -52,7 +53,7 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	if push.Type != model.FrameTypeMessage {
 		t.Fatalf("expected message push, got %q", push.Type)
 	}
-	if push.PayloadB64 != "QQ" {
+	if push.PayloadB64 != payload {
 		t.Fatalf("expected canonical payload_b64, got %q", push.PayloadB64)
 	}
 	if push.ReceivedAt == 0 {
@@ -75,7 +76,7 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 		t.Fatalf("unexpected ack_ok: %+v", ackOK)
 	}
 
-	ackRecipient := storeforward.DeliveryIdentity("wayfarer-b", "device-b")
+	ackRecipient := storeforward.DeliveryIdentity("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "device-b")
 	acked, err := relay.store.IsAckedBy(context.Background(), sendOK.MsgID, ackRecipient)
 	if err != nil {
 		t.Fatalf("check ack state: %v", err)
@@ -92,23 +93,23 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 }
 
 func TestCompatibilityHarnessRejectsLegacyShapes(t *testing.T) {
-	relay, wsURL := startRelayForTest(t, "relay-harness-reject", false, "", true)
+	relay, wsURL := startRelayForTest(t, "relay-harness-reject", false, "", true, true)
 	defer relay.close()
 
 	conn := mustDial(t, wsURL)
 	defer conn.Close()
 
-	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a"})
+	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	errFrame := readFrame(t, conn)
 	if errFrame.Type != model.FrameTypeError || errFrame.Message != "device_id required" {
 		t.Fatalf("expected device_id required error, got %+v", errFrame)
 	}
 
-	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a", DeviceID: "device-a"})
+	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeviceID: "device-a"})
 	_ = readFrame(t, conn)
 
 	legacyPayload := base64.StdEncoding.EncodeToString([]byte{0x41}) // "QQ=="
-	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: legacyPayload})
+	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeSend, To: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PayloadB64: legacyPayload})
 	errFrame = readFrame(t, conn)
 	if errFrame.Type != model.FrameTypeError || errFrame.Message != "invalid payload_b64" {
 		t.Fatalf("expected invalid payload_b64 error, got %+v", errFrame)
@@ -134,7 +135,7 @@ func (r *relayHarness) close() {
 	_ = r.store.Close()
 }
 
-func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, peerURL string, ackDrivenSuppression bool) (*relayHarness, string) {
+func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, peerURL string, ackDrivenSuppression bool, strictClientRelayV1 bool) (*relayHarness, string) {
 	t.Helper()
 	dir := t.TempDir()
 	st := store.NewBBoltStore(dir + "/relay.db")
@@ -146,6 +147,7 @@ func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, pee
 
 	wsHandler := api.NewWSHandler(st, clients, 24*time.Hour, "", true, relayID)
 	wsHandler.SetAckDrivenSuppression(ackDrivenSuppression)
+	wsHandler.SetStrictClientRelayV1(strictClientRelayV1)
 	wsHandler.SetAutoDeliverQueued(false)
 
 	mux := http.NewServeMux()

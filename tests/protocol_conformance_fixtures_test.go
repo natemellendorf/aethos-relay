@@ -95,7 +95,7 @@ func TestProtocolConformanceFixtures(t *testing.T) {
 func newProtocolFixtureRunner(t *testing.T, fixtureCase protocolFixtureCase) *protocolFixtureRunner {
 	t.Helper()
 	relayID := "fixture-" + sanitizeRelayIDSuffix(fixtureCase.Name)
-	relay, wsURL := startRelayForTest(t, relayID, false, "", fixtureCase.Relay.AckDrivenSuppression)
+	relay, wsURL := startRelayForTest(t, relayID, false, "", fixtureCase.Relay.AckDrivenSuppression, true)
 
 	clients := make(map[string]protocolFixtureClient, len(fixtureCase.Clients))
 	for _, client := range fixtureCase.Clients {

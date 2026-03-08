@@ -246,6 +246,7 @@ func main() {
 	// Initialize handlers
 	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL, *allowedOrigins, *devMode, *relayID)
 	wsHandler.SetAckDrivenSuppression(*ackDrivenSuppression)
+	log.Printf("Client relay strict v1 mode: %v (env %s)", wsHandler.IsStrictClientRelayV1(), "AETHOS_CLIENT_RELAY_STRICT_V1")
 	wsHandler.SetFederationManager(federationManager)
 	federationManager.SetAckDrivenSuppression(*ackDrivenSuppression)
 	httpHandler := api.NewHTTPHandler(bbstore, sweeper, *maxTTLSecs)

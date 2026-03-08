@@ -15,15 +15,17 @@ This relay implementation targets the canonical protocol specifications defined 
 
 This is a non-exhaustive list of currently identified spec-to-implementation deltas.
 
-- Client-relay canonicalization is now strict for legacy cleanup items:
-  - `hello` requires `device_id`.
-  - `hello_ok` includes `relay_id`.
-  - `send_ok`/`message` no longer emit legacy `at` alias.
-  - `messages[]` entries are canonical-only: `msg_id`, `from`, `payload_b64`, `received_at`.
-  - `payload_b64` on client `send` is strict RFC4648 base64url unpadded (no whitespace, no padding); relay emits base64url-raw outbound.
-  - `error` frames emit canonical fields only: `type`, `code`, `message`.
-  - Client `ack` is bound to `(wayfarer_id, device_id)` from the authenticated connection.
-  - Client delivery suppression defaults to canonical ack-driven semantics.
+- Client-relay has two runtime modes:
+  - **Default (compatibility)**: preserves legacy acceptance/emission paths for production backward compatibility.
+  - **Strict canonical-only**: enabled via `AETHOS_CLIENT_RELAY_STRICT_V1=1`, intended for conformance fixtures.
+    - Enforces `hello` first and requires `hello.device_id`.
+    - Validates `wayfarer_id`/`send.to` as lowercase 64-hex.
+    - Requires strict base64url-raw `payload_b64` and validates EnvelopeV1 recipient against `send.to`.
+    - Emits canonical errors (`type`, `code`, `message`) without legacy `msg_id` alias.
+    - Emits canonical timestamp/message fields (no legacy `at`).
+    - Uses strict defaults (`pull.limit=50`, `ttl_seconds=3600` when omitted) and strict expiry boundary (`now_seconds >= expires_at` not deliverable).
+    - Binds ack strictly to connection `(wayfarer_id, device_id)`.
+  - No legacy compatibility paths were removed in this bead because cleanup plan removals are not yet greenlit.
 - `relay_forward` canonical frame shape is `{"type":"relay_forward","envelope":{...}}` in [FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md), while current relay code uses `RelayForwardFrame` with `json:"message"` (`internal/model/message.go`) and corresponding marshal/unmarshal paths in `internal/federation/peering.go`.
 - `relay_hello` canonical field is `protocol_version` integer (v1 spec), while current relay code sends/accepts string `version` via `RelayHelloFrame` (`internal/model/message.go`) and `ProtocolVersion = "1.0"` (`internal/federation/peering.go`).
 - `relay_ack` canonical statuses are `accepted|rejected` (with optional `code`/`message`), while current relay code handles `accepted|duplicate|expired` in `handleRelayAck` (`internal/federation/peering.go`).
@@ -49,4 +51,4 @@ These are implementation limits and defaults in `aethos-relay`. They are not the
 - Runtime startup values: inspect relay startup logs from `cmd/relay/main.go`
 - Constant/fallback behavior: review `internal/federation/tar.go`, `internal/federation/peering.go`, and `internal/model/envelope.go`
 
-Environment variables are not currently used for these protocol constraint values.
+Client strict conformance mode uses environment variable `AETHOS_CLIENT_RELAY_STRICT_V1`.
