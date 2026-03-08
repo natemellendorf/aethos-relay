@@ -284,6 +284,7 @@ func TestRelayLinkCompatibilityFederationOptional(t *testing.T) {
 
 type relayHarness struct {
 	store       *store.BBoltStore
+	clients     *model.ClientRegistry
 	server      *httptest.Server
 	peerManager *federation.PeerManager
 	fedURL      string
@@ -329,7 +330,7 @@ func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, pee
 
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws"
 	fedURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/federation/ws"
-	return &relayHarness{store: st, server: srv, peerManager: pm, fedURL: fedURL}, wsURL
+	return &relayHarness{store: st, clients: clients, server: srv, peerManager: pm, fedURL: fedURL}, wsURL
 }
 
 func mustReadFixture(t *testing.T) []byte {

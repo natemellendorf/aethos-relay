@@ -1,0 +1,158 @@
+{
+  "name": "canonical-pull-and-ack",
+  "description": "Canonical frame flow using vendored examples with queued pull and per-device ack.",
+  "relay": {
+    "ack_driven_suppression": false
+  },
+  "clients": [
+    {
+      "id": "sender",
+      "wayfarer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "device_id": "device-sender"
+    },
+    {
+      "id": "recipient",
+      "wayfarer_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "device_id": "device-recipient"
+    }
+  ],
+  "steps": [
+    {
+      "op": "dial",
+      "client": "sender"
+    },
+    {
+      "op": "hello",
+      "client": "sender",
+      "frame_ref": "frames/client_to_relay/hello.json"
+    },
+    {
+      "op": "expect_frame",
+      "client": "sender",
+      "frame_ref": "frames/relay_to_client/hello_ok.json"
+    },
+    {
+      "op": "dial",
+      "client": "recipient"
+    },
+    {
+      "op": "hello",
+      "client": "recipient",
+      "frame_ref": "frames/client_to_relay/hello.json"
+    },
+    {
+      "op": "expect_frame",
+      "client": "recipient",
+      "frame_ref": "frames/relay_to_client/hello_ok.json"
+    },
+    {
+      "op": "close",
+      "client": "recipient"
+    },
+    {
+      "op": "send",
+      "client": "sender",
+      "frame_ref": "frames/client_to_relay/send.json",
+      "to_client": "recipient",
+      "payload_ref": "payloads/envelope_v1_canonical_example_01.b64url.txt",
+      "capture_payload_var": "sent_payload",
+      "ttl_seconds": 120
+    },
+    {
+      "op": "expect_frame",
+      "client": "sender",
+      "frame_ref": "frames/relay_to_client/send_ok.json",
+      "required_fields": [
+        "msg_id",
+        "received_at",
+        "expires_at",
+        "at"
+      ],
+      "equal_fields": [
+        [
+          "at",
+          "received_at"
+        ]
+      ],
+      "capture": {
+        "send_msg_id": "msg_id"
+      }
+    },
+    {
+      "op": "dial",
+      "client": "recipient"
+    },
+    {
+      "op": "hello",
+      "client": "recipient",
+      "frame_ref": "frames/client_to_relay/hello.json"
+    },
+    {
+      "op": "expect_frame",
+      "client": "recipient",
+      "frame_ref": "frames/relay_to_client/hello_ok.json"
+    },
+    {
+      "op": "pull",
+      "client": "recipient",
+      "frame_ref": "frames/client_to_relay/pull.json",
+      "limit": 10
+    },
+    {
+      "op": "expect_messages",
+      "client": "recipient",
+      "frame_ref": "frames/relay_to_client/messages.json",
+      "count": 1,
+      "message_index": 0,
+      "message_required_fields": [
+        "msg_id",
+        "from",
+        "payload_b64",
+        "received_at"
+      ],
+      "message_field_equals": {
+        "msg_id": "$send_msg_id",
+        "from": "$sender.wayfarer_id"
+      },
+      "message_payload_equals": "$sent_payload"
+    },
+    {
+      "op": "assert_delivery_state",
+      "msg_id_var": "send_msg_id",
+      "recipient": "$recipient.delivery_identity",
+      "delivered": false
+    },
+    {
+      "op": "ack",
+      "client": "recipient",
+      "frame_ref": "frames/client_to_relay/ack.json",
+      "msg_id_var": "send_msg_id"
+    },
+    {
+      "op": "expect_frame",
+      "client": "recipient",
+      "frame_ref": "frames/relay_to_client/ack_ok.json",
+      "field_equals": {
+        "msg_id": "$send_msg_id"
+      }
+    },
+    {
+      "op": "assert_delivery_state",
+      "msg_id_var": "send_msg_id",
+      "recipient": "$recipient.delivery_identity",
+      "delivered": true
+    },
+    {
+      "op": "pull",
+      "client": "recipient",
+      "frame_ref": "frames/client_to_relay/pull.json",
+      "limit": 10
+    },
+    {
+      "op": "expect_messages",
+      "client": "recipient",
+      "frame_ref": "frames/relay_to_client/messages.json",
+      "count": 0
+    }
+  ]
+}

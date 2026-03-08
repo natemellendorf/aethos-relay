@@ -1,6 +1,6 @@
 # Protocol Divergence Audit
 
-Last audited: 2026-03-07
+Last audited: 2026-03-08
 
 This document audits current `aethos-relay` runtime behavior against canonical specs in `aethos`.
 
@@ -61,6 +61,22 @@ This document audits current `aethos-relay` runtime behavior against canonical s
 | Receipt transport wrapper support | Receipt wrappers use `receipt_scope` + `receipt_v1_b64` (base64url) (`RECEIPTS.md:58`, `RECEIPTS.md:66`), with inner `ReceiptV1` from canonical structures (`RECEIPTS.md:7`, `protocol.md:57`). | Relay does not expose or consume receipt wrapper fields; no receipt frame types are implemented in client or federation WebSocket handlers (`internal/api/ws.go:202`, `internal/federation/peering.go:336`). | **Diverges** |
 | Non-conflation of device vs federation semantics | `DeviceReceipt` and `FederationReceipt` must not be conflated (`RECEIPTS.md:42`, `RECEIPTS.md:44`). | Client `ack` updates client-delivery state (`internal/api/ws.go:299`), while `relay_ack` updates peer metrics and tests assert it does not mark client delivery (`internal/federation/peering.go:616`, `internal/federation/peering_test.go:375`, `internal/federation/peering_test.go:380`). | **Matches** |
 | `ack_ok` vs receipt semantics | Receipt semantics are `ReceiptV1`-based and scoped (`RECEIPTS.md:13`, `RECEIPTS.md:51`). | `ack_ok` remains a stable transport response (`{type,msg_id}`) to client `ack`, and relay still does not generate `ReceiptV1` wrappers. Device ack persistence is tracked separately from federation receipt semantics; `ack_ok` is not a receipt payload (`internal/api/ws.go`, `internal/store/bbolt_store.go`). | **Diverges (non-conflation preserved)** |
+
+## Compatibility boundary and fixture-driven conformance (2026-03-08)
+
+- Client protocol compatibility handling is centralized in `internal/protocolcompat/clientv1` and consumed by `internal/api/ws.go` for:
+  - legacy + canonical timestamp dual-surface encoding (`send_ok`, `message`, `messages`)
+  - legacy error alias shaping (`error.msg_id` mirror)
+  - ack recipient resolution (tracked delivery identity first, legacy wayfarer fallback)
+- Fixture-driven black-box conformance tests were added at:
+  - `tests/protocol_conformance_fixtures_test.go`
+  - `tests/testdata/aethos/client_relay_v1/**` (vendored canonical frame/payload fixtures with provenance in `SOURCE.txt`)
+  - Coverage includes canonical fixture frame flow (`hello`/`send`/`pull`/`ack`) and transitional compatibility behavior checks.
+- Remaining temporary compatibility behaviors still intentionally supported:
+  1. `hello.device_id` optional for legacy clients (fallback to wayfarer-only delivery identity)
+  2. dual timestamp aliasing (`at` with canonical `received_at`)
+  3. legacy error shape alias (`error.msg_id` mirrors canonical `error.message`)
+  4. ack recipient fallback to legacy wayfarer identity when no tracked delivery identity exists
 
 ## Implementation Notes (non-protocol constraints)
 

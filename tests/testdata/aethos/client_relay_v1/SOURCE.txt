@@ -1,0 +1,20 @@
+Source: https://github.com/natemellendorf/aethos
+Reference: origin/main @ 99696976c549d7e6b85a005da5a9840e32a9e10e
+Captured: 2026-03-08
+
+Canonical documents used:
+- docs/spec/CLIENT_RELAY_PROTOCOL_V1.md
+- docs/spec/RECEIPTS.md
+- docs/protocol.md
+
+Requested document status:
+- docs/migration/CLIENT_RELAY_CONFORMANCE_FIXTURES.md is not present at this ref.
+
+Fixture provenance:
+- frames/* extracted from JSON examples in CLIENT_RELAY_PROTOCOL_V1.md.
+- payloads/envelope_v1_canonical_example_01.b64url.txt generated from docs/protocol.md Canonical Bytes v1 EnvelopeV1 layout using deterministic field values:
+  - toWayfarerId bytes: 0x00..0x1f
+  - manifestId bytes: "manifest-fixed-0001"
+  - body bytes: "hello-aethos"
+  - encoded bytes hex:
+    01010100000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f02000000136d616e69666573742d66697865642d30303031030000000c68656c6c6f2d616574686f73
