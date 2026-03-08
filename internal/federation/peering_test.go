@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -664,36 +665,68 @@ func TestHandleRelayForward_RejectsInvalidPayloadB64(t *testing.T) {
 }
 
 func TestHandleRelayForward_CanonicalizesLegacyPayloadBeforePersist(t *testing.T) {
-	st := newMockStore()
-	clients := model.NewClientRegistry()
-	go clients.Run()
-	pm := NewPeerManager("relay-a", st, clients, time.Hour)
-
-	now := time.Now()
-	msg := &model.Message{
-		ID:        "normalized-relay-forward",
-		From:      "alice",
-		To:        "bob",
-		Payload:   " \n\tdGVzdA==\r ",
-		CreatedAt: now,
-		ExpiresAt: now.Add(time.Hour),
+	tests := []struct {
+		name              string
+		id                string
+		legacyPayload     string
+		expectedCanonical string
+		expectedBytes     []byte
+	}{
+		{
+			name:              "legacy standard with padding canonicalizes",
+			id:                "normalized-relay-forward-test",
+			legacyPayload:     " \n\tdGVzdA==\r ",
+			expectedCanonical: "dGVzdA",
+			expectedBytes:     []byte("test"),
+		},
+		{
+			name:              "legacy standard plus slash and padding canonicalizes",
+			id:                "normalized-relay-forward-plus-slash",
+			legacyPayload:     " \n\t+/8=\r ",
+			expectedCanonical: "-_8",
+			expectedBytes:     []byte{0xfb, 0xff},
+		},
 	}
 
-	peer := &Peer{ID: "peer-1", Done: make(chan struct{})}
-	pm.handleRelayForward(peer, &model.RelayForwardFrame{
-		Type:    model.FrameTypeRelayForward,
-		Message: msg,
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newMockStore()
+			clients := model.NewClientRegistry()
+			go clients.Run()
+			pm := NewPeerManager("relay-a", st, clients, time.Hour)
 
-	stored, err := st.GetMessageByID(context.Background(), msg.ID)
-	if err != nil {
-		t.Fatalf("expected message to be stored: %v", err)
-	}
-	if stored.Payload != "dGVzdA" {
-		t.Fatalf("expected canonical base64url payload, got %q", stored.Payload)
-	}
-	if _, err := model.DecodePayloadB64(stored.Payload); err != nil {
-		t.Fatalf("expected persisted payload to pass strict decode: %v", err)
+			now := time.Now()
+			msg := &model.Message{
+				ID:        tc.id,
+				From:      "alice",
+				To:        "bob",
+				Payload:   tc.legacyPayload,
+				CreatedAt: now,
+				ExpiresAt: now.Add(time.Hour),
+			}
+
+			peer := &Peer{ID: "peer-1", Done: make(chan struct{})}
+			pm.handleRelayForward(peer, &model.RelayForwardFrame{
+				Type:    model.FrameTypeRelayForward,
+				Message: msg,
+			})
+
+			stored, err := st.GetMessageByID(context.Background(), msg.ID)
+			if err != nil {
+				t.Fatalf("expected message to be stored: %v", err)
+			}
+			if stored.Payload != tc.expectedCanonical {
+				t.Fatalf("expected canonical base64url payload %q, got %q", tc.expectedCanonical, stored.Payload)
+			}
+
+			decoded, err := model.DecodePayloadB64(stored.Payload)
+			if err != nil {
+				t.Fatalf("expected persisted payload to pass strict decode: %v", err)
+			}
+			if !bytes.Equal(decoded, tc.expectedBytes) {
+				t.Fatalf("decoded payload bytes mismatch: got %x want %x", decoded, tc.expectedBytes)
+			}
+		})
 	}
 }
 
