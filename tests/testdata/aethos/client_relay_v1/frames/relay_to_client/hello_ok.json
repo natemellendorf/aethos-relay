@@ -1,3 +1,4 @@
 {
-  "type": "hello_ok"
+  "type": "hello_ok",
+  "relay_id": "$relay.relay_id"
 }

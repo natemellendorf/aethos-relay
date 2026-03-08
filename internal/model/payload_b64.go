@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // PayloadEncodingPref controls outbound payload_b64 wire encoding per connection.
@@ -17,60 +18,46 @@ const (
 
 var errInvalidPayloadB64 = errors.New("invalid payload_b64")
 
-// DecodePayloadB64 decodes payload_b64 using tolerant compatibility rules.
+// DecodePayloadB64 decodes payload_b64 using canonical rules:
+// RFC4648 URL-safe base64 without padding and without whitespace.
 func DecodePayloadB64(s string) ([]byte, error) {
-	trimmed := NormalizePayloadB64(s)
-	if trimmed == "" {
+	if s == "" {
 		return nil, fmt.Errorf("%w: empty payload", errInvalidPayloadB64)
 	}
-
-	encodings := []*base64.Encoding{
-		base64.RawURLEncoding,
-		base64.URLEncoding,
-		base64.RawStdEncoding,
-		base64.StdEncoding,
+	if strings.TrimSpace(s) != s {
+		return nil, fmt.Errorf("%w: surrounding whitespace is not allowed", errInvalidPayloadB64)
 	}
-
-	var lastErr error
-	for _, encoding := range encodings {
-		decoded, err := encoding.DecodeString(trimmed)
-		if err == nil {
-			return decoded, nil
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			return nil, fmt.Errorf("%w: whitespace is not allowed", errInvalidPayloadB64)
 		}
-		lastErr = err
+	}
+	if strings.Contains(s, "=") {
+		return nil, fmt.Errorf("%w: padding is not allowed", errInvalidPayloadB64)
 	}
 
-	return nil, fmt.Errorf("%w: %v", errInvalidPayloadB64, lastErr)
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidPayloadB64, err)
+	}
+
+	return decoded, nil
 }
 
-// NormalizePayloadB64 trims surrounding Unicode whitespace from payload_b64.
+// NormalizePayloadB64 returns payload_b64 unchanged.
+// Canonical decoding rejects any whitespace and padding.
 func NormalizePayloadB64(s string) string {
-	return strings.TrimSpace(s)
+	return s
 }
 
 // DetectPayloadB64EncodingPref infers preferred outbound payload_b64 encoding.
 func DetectPayloadB64EncodingPref(s string) PayloadEncodingPref {
-	trimmed := NormalizePayloadB64(s)
-
-	if strings.ContainsAny(trimmed, "-_") {
-		return PayloadEncodingPrefBase64URL
-	}
-	if strings.ContainsAny(trimmed, "+/") {
-		return PayloadEncodingPrefBase64
-	}
-	if strings.Contains(trimmed, "=") {
-		return PayloadEncodingPrefBase64
-	}
-	if len(trimmed)%4 != 0 {
-		return PayloadEncodingPrefBase64URL
-	}
-	return PayloadEncodingPrefBase64
+	_ = s
+	return PayloadEncodingPrefBase64URL
 }
 
 // EncodePayloadB64 encodes bytes using the requested wire preference.
 func EncodePayloadB64(b []byte, pref PayloadEncodingPref) string {
-	if pref == PayloadEncodingPrefBase64URL {
-		return base64.RawURLEncoding.EncodeToString(b)
-	}
-	return base64.StdEncoding.EncodeToString(b)
+	_ = pref
+	return base64.RawURLEncoding.EncodeToString(b)
 }

@@ -88,26 +88,23 @@ func (e *Engine) PullForDeliveryIdentity(ctx context.Context, deliveryIdentity s
 
 	var filtered []*model.Message
 	for _, msg := range messages {
-		isSuppressed := false
-		var err error
 		if e.ackDrivenSuppression {
-			acked, ackErr := e.store.IsAckedBy(ctx, msg.ID, deliveryIdentity)
-			if ackErr != nil {
-				return nil, ackErr
-			}
-			legacyDelivered, deliveredErr := e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
-			if deliveredErr != nil {
-				return nil, deliveredErr
-			}
-			isSuppressed = acked || legacyDelivered
-		} else {
-			isSuppressed, err = e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
+			acked, err := e.store.IsAckedBy(ctx, msg.ID, deliveryIdentity)
 			if err != nil {
 				return nil, err
 			}
+			if acked {
+				continue
+			}
+			filtered = append(filtered, msg)
+			continue
 		}
 
-		if isSuppressed {
+		delivered, err := e.store.IsDeliveredTo(ctx, msg.ID, deliveryIdentity)
+		if err != nil {
+			return nil, err
+		}
+		if delivered {
 			continue
 		}
 		filtered = append(filtered, msg)

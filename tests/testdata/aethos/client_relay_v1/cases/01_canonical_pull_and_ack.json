@@ -3,7 +3,7 @@
   "expectation_mode": "canonical_v1",
   "description": "Canonical frame flow using vendored examples with queued pull and per-device ack.",
   "relay": {
-    "ack_driven_suppression": false
+    "ack_driven_suppression": true
   },
   "clients": [
     {
@@ -30,7 +30,10 @@
     {
       "op": "expect_frame",
       "client": "sender",
-      "frame_ref": "frames/relay_to_client/hello_ok.json"
+      "frame_ref": "frames/relay_to_client/hello_ok.json",
+      "required_fields": [
+        "relay_id"
+      ]
     },
     {
       "op": "dial",
@@ -44,7 +47,10 @@
     {
       "op": "expect_frame",
       "client": "recipient",
-      "frame_ref": "frames/relay_to_client/hello_ok.json"
+      "frame_ref": "frames/relay_to_client/hello_ok.json",
+      "required_fields": [
+        "relay_id"
+      ]
     },
     {
       "op": "close",
@@ -66,14 +72,7 @@
       "required_fields": [
         "msg_id",
         "received_at",
-        "expires_at",
-        "at"
-      ],
-      "equal_fields": [
-        [
-          "at",
-          "received_at"
-        ]
+        "expires_at"
       ],
       "capture": {
         "send_msg_id": "msg_id"
@@ -91,7 +90,10 @@
     {
       "op": "expect_frame",
       "client": "recipient",
-      "frame_ref": "frames/relay_to_client/hello_ok.json"
+      "frame_ref": "frames/relay_to_client/hello_ok.json",
+      "required_fields": [
+        "relay_id"
+      ]
     },
     {
       "op": "pull",
@@ -118,12 +120,6 @@
       "message_payload_equals": "$sent_payload"
     },
     {
-      "op": "assert_delivery_state",
-      "msg_id_var": "send_msg_id",
-      "recipient": "$recipient.delivery_identity",
-      "delivered": false
-    },
-    {
       "op": "ack",
       "client": "recipient",
       "frame_ref": "frames/client_to_relay/ack.json",
@@ -136,12 +132,6 @@
       "field_equals": {
         "msg_id": "$send_msg_id"
       }
-    },
-    {
-      "op": "assert_delivery_state",
-      "msg_id_var": "send_msg_id",
-      "recipient": "$recipient.delivery_identity",
-      "delivered": true
     },
     {
       "op": "pull",

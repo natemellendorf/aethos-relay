@@ -133,6 +133,7 @@ func TestPullReturnsQueuedMessages(t *testing.T) {
 
 func TestClientAckTracksSingleDeliveryIdentity(t *testing.T) {
 	h := newEngineHarness(t, time.Hour)
+	h.engine.SetAckDrivenSuppression(true)
 
 	msg := &model.Message{
 		ID:        "msg-device",
@@ -159,8 +160,15 @@ func TestClientAckTracksSingleDeliveryIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("delivered check device-a: %v", err)
 	}
-	if !deliveredA {
-		t.Fatal("device-a should be marked delivered")
+	if deliveredA {
+		t.Fatal("canonical ack should not write legacy delivered state")
+	}
+	ackedA, err := h.messageStore.IsAckedBy(context.Background(), msg.ID, deviceA)
+	if err != nil {
+		t.Fatalf("acked check device-a: %v", err)
+	}
+	if !ackedA {
+		t.Fatal("device-a should be marked acked")
 	}
 
 	deliveredB, err := h.messageStore.IsDeliveredTo(context.Background(), msg.ID, deviceB)
@@ -188,7 +196,7 @@ func TestClientAckTracksSingleDeliveryIdentity(t *testing.T) {
 	}
 }
 
-func TestAckDrivenSuppressionUsesAckOrLegacyDeliveredStateAndIsIdempotent(t *testing.T) {
+func TestAckDrivenSuppressionUsesAckStateAndIsIdempotent(t *testing.T) {
 	h := newEngineHarness(t, time.Hour)
 	h.engine.SetAckDrivenSuppression(true)
 
@@ -204,16 +212,12 @@ func TestAckDrivenSuppressionUsesAckOrLegacyDeliveredStateAndIsIdempotent(t *tes
 
 	deviceA := DeliveryIdentity("wayfarer-1", "device-a")
 
-	if err := h.engine.MarkDelivery(context.Background(), msg.ID, deviceA); err != nil {
-		t.Fatalf("legacy mark delivery write: %v", err)
-	}
-
 	stillVisible, err := h.engine.PullForDeliveryIdentity(context.Background(), deviceA, 10)
 	if err != nil {
 		t.Fatalf("pull before ack: %v", err)
 	}
-	if len(stillVisible) != 0 {
-		t.Fatalf("canonical mode should suppress when legacy delivered state exists, got %d", len(stillVisible))
+	if len(stillVisible) != 1 {
+		t.Fatalf("canonical mode should not suppress before ack, got %d", len(stillVisible))
 	}
 
 	firstTransition, err := h.engine.AckClientDelivery(context.Background(), msg.ID, deviceA)
@@ -250,7 +254,7 @@ func TestAckDrivenSuppressionUsesAckOrLegacyDeliveredStateAndIsIdempotent(t *tes
 	}
 }
 
-func TestAckDrivenSuppressionRespectsLegacyStateAfterModeToggle(t *testing.T) {
+func TestAckDrivenSuppressionDoesNotUseLegacyStateAfterModeToggle(t *testing.T) {
 	h := newEngineHarness(t, time.Hour)
 
 	msg := &model.Message{
@@ -275,8 +279,8 @@ func TestAckDrivenSuppressionRespectsLegacyStateAfterModeToggle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pull after mode toggle: %v", err)
 	}
-	if len(messages) != 0 {
-		t.Fatalf("expected no duplicate delivery after mode toggle, got %d", len(messages))
+	if len(messages) != 1 {
+		t.Fatalf("expected canonical mode to ignore legacy delivered state, got %d", len(messages))
 	}
 }
 
