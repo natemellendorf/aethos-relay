@@ -22,6 +22,61 @@ go run ./cmd/relay/main.go -http-addr :8081
 
 This starts a relay on port 8081 with default settings.
 
+### Run with Docker
+
+Build the image locally:
+
+```bash
+docker build -t aethos-relay:local .
+```
+
+Run the relay with persisted storage:
+
+```bash
+docker run --rm \
+  -p 8080:8080 \
+  -p 8081:8081 \
+  -v aethos-relay-data:/var/lib/aethos \
+  aethos-relay:local
+```
+
+The container starts `relay` with:
+- `-ws-addr=:8080`
+- `-http-addr=:8081`
+- `-store-path=/var/lib/aethos/relay.db`
+
+Override flags by appending them to `docker run`:
+
+```bash
+docker run --rm -p 8081:8081 aethos-relay:local -http-addr=:8081 -dev-mode
+```
+
+Run with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Stop and remove the stack:
+
+```bash
+docker compose down
+```
+
+### Container Releases (GHCR)
+
+The repo includes a release workflow that publishes multi-arch images to GitHub Container Registry (GHCR) on tag pushes (`v*`):
+
+- `ghcr.io/natemellendorf/aethos-relay:<tag>`
+- `ghcr.io/natemellendorf/aethos-relay:sha-<commit>`
+
+Pull and run a published image:
+
+```bash
+docker pull ghcr.io/natemellendorf/aethos-relay:v0.1.0
+docker run --rm -p 8080:8080 -p 8081:8081 ghcr.io/natemellendorf/aethos-relay:v0.1.0
+```
+
 ### Run with Federation
 
 Connect to peer relays for mesh networking:

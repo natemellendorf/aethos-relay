@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -285,7 +287,7 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 	}
 
 	if _, err := model.DecodePayloadB64(frame.PayloadB64); err != nil {
-		log.Printf("ws: rejecting send from=%s to=%s: invalid payload_b64: %v", client.WayfarerID, frame.To, err)
+		log.Printf("ws: rejecting send from=%s to=%s device=%s: invalid payload_b64: %v shape={%s}", client.WayfarerID, frame.To, client.DeviceID, err, payloadB64Shape(frame.PayloadB64))
 		h.sendError(client, model.ErrorCodeInvalidPayload, "invalid payload_b64")
 		return
 	}
@@ -387,7 +389,7 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 		}
 		decodedPayload, err := model.DecodePayloadB64(m.Payload)
 		if err != nil {
-			h.dropCorruptMessage(m.ID, deliveryID, "pull", err)
+			h.dropCorruptMessage(m.ID, deliveryID, "pull", m.Payload, err)
 			continue
 		}
 		msgs = append(msgs, model.WSPullMessage{
@@ -423,7 +425,7 @@ func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
 func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 	decodedPayload, err := model.DecodePayloadB64(msg.Payload)
 	if err != nil {
-		h.dropCorruptMessage(msg.ID, msg.To, "deliver", err)
+		h.dropCorruptMessage(msg.ID, msg.To, "deliver", msg.Payload, err)
 		return
 	}
 
@@ -449,13 +451,33 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 	}
 }
 
-func (h *WSHandler) dropCorruptMessage(msgID, recipientID, stage string, decodeErr error) {
+func payloadB64Shape(raw string) string {
+	hasWhitespace := false
+	for _, r := range raw {
+		if unicode.IsSpace(r) {
+			hasWhitespace = true
+			break
+		}
+	}
+
+	return fmt.Sprintf("len=%d padding=%t plus=%t slash=%t dash=%t underscore=%t whitespace=%t",
+		len(raw),
+		strings.Contains(raw, "="),
+		strings.Contains(raw, "+"),
+		strings.Contains(raw, "/"),
+		strings.Contains(raw, "-"),
+		strings.Contains(raw, "_"),
+		hasWhitespace,
+	)
+}
+
+func (h *WSHandler) dropCorruptMessage(msgID, recipientID, stage, payloadB64 string, decodeErr error) {
 	if msgID == "" {
 		log.Printf("ws: skipping corrupt payload removal with empty msg_id recipient=%s stage=%s: %v", recipientID, stage, decodeErr)
 		return
 	}
 
-	log.Printf("ws: dropping corrupt payload msg_id=%s recipient=%s stage=%s: %v", msgID, recipientID, stage, decodeErr)
+	log.Printf("ws: dropping corrupt payload msg_id=%s recipient=%s stage=%s: %v shape={%s}", msgID, recipientID, stage, decodeErr, payloadB64Shape(payloadB64))
 	if err := h.engine.RemoveMessage(context.Background(), msgID); err != nil {
 		metrics.IncrementStoreErrors()
 		log.Printf("ws: failed to remove corrupt message msg_id=%s stage=%s: %v", msgID, stage, err)

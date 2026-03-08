@@ -43,6 +43,7 @@ func main() {
 	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated list of allowed WebSocket origins (e.g., 'https://app.aethos.io,https://aethos.app')")
 	devMode := flag.Bool("dev-mode", false, "Enable development mode (allows all origins, for local development only)")
 	ackDrivenSuppression := flag.Bool("ack-driven-suppression", false, "Use canonical ack-driven delivery suppression (default legacy mark-on-push)")
+	scrubInvalidPayloadsStartup := flag.Bool("scrub-invalid-payloads-startup", true, "Remove queued messages with invalid payload_b64 at startup")
 
 	// Federation flags
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
@@ -93,6 +94,7 @@ func main() {
 	log.Printf("Allowed origins: %s", *allowedOrigins)
 	log.Printf("Dev mode: %v", *devMode)
 	log.Printf("Ack-driven suppression: %v", *ackDrivenSuppression)
+	log.Printf("Scrub invalid payloads on startup: %v", *scrubInvalidPayloadsStartup)
 	if *ackDrivenSuppression {
 		log.Printf("WARNING: ack-driven suppression enabled: queue suppression uses ack_state and legacy delivery_state during migration")
 	}
@@ -162,6 +164,20 @@ func main() {
 	defer bbstore.Close()
 
 	log.Println("Store opened successfully")
+	if *scrubInvalidPayloadsStartup {
+		report, err := store.ScrubInvalidPayloadMessages(context.Background(), bbstore)
+		if err != nil {
+			log.Printf("WARNING: startup payload scrub completed with errors: %v", err)
+		}
+		log.Printf("store: startup payload scrub summary recipients=%d queued=%d invalid=%d removed=%d lookup_errors=%d remove_errors=%d",
+			report.RecipientsScanned,
+			report.QueuedScanned,
+			report.InvalidFound,
+			report.Removed,
+			report.LookupErrors,
+			report.RemoveErrors,
+		)
+	}
 
 	// Initialize envelope store for federation
 	envelopeStore := store.NewBBoltEnvelopeStore(envStorePath)
