@@ -14,3 +14,6 @@ relay.db.envelopes
 /relaylink
 client
 .worktrees/
+*.db.*
+*.log
+*.db

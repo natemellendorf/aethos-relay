@@ -267,3 +267,18 @@ func TestHandleAckUsesConnectionDeviceIdentity(t *testing.T) {
 		t.Fatalf("ack recipient mismatch: %#v", st.markAcked[0])
 	}
 }
+
+func TestSendClosedChannelDoesNotPanic(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-a"
+	close(client.Send)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("send panicked on closed channel: %v", r)
+		}
+	}()
+
+	h.send(client, model.WSFrame{Type: model.FrameTypeHelloOK})
+}

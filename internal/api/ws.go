@@ -472,9 +472,17 @@ func (h *WSHandler) send(client *model.Client, frame model.WSFrame) {
 		log.Printf("ws: failed to marshal frame: %v", err)
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ws: failed to send, channel closed for client %s", client.WayfarerID)
+			metrics.IncrementDropped()
+		}
+	}()
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
 	select {
 	case client.Send <- data:
-	case <-time.After(1 * time.Second):
+	case <-timer.C:
 		log.Printf("ws: failed to send, channel full after timeout for client %s", client.WayfarerID)
 		metrics.IncrementDropped()
 	}
