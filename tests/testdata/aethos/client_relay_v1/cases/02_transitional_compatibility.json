@@ -1,0 +1,224 @@
+{
+  "name": "transitional-compatibility",
+  "expectation_mode": "transitional_compat",
+  "known_divergences": [
+    "hello_ok omits canonical relay_id",
+    "error frame includes legacy msg_id alias mirroring canonical message",
+    "relay accepts legacy padded base64 payload_b64 (not strict base64url-only enforcement)",
+    "ack recipient fallback follows connection delivery identity compatibility behavior"
+  ],
+  "description": "Intentional compatibility surfaces: optional device_id hello, dual timestamps, legacy error msg_id alias, ack fallback preserving connection delivery identity semantics, and legacy base64 acceptance.",
+  "relay": {
+    "ack_driven_suppression": true
+  },
+  "clients": [
+    {
+      "id": "sender",
+      "wayfarer_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "device_id": "device-sender"
+    },
+    {
+      "id": "legacy_recipient",
+      "wayfarer_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "steps": [
+    {
+      "op": "dial",
+      "client": "sender"
+    },
+    {
+      "op": "hello",
+      "client": "sender",
+      "frame_ref": "frames/client_to_relay/hello.json"
+    },
+    {
+      "op": "expect_frame",
+      "client": "sender",
+      "frame_ref": "frames/relay_to_client/hello_ok.json",
+      "forbidden_fields": [
+        "relay_id"
+      ]
+    },
+    {
+      "op": "dial",
+      "client": "legacy_recipient"
+    },
+    {
+      "op": "hello",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/client_to_relay/hello.json"
+    },
+    {
+      "op": "expect_frame",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/relay_to_client/hello_ok.json",
+      "forbidden_fields": [
+        "relay_id"
+      ]
+    },
+    {
+      "op": "send",
+      "client": "sender",
+      "frame_ref": "frames/client_to_relay/send.json",
+      "to_client": "legacy_recipient",
+      "payload_ref": "payloads/envelope_v1_canonical_example_01.b64url.txt",
+      "capture_payload_var": "sent_payload",
+      "ttl_seconds": 120
+    },
+    {
+      "op": "expect_frame",
+      "client": "sender",
+      "frame_ref": "frames/relay_to_client/send_ok.json",
+      "required_fields": [
+        "msg_id",
+        "received_at",
+        "expires_at",
+        "at"
+      ],
+      "equal_fields": [
+        [
+          "at",
+          "received_at"
+        ]
+      ],
+      "capture": {
+        "send_msg_id": "msg_id"
+      }
+    },
+    {
+      "op": "expect_frame",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/relay_to_client/message.json",
+      "required_fields": [
+        "msg_id",
+        "from",
+        "payload_b64",
+        "received_at",
+        "at"
+      ],
+      "field_equals": {
+        "msg_id": "$send_msg_id",
+        "from": "$sender.wayfarer_id"
+      },
+      "equal_fields": [
+        [
+          "at",
+          "received_at"
+        ]
+      ],
+      "capture": {
+        "send_msg_id_from_push": "msg_id"
+      }
+    },
+    {
+      "op": "close",
+      "client": "legacy_recipient"
+    },
+    {
+      "op": "dial",
+      "client": "legacy_recipient"
+    },
+    {
+      "op": "hello",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/client_to_relay/hello.json"
+    },
+    {
+      "op": "expect_frame",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/relay_to_client/hello_ok.json",
+      "forbidden_fields": [
+        "relay_id"
+      ]
+    },
+    {
+      "op": "ack",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/client_to_relay/ack.json",
+      "msg_id_var": "send_msg_id"
+    },
+    {
+      "op": "expect_frame",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/relay_to_client/ack_ok.json",
+      "field_equals": {
+        "msg_id": "$send_msg_id"
+      }
+    },
+    {
+      "op": "pull",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/client_to_relay/pull.json",
+      "limit": 10
+    },
+    {
+      "op": "expect_messages",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/relay_to_client/messages.json",
+      "count": 0
+    },
+    {
+      "op": "send",
+      "client": "sender",
+      "frame_ref": "frames/client_to_relay/send.json",
+      "to_client": "legacy_recipient",
+      "payload_ref": "payloads/envelope_v1_canonical_example_01.base64.txt",
+      "capture_payload_var": "legacy_sent_payload",
+      "ttl_seconds": 120
+    },
+    {
+      "op": "expect_frame",
+      "client": "sender",
+      "frame_ref": "frames/relay_to_client/send_ok.json",
+      "required_fields": [
+        "msg_id"
+      ],
+      "capture": {
+        "legacy_send_msg_id": "msg_id"
+      }
+    },
+    {
+      "op": "expect_frame",
+      "client": "legacy_recipient",
+      "frame_ref": "frames/relay_to_client/message.json",
+      "required_fields": [
+        "msg_id",
+        "from",
+        "payload_b64",
+        "received_at",
+        "at"
+      ],
+      "field_equals": {
+        "msg_id": "$legacy_send_msg_id",
+        "from": "$sender.wayfarer_id",
+        "payload_b64": "$legacy_sent_payload"
+      },
+      "equal_fields": [
+        [
+          "at",
+          "received_at"
+        ]
+      ]
+    },
+    {
+      "op": "send",
+      "client": "sender",
+      "frame_ref": "frames/client_to_relay/send_invalid_payload.json",
+      "to_client": "legacy_recipient"
+    },
+    {
+      "op": "expect_frame",
+      "client": "sender",
+      "frame_ref": "frames/relay_to_client/error.json",
+      "field_equals": {
+        "msg_id": "invalid payload_b64"
+      },
+      "required_fields": [
+        "code",
+        "message",
+        "msg_id"
+      ]
+    }
+  ]
+}

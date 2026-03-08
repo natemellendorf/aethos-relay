@@ -138,3 +138,10 @@ func awaitRegistryState(t *testing.T, timeout time.Duration, state func() bool, 
 
 	t.Fatal(failureMessage)
 }
+
+func TestClientMessageDeliveryRecipientNilSafe(t *testing.T) {
+	var client *Client
+	if got := client.MessageDeliveryRecipient("msg-1"); got != "" {
+		t.Fatalf("expected empty recipient for nil client, got %q", got)
+	}
+}

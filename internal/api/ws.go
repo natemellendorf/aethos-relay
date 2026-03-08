@@ -14,6 +14,7 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
+	"github.com/natemellendorf/aethos-relay/internal/protocolcompat/clientv1"
 	"github.com/natemellendorf/aethos-relay/internal/store"
 	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
@@ -244,7 +245,7 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 
 	// Legacy clients omit device_id; in that case, keep the delivery identity at
 	// the existing wayfarer-only bucket for backward compatibility.
-	deliveryID := storeforward.DeliveryIdentity(frame.WayfarerID, frame.DeviceID)
+	deliveryID := clientv1.DeliveryIdentity(frame.WayfarerID, frame.DeviceID)
 
 	// Register client.
 	client.WayfarerID = frame.WayfarerID
@@ -261,16 +262,6 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 	if h.autoDeliverQueued {
 		go h.deliverQueuedMessages(client)
 	}
-}
-
-// relayReceivedAtUnix returns the client-facing receipt timestamp.
-// The relay currently stores CreatedAt as the ingestion timestamp for queued
-// client messages, and that value is what we expose as received_at.
-func relayReceivedAtUnix(msg *model.Message) int64 {
-	if msg == nil {
-		return 0
-	}
-	return msg.CreatedAt.Unix()
 }
 
 // handleSend handles the send frame.
@@ -315,16 +306,8 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		h.deliverToRecipient(msg)
 	}
 
-	// Send send_ok after durable persistence. Keep legacy `at` as alias of
-	// canonical `received_at` during compatibility window.
-	receivedAt := relayReceivedAtUnix(msg)
-	h.send(client, model.WSFrame{
-		Type:       model.FrameTypeSendOK,
-		MsgID:      msg.ID,
-		At:         receivedAt,
-		ReceivedAt: receivedAt,
-		ExpiresAt:  msg.ExpiresAt.Unix(),
-	})
+	// Send send_ok after durable persistence.
+	h.send(client, clientv1.EncodeSendOK(msg))
 
 	// Announce to federation peers (if federation is enabled)
 	if h.federationManager != nil {
@@ -333,9 +316,10 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 }
 
 // handleAck handles the ack frame.
-// `ack` marks the message delivered for the recipient identity associated with
-// this WebSocket connection. The client does not provide a recipient in the
-// `ack` frame; the server resolves it from connection identity.
+// `ack` marks the message delivered for a resolved recipient identity.
+// The client does not provide a recipient in the `ack` frame; the server uses
+// compat resolution (tracked recipient identity first, then connection
+// delivery identity fallback).
 func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
 		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
@@ -346,10 +330,7 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	recipientID := deliveryIdentityForClient(client)
-	if recipientID == "" {
-		recipientID = client.WayfarerID
-	}
+	recipientID := clientv1.ResolveAckRecipient(client, frame.MsgID)
 
 	transitioned, err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, recipientID)
 	if err != nil {
@@ -399,12 +380,8 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 		}
 		wireMessage := *m
 		wireMessage.Payload = model.EncodePayloadB64(decodedPayload, client.GetPayloadEncodingPref())
-		receivedAt := relayReceivedAtUnix(m)
 		client.TrackMessageDeliveryRecipient(wireMessage.ID, deliveryID)
-		msgs = append(msgs, model.WSPullMessage{
-			Message:    wireMessage,
-			ReceivedAt: receivedAt,
-		})
+		msgs = append(msgs, clientv1.EncodePullEntry(&wireMessage))
 	}
 
 	h.send(client, model.WSFrame{
@@ -446,15 +423,9 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 		}
 		log.Printf("ws: deliver msg_id=%s from=%s to=%s recipient_id=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, recipientID, remainingTTL)
 		r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
-		receivedAt := relayReceivedAtUnix(msg)
-		h.send(r, model.WSFrame{
-			Type:       model.FrameTypeMessage,
-			MsgID:      msg.ID,
-			From:       msg.From,
-			PayloadB64: payloadB64,
-			At:         receivedAt,
-			ReceivedAt: receivedAt,
-		})
+		wireMessage := *msg
+		wireMessage.Payload = payloadB64
+		h.send(r, clientv1.EncodePushMessage(&wireMessage))
 		if !h.engine.IsAckDrivenSuppression() {
 			alreadyDelivered, err := h.store.IsDeliveredTo(context.Background(), msg.ID, recipientID)
 			if err != nil {
@@ -522,11 +493,12 @@ func (h *WSHandler) sendError(client *model.Client, code model.ErrorCode, messag
 			message = string(code)
 		}
 	}
+	legacyShape := clientv1.EncodeError(message)
 
 	h.send(client, model.WSFrame{
-		Type:    model.FrameTypeError,
+		Type:    legacyShape.Type,
 		Code:    string(code),
 		Message: message,
-		MsgID:   message,
+		MsgID:   legacyShape.MsgID,
 	})
 }

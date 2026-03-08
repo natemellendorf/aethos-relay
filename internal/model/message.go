@@ -242,6 +242,20 @@ func (c *Client) ConsumeMessageDeliveryRecipient(msgID string) string {
 	return recipientID
 }
 
+// MessageDeliveryRecipient returns the tracked recipient identity for a
+// message without mutating tracking state.
+func (c *Client) MessageDeliveryRecipient(msgID string) string {
+	if c == nil || msgID == "" {
+		return ""
+	}
+	c.deliveryMu.Lock()
+	defer c.deliveryMu.Unlock()
+	if c.deliveryRecipientByMsgID == nil {
+		return ""
+	}
+	return c.deliveryRecipientByMsgID[msgID]
+}
+
 // ResetDeliveryTracking clears per-message recipient identity tracking.
 func (c *Client) ResetDeliveryTracking() {
 	c.deliveryMu.Lock()
