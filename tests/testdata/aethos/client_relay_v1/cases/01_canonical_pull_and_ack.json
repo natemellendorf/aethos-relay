@@ -1,5 +1,6 @@
 {
   "name": "canonical-pull-and-ack",
+  "expectation_mode": "canonical_v1",
   "description": "Canonical frame flow using vendored examples with queued pull and per-device ack.",
   "relay": {
     "ack_driven_suppression": false

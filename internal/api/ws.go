@@ -318,7 +318,8 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 // handleAck handles the ack frame.
 // `ack` marks the message delivered for a resolved recipient identity.
 // The client does not provide a recipient in the `ack` frame; the server uses
-// compat resolution (tracked recipient identity first, then wayfarer fallback).
+// compat resolution (tracked recipient identity first, then connection
+// delivery identity fallback).
 func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
 		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")

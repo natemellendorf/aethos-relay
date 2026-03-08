@@ -16,5 +16,9 @@ Fixture provenance:
   - toWayfarerId bytes: 0x00..0x1f
   - manifestId bytes: "manifest-fixed-0001"
   - body bytes: "hello-aethos"
-  - encoded bytes hex:
-    01010100000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f02000000136d616e69666573742d66697865642d30303031030000000c68656c6c6f2d616574686f73
+- encoded bytes hex:
+  01010100000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f02000000136d616e69666573742d66697865642d30303031030000000c68656c6c6f2d616574686f73
+
+Fixture expectation modes:
+- canonical_v1: aligned canonical-v1 expectations.
+- transitional_compat: explicit, known relay divergences from canonical-v1 that are intentionally retained during migration.

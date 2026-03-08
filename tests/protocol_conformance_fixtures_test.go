@@ -20,12 +20,19 @@ import (
 
 const conformanceFixtureRoot = "testdata/aethos/client_relay_v1"
 
+const (
+	fixtureExpectationCanonicalV1        = "canonical_v1"
+	fixtureExpectationTransitionalCompat = "transitional_compat"
+)
+
 type protocolFixtureCase struct {
-	Name        string                  `json:"name"`
-	Description string                  `json:"description"`
-	Relay       protocolFixtureRelay    `json:"relay"`
-	Clients     []protocolFixtureClient `json:"clients"`
-	Steps       []protocolFixtureStep   `json:"steps"`
+	Name             string                  `json:"name"`
+	Description      string                  `json:"description"`
+	ExpectationMode  string                  `json:"expectation_mode"`
+	KnownDivergences []string                `json:"known_divergences,omitempty"`
+	Relay            protocolFixtureRelay    `json:"relay"`
+	Clients          []protocolFixtureClient `json:"clients"`
+	Steps            []protocolFixtureStep   `json:"steps"`
 }
 
 type protocolFixtureRelay struct {
@@ -50,11 +57,13 @@ type protocolFixtureStep struct {
 	CapturePayloadVar    string            `json:"capture_payload_var,omitempty"`
 	Capture              map[string]string `json:"capture,omitempty"`
 	RequiredFields       []string          `json:"required_fields,omitempty"`
+	ForbiddenFields      []string          `json:"forbidden_fields,omitempty"`
 	FieldEquals          map[string]string `json:"field_equals,omitempty"`
 	EqualFields          [][2]string       `json:"equal_fields,omitempty"`
 	Count                int               `json:"count,omitempty"`
 	MessageIndex         int               `json:"message_index,omitempty"`
 	MessageRequired      []string          `json:"message_required_fields,omitempty"`
+	MessageForbidden     []string          `json:"message_forbidden_fields,omitempty"`
 	MessageFieldEquals   map[string]string `json:"message_field_equals,omitempty"`
 	MessageEqualFields   [][2]string       `json:"message_equal_fields,omitempty"`
 	MessagePayloadEquals string            `json:"message_payload_equals,omitempty"`
@@ -75,7 +84,7 @@ func TestProtocolConformanceFixtures(t *testing.T) {
 	casePaths := mustListProtocolFixtureCases(t)
 	for _, casePath := range casePaths {
 		fixtureCase := mustLoadProtocolFixtureCase(t, casePath)
-		t.Run(fixtureCase.Name, func(t *testing.T) {
+		t.Run(fixtureCase.ExpectationMode+"/"+fixtureCase.Name, func(t *testing.T) {
 			runner := newProtocolFixtureRunner(t, fixtureCase)
 			defer runner.closeAll()
 			runner.runSteps(fixtureCase.Steps)
@@ -180,6 +189,7 @@ func (r *protocolFixtureRunner) expectFrame(step protocolFixtureStep) {
 	}
 
 	r.requireFields(actual, step.RequiredFields)
+	r.forbidFields(actual, step.ForbiddenFields)
 	r.applyFieldEquals(actual, step.FieldEquals)
 	r.applyEqualPairs(actual, step.EqualFields)
 	r.captureFields(actual, step.Capture)
@@ -225,10 +235,20 @@ func (r *protocolFixtureRunner) expectMessages(step protocolFixtureStep) {
 	}
 
 	r.requireFields(message, step.MessageRequired)
+	r.forbidFields(message, step.MessageForbidden)
 	r.applyFieldEquals(message, step.MessageFieldEquals)
 	r.applyEqualPairs(message, step.MessageEqualFields)
 	r.assertMessagePayloadEquals(message, step.MessagePayloadEquals)
 	r.captureFields(message, step.Capture)
+}
+
+func (r *protocolFixtureRunner) forbidFields(frame map[string]any, forbidden []string) {
+	r.t.Helper()
+	for _, field := range forbidden {
+		if _, ok := frame[field]; ok {
+			r.t.Fatalf("forbidden field present: %q", field)
+		}
+	}
 }
 
 func (r *protocolFixtureRunner) assertMessagePayloadEquals(message map[string]any, expectedToken string) {
@@ -525,6 +545,18 @@ func mustLoadProtocolFixtureCase(t *testing.T, relativePath string) protocolFixt
 	}
 	if fixtureCase.Name == "" {
 		t.Fatalf("fixture case %q missing name", path)
+	}
+	switch fixtureCase.ExpectationMode {
+	case fixtureExpectationCanonicalV1:
+		if len(fixtureCase.KnownDivergences) != 0 {
+			t.Fatalf("fixture case %q canonical_v1 must not declare known_divergences", path)
+		}
+	case fixtureExpectationTransitionalCompat:
+		if len(fixtureCase.KnownDivergences) == 0 {
+			t.Fatalf("fixture case %q transitional_compat must declare known_divergences", path)
+		}
+	default:
+		t.Fatalf("fixture case %q has unsupported expectation_mode %q", path, fixtureCase.ExpectationMode)
 	}
 	if len(fixtureCase.Steps) == 0 {
 		t.Fatalf("fixture case %q has no steps", path)

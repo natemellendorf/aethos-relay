@@ -68,7 +68,8 @@ func EncodeError(errText string) model.WSFrame {
 }
 
 // ResolveAckRecipient resolves ack recipient identity using tracked delivery
-// identity first, with legacy wayfarer fallback.
+// identity first, then falling back to the connection delivery identity.
+// This preserves pre-compat-refactor handleAck behavior.
 func ResolveAckRecipient(c *model.Client, msgID string) string {
 	if c == nil {
 		return ""
@@ -76,6 +77,10 @@ func ResolveAckRecipient(c *model.Client, msgID string) string {
 
 	if recipientID := c.MessageDeliveryRecipient(msgID); recipientID != "" {
 		return recipientID
+	}
+
+	if c.DeliveryID != "" {
+		return c.DeliveryID
 	}
 
 	return c.WayfarerID

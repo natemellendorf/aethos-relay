@@ -245,7 +245,7 @@ func (c *Client) ConsumeMessageDeliveryRecipient(msgID string) string {
 // MessageDeliveryRecipient returns the tracked recipient identity for a
 // message without mutating tracking state.
 func (c *Client) MessageDeliveryRecipient(msgID string) string {
-	if msgID == "" {
+	if c == nil || msgID == "" {
 		return ""
 	}
 	c.deliveryMu.Lock()

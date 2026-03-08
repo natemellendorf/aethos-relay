@@ -71,12 +71,20 @@ This document audits current `aethos-relay` runtime behavior against canonical s
 - Fixture-driven black-box conformance tests were added at:
   - `tests/protocol_conformance_fixtures_test.go`
   - `tests/testdata/aethos/client_relay_v1/**` (vendored canonical frame/payload fixtures with provenance in `SOURCE.txt`)
-  - Coverage includes canonical fixture frame flow (`hello`/`send`/`pull`/`ack`) and transitional compatibility behavior checks.
+  - Coverage is split by fixture `expectation_mode`:
+    - `canonical_v1`: aligned canonical-v1 expectations
+    - `transitional_compat`: explicit assertions for known divergences
+  - Fixtures were derived from Markdown spec examples (upstream has no machine-readable fixture bundle at the captured ref).
+  - Transitional fixture assertions explicitly pin known divergences instead of rewriting canonical expectations, including:
+    1. `hello_ok` omitting canonical `relay_id`
+    2. `error` retaining legacy `msg_id` alias alongside canonical `code`/`message`
+    3. acceptance of legacy padded base64 `payload_b64` (not strict base64url-only)
+    4. ack recipient fallback preserving pre-refactor behavior: tracked recipient -> connection delivery identity (`DeliveryID`) -> wayfarer fallback
 - Remaining temporary compatibility behaviors still intentionally supported:
   1. `hello.device_id` optional for legacy clients (fallback to wayfarer-only delivery identity)
   2. dual timestamp aliasing (`at` with canonical `received_at`)
   3. legacy error shape alias (`error.msg_id` mirrors canonical `error.message`)
-  4. ack recipient fallback to legacy wayfarer identity when no tracked delivery identity exists
+  4. ack recipient fallback to connection delivery identity when no tracked delivery identity exists; then to wayfarer when delivery identity is empty
 
 ## Implementation Notes (non-protocol constraints)
 
