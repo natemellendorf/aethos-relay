@@ -15,6 +15,15 @@ This relay implementation targets the canonical protocol specifications defined 
 
 This is a non-exhaustive list of currently identified spec-to-implementation deltas.
 
+- Client-relay canonicalization is now strict for legacy cleanup items:
+  - `hello` requires `device_id`.
+  - `hello_ok` includes `relay_id`.
+  - `send_ok`/`message` no longer emit legacy `at` alias.
+  - `messages[]` entries are canonical-only: `msg_id`, `from`, `payload_b64`, `received_at`.
+  - `payload_b64` on client `send` is strict RFC4648 base64url unpadded (no whitespace, no padding); relay emits base64url-raw outbound.
+  - `error` frames emit canonical fields only: `type`, `code`, `message`.
+  - Client `ack` is bound to `(wayfarer_id, device_id)` from the authenticated connection.
+  - Client delivery suppression defaults to canonical ack-driven semantics.
 - `relay_forward` canonical frame shape is `{"type":"relay_forward","envelope":{...}}` in [FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md), while current relay code uses `RelayForwardFrame` with `json:"message"` (`internal/model/message.go`) and corresponding marshal/unmarshal paths in `internal/federation/peering.go`.
 - `relay_hello` canonical field is `protocol_version` integer (v1 spec), while current relay code sends/accepts string `version` via `RelayHelloFrame` (`internal/model/message.go`) and `ProtocolVersion = "1.0"` (`internal/federation/peering.go`).
 - `relay_ack` canonical statuses are `accepted|rejected` (with optional `code`/`message`), while current relay code handles `accepted|duplicate|expired` in `handleRelayAck` (`internal/federation/peering.go`).

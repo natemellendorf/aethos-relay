@@ -14,7 +14,6 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
-	"github.com/natemellendorf/aethos-relay/internal/protocolcompat/clientv1"
 	"github.com/natemellendorf/aethos-relay/internal/store"
 	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
@@ -70,6 +69,7 @@ type WSHandler struct {
 	store             store.Store
 	engine            *storeforward.Engine
 	clients           *model.ClientRegistry
+	relayID           string
 	maxTTL            time.Duration
 	originChecker     *OriginChecker
 	federationManager *federation.PeerManager
@@ -79,24 +79,27 @@ type WSHandler struct {
 // NewWSHandler creates a new WebSocket handler.
 // allowedOrigins is a comma-separated list of allowed origins.
 // devMode enables relaxed origin checking for local development.
-func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, allowedOrigins string, devMode bool) *WSHandler {
+func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, allowedOrigins string, devMode bool, relayID string) *WSHandler {
 	originChecker := NewOriginChecker(allowedOrigins, devMode)
+	engine := storeforward.New(store, maxTTL)
+	engine.SetAckDrivenSuppression(true)
 	return &WSHandler{
 		store:             store,
-		engine:            storeforward.New(store, maxTTL),
+		engine:            engine,
 		clients:           clients,
+		relayID:           relayID,
 		maxTTL:            maxTTL,
 		originChecker:     originChecker,
 		autoDeliverQueued: true,
 	}
 }
 
-// SetAckDrivenSuppression enables canonical ack-driven suppression semantics.
-// When disabled, relay keeps legacy mark-on-push suppression behavior.
+// SetAckDrivenSuppression keeps canonical ack-driven suppression enabled.
 func (h *WSHandler) SetAckDrivenSuppression(enabled bool) {
-	h.engine.SetAckDrivenSuppression(enabled)
+	_ = enabled
+	h.engine.SetAckDrivenSuppression(true)
 	if h.federationManager != nil {
-		h.federationManager.SetAckDrivenSuppression(enabled)
+		h.federationManager.SetAckDrivenSuppression(true)
 	}
 }
 
@@ -104,7 +107,7 @@ func (h *WSHandler) SetAckDrivenSuppression(enabled bool) {
 func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
 	h.federationManager = mgr
 	if h.federationManager != nil {
-		h.federationManager.SetAckDrivenSuppression(h.engine.IsAckDrivenSuppression())
+		h.federationManager.SetAckDrivenSuppression(true)
 	}
 }
 
@@ -146,8 +149,6 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Send:       make(chan []byte, 256),
 		WayfarerID: "",
 	}
-	client.SetPayloadEncodingPref(model.PayloadEncodingPrefBase64)
-
 	// Start writer goroutine
 	go h.writePump(client)
 
@@ -230,10 +231,13 @@ func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
 }
 
 func deliveryIdentityForClient(client *model.Client) string {
-	if client.DeliveryID != "" {
-		return client.DeliveryID
+	if client == nil {
+		return ""
 	}
-	return client.WayfarerID
+	if client.WayfarerID == "" || client.DeviceID == "" {
+		return ""
+	}
+	return storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
 }
 
 // handleHello handles the hello frame.
@@ -242,21 +246,22 @@ func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
 		h.sendError(client, model.ErrorCodeInvalidWayfarerID, "wayfarer_id required")
 		return
 	}
+	if frame.DeviceID == "" {
+		h.sendError(client, model.ErrorCodeInvalidPayload, "device_id required")
+		return
+	}
 
-	// Legacy clients omit device_id; in that case, keep the delivery identity at
-	// the existing wayfarer-only bucket for backward compatibility.
-	deliveryID := clientv1.DeliveryIdentity(frame.WayfarerID, frame.DeviceID)
+	deliveryID := storeforward.DeliveryIdentity(frame.WayfarerID, frame.DeviceID)
 
 	// Register client.
 	client.WayfarerID = frame.WayfarerID
 	client.DeviceID = frame.DeviceID
 	client.DeliveryID = deliveryID
-	client.ResetDeliveryTracking()
 	client.ID = uuid.New().String()
 	h.clients.Register(client)
 
 	// Send hello_ok
-	h.send(client, model.WSFrame{Type: model.FrameTypeHelloOK})
+	h.send(client, model.WSFrame{Type: model.FrameTypeHelloOK, RelayID: h.relayID})
 
 	// Deliver any queued messages
 	if h.autoDeliverQueued {
@@ -279,16 +284,13 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	normalizedPayloadB64 := model.NormalizePayloadB64(frame.PayloadB64)
-	if _, err := model.DecodePayloadB64(normalizedPayloadB64); err != nil {
+	if _, err := model.DecodePayloadB64(frame.PayloadB64); err != nil {
 		log.Printf("ws: rejecting send from=%s to=%s: invalid payload_b64: %v", client.WayfarerID, frame.To, err)
 		h.sendError(client, model.ErrorCodeInvalidPayload, "invalid payload_b64")
 		return
 	}
 
-	client.SetPayloadEncodingPref(model.DetectPayloadB64EncodingPref(normalizedPayloadB64))
-
-	msg, ttl := h.engine.AcceptClientSend(client.WayfarerID, frame.To, normalizedPayloadB64, frame.TTLSeconds)
+	msg, ttl := h.engine.AcceptClientSend(client.WayfarerID, frame.To, frame.PayloadB64, frame.TTLSeconds)
 
 	// Check if recipient is online
 	online := h.clients.IsOnline(frame.To)
@@ -307,7 +309,12 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 	}
 
 	// Send send_ok after durable persistence.
-	h.send(client, clientv1.EncodeSendOK(msg))
+	h.send(client, model.WSFrame{
+		Type:       model.FrameTypeSendOK,
+		MsgID:      msg.ID,
+		ReceivedAt: msg.CreatedAt.Unix(),
+		ExpiresAt:  msg.ExpiresAt.Unix(),
+	})
 
 	// Announce to federation peers (if federation is enabled)
 	if h.federationManager != nil {
@@ -316,12 +323,13 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 }
 
 // handleAck handles the ack frame.
-// `ack` marks the message delivered for a resolved recipient identity.
-// The client does not provide a recipient in the `ack` frame; the server uses
-// compat resolution (tracked recipient identity first, then connection
-// delivery identity fallback).
+// `ack` marks the message delivered for this connection's delivery identity.
 func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 	if client.WayfarerID == "" {
+		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
+		return
+	}
+	if client.DeviceID == "" {
 		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
 		return
 	}
@@ -330,7 +338,11 @@ func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
 		return
 	}
 
-	recipientID := clientv1.ResolveAckRecipient(client, frame.MsgID)
+	recipientID := deliveryIdentityForClient(client)
+	if recipientID == "" {
+		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
+		return
+	}
 
 	transitioned, err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, recipientID)
 	if err != nil {
@@ -378,10 +390,12 @@ func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
 			h.dropCorruptMessage(m.ID, deliveryID, "pull", err)
 			continue
 		}
-		wireMessage := *m
-		wireMessage.Payload = model.EncodePayloadB64(decodedPayload, client.GetPayloadEncodingPref())
-		client.TrackMessageDeliveryRecipient(wireMessage.ID, deliveryID)
-		msgs = append(msgs, clientv1.EncodePullEntry(&wireMessage))
+		msgs = append(msgs, model.WSPullMessage{
+			MsgID:      m.ID,
+			From:       m.From,
+			PayloadB64: model.EncodePayloadB64(decodedPayload, client.GetPayloadEncodingPref()),
+			ReceivedAt: m.CreatedAt.Unix(),
+		})
 	}
 
 	h.send(client, model.WSFrame{
@@ -416,36 +430,22 @@ func (h *WSHandler) deliverToRecipient(msg *model.Message) {
 	recipients := h.clients.GetClients(msg.To)
 	for _, r := range recipients {
 		recipientID := deliveryIdentityForClient(r)
+		if recipientID == "" {
+			continue
+		}
 		payloadB64 := model.EncodePayloadB64(decodedPayload, r.GetPayloadEncodingPref())
 		remainingTTL := int(time.Until(msg.ExpiresAt).Seconds())
 		if remainingTTL < 0 {
 			remainingTTL = 0
 		}
 		log.Printf("ws: deliver msg_id=%s from=%s to=%s recipient_id=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, recipientID, remainingTTL)
-		r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
-		wireMessage := *msg
-		wireMessage.Payload = payloadB64
-		h.send(r, clientv1.EncodePushMessage(&wireMessage))
-		if !h.engine.IsAckDrivenSuppression() {
-			alreadyDelivered, err := h.store.IsDeliveredTo(context.Background(), msg.ID, recipientID)
-			if err != nil {
-				metrics.IncrementStoreErrors()
-				log.Printf("ws: failed to check prior delivery state: %v", err)
-				continue
-			}
-			if alreadyDelivered {
-				continue
-			}
-
-			// Legacy suppression path: mark on push so reconnect/pull flows continue
-			// to suppress as before until canonical mode is enabled.
-			if err := h.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
-				metrics.IncrementStoreErrors()
-				log.Printf("ws: failed to mark delivered: %v", err)
-				continue
-			}
-			metrics.IncrementDelivered()
-		}
+		h.send(r, model.WSFrame{
+			Type:       model.FrameTypeMessage,
+			MsgID:      msg.ID,
+			From:       msg.From,
+			PayloadB64: payloadB64,
+			ReceivedAt: msg.CreatedAt.Unix(),
+		})
 	}
 }
 
@@ -480,8 +480,7 @@ func (h *WSHandler) send(client *model.Client, frame model.WSFrame) {
 	}
 }
 
-// sendError sends canonical error fields (code/message) and temporarily mirrors
-// message into legacy msg_id for backward compatibility during migration.
+// sendError sends canonical error fields (code/message).
 func (h *WSHandler) sendError(client *model.Client, code model.ErrorCode, message string) {
 	if code == "" {
 		code = model.ErrorCodeInternalError
@@ -493,12 +492,9 @@ func (h *WSHandler) sendError(client *model.Client, code model.ErrorCode, messag
 			message = string(code)
 		}
 	}
-	legacyShape := clientv1.EncodeError(message)
-
 	h.send(client, model.WSFrame{
-		Type:    legacyShape.Type,
+		Type:    model.FrameTypeError,
 		Code:    string(code),
 		Message: message,
-		MsgID:   legacyShape.MsgID,
 	})
 }

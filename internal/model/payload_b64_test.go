@@ -19,24 +19,24 @@ func TestDecodePayloadB64_ToleratesLegacyAndCanonicalEncodings(t *testing.T) {
 			expect: []byte{0xfb, 0xff},
 		},
 		{
-			name:   "base64url padded",
-			input:  "-_8=",
-			expect: []byte{0xfb, 0xff},
+			name:    "base64url padded rejected",
+			input:   "-_8=",
+			wantErr: true,
 		},
 		{
-			name:   "base64 padded",
-			input:  "+/8=",
-			expect: []byte{0xfb, 0xff},
+			name:    "base64 padded rejected",
+			input:   "+/8=",
+			wantErr: true,
 		},
 		{
-			name:   "base64 unpadded",
-			input:  "+/8",
-			expect: []byte{0xfb, 0xff},
+			name:    "base64 unpadded rejected",
+			input:   "+/8",
+			wantErr: true,
 		},
 		{
-			name:   "trims ascii whitespace",
-			input:  " \n\t+/8=\r ",
-			expect: []byte{0xfb, 0xff},
+			name:    "whitespace rejected",
+			input:   " \n\t-_8\r ",
+			wantErr: true,
 		},
 		{
 			name:    "invalid rejects",
@@ -65,26 +65,11 @@ func TestDecodePayloadB64_ToleratesLegacyAndCanonicalEncodings(t *testing.T) {
 }
 
 func TestDetectPayloadB64EncodingPref(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  PayloadEncodingPref
-	}{
-		{name: "dash implies url", input: "abc-def", want: PayloadEncodingPrefBase64URL},
-		{name: "underscore implies url", input: "abc_def", want: PayloadEncodingPrefBase64URL},
-		{name: "plus implies std", input: "abc+def", want: PayloadEncodingPrefBase64},
-		{name: "slash implies std", input: "abc/def", want: PayloadEncodingPrefBase64},
-		{name: "padding implies std", input: "YWJjZA==", want: PayloadEncodingPrefBase64},
-		{name: "unpadded len mod 4 implies url", input: "YWJjZA", want: PayloadEncodingPrefBase64URL},
-		{name: "ambiguous defaults std", input: "YWJjZA0K", want: PayloadEncodingPrefBase64},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := DetectPayloadB64EncodingPref(tt.input); got != tt.want {
-				t.Fatalf("preference mismatch: got %v want %v", got, tt.want)
-			}
-		})
+	inputs := []string{"abc-def", "abc_def", "abc+def", "abc/def", "YWJjZA==", "YWJjZA", "YWJjZA0K"}
+	for _, input := range inputs {
+		if got := DetectPayloadB64EncodingPref(input); got != PayloadEncodingPrefBase64URL {
+			t.Fatalf("preference mismatch for %q: got %v want %v", input, got, PayloadEncodingPrefBase64URL)
+		}
 	}
 }
 
@@ -94,8 +79,8 @@ func TestEncodePayloadB64_RespectsPreference(t *testing.T) {
 	if got := EncodePayloadB64(payload, PayloadEncodingPrefBase64URL); got != "-_8" {
 		t.Fatalf("base64url encode mismatch: got %q want %q", got, "-_8")
 	}
-	if got := EncodePayloadB64(payload, PayloadEncodingPrefBase64); got != "+/8=" {
-		t.Fatalf("base64 encode mismatch: got %q want %q", got, "+/8=")
+	if got := EncodePayloadB64(payload, PayloadEncodingPrefBase64); got != "-_8" {
+		t.Fatalf("base64 encode should canonicalize to base64url: got %q want %q", got, "-_8")
 	}
 }
 

@@ -53,12 +53,13 @@ func main() {
 func helloCmd(conn *websocket.Conn, args []string) {
 	fs := flag.NewFlagSet("hello", flag.ExitOnError)
 	wayfarerID := fs.String("wayfarer-id", "", "wayfarer identifier")
+	deviceID := fs.String("device-id", "", "device identifier")
 	_ = fs.Parse(args)
-	if *wayfarerID == "" {
-		log.Fatal("--wayfarer-id is required")
+	if *wayfarerID == "" || *deviceID == "" {
+		log.Fatal("--wayfarer-id and --device-id are required")
 	}
 
-	frame := model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID}
+	frame := model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID, DeviceID: *deviceID}
 	writeFrame(conn, frame)
 	resp := readFrame(conn)
 	printJSON(map[string]any{"request": frame, "response": resp})
@@ -67,16 +68,17 @@ func helloCmd(conn *websocket.Conn, args []string) {
 func sendCmd(conn *websocket.Conn, args []string) {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	wayfarerID := fs.String("wayfarer-id", "", "sender wayfarer identifier")
+	deviceID := fs.String("device-id", "", "sender device identifier")
 	to := fs.String("to", "", "recipient wayfarer identifier")
 	payloadFile := fs.String("payload-file", "", "path to raw payload bytes")
 	ttl := fs.Int("ttl", 0, "ttl in seconds")
 	_ = fs.Parse(args)
 
-	if *wayfarerID == "" || *to == "" || *payloadFile == "" {
-		log.Fatal("--wayfarer-id, --to, and --payload-file are required")
+	if *wayfarerID == "" || *deviceID == "" || *to == "" || *payloadFile == "" {
+		log.Fatal("--wayfarer-id, --device-id, --to, and --payload-file are required")
 	}
 
-	hello := model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID}
+	hello := model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID, DeviceID: *deviceID}
 	writeFrame(conn, hello)
 	_ = readFrame(conn)
 
@@ -85,7 +87,7 @@ func sendCmd(conn *websocket.Conn, args []string) {
 		log.Fatalf("read payload file: %v", err)
 	}
 
-	frame := model.WSFrame{Type: model.FrameTypeSend, To: *to, TTLSeconds: *ttl, PayloadB64: base64.StdEncoding.EncodeToString(payload)}
+	frame := model.WSFrame{Type: model.FrameTypeSend, To: *to, TTLSeconds: *ttl, PayloadB64: base64.RawURLEncoding.EncodeToString(payload)}
 	writeFrame(conn, frame)
 	resp := readFrame(conn)
 	printJSON(map[string]any{"request": frame, "response": resp})
@@ -94,14 +96,15 @@ func sendCmd(conn *websocket.Conn, args []string) {
 func pullCmd(conn *websocket.Conn, args []string) {
 	fs := flag.NewFlagSet("pull", flag.ExitOnError)
 	wayfarerID := fs.String("wayfarer-id", "", "wayfarer identifier")
+	deviceID := fs.String("device-id", "", "device identifier")
 	limit := fs.Int("limit", 50, "maximum messages")
 	outDir := fs.String("out-dir", "", "optional directory to write decoded payloads")
 	_ = fs.Parse(args)
-	if *wayfarerID == "" {
-		log.Fatal("--wayfarer-id is required")
+	if *wayfarerID == "" || *deviceID == "" {
+		log.Fatal("--wayfarer-id and --device-id are required")
 	}
 
-	writeFrame(conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID})
+	writeFrame(conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID, DeviceID: *deviceID})
 	_ = readFrame(conn)
 
 	frame := model.WSFrame{Type: model.FrameTypePull, Limit: *limit}
@@ -114,13 +117,13 @@ func pullCmd(conn *websocket.Conn, args []string) {
 
 	decoded := make([]map[string]any, 0, len(resp.Messages))
 	for _, msg := range resp.Messages {
-		raw, err := base64.StdEncoding.DecodeString(msg.Payload)
+		raw, err := model.DecodePayloadB64(msg.PayloadB64)
 		if err != nil {
-			log.Fatalf("decode payload for msg %s: %v", msg.ID, err)
+			log.Fatalf("decode payload for msg %s: %v", msg.MsgID, err)
 		}
-		entry := map[string]any{"msg_id": msg.ID, "from": msg.From, "to": msg.To, "payload_len": len(raw), "payload_b64": msg.Payload}
+		entry := map[string]any{"msg_id": msg.MsgID, "from": msg.From, "payload_len": len(raw), "payload_b64": msg.PayloadB64}
 		if *outDir != "" {
-			path := fmt.Sprintf("%s/%s.bin", *outDir, msg.ID)
+			path := fmt.Sprintf("%s/%s.bin", *outDir, msg.MsgID)
 			if err := os.WriteFile(path, raw, 0o600); err != nil {
 				log.Fatalf("write decoded payload: %v", err)
 			}
@@ -135,13 +138,14 @@ func pullCmd(conn *websocket.Conn, args []string) {
 func ackCmd(conn *websocket.Conn, args []string) {
 	fs := flag.NewFlagSet("ack", flag.ExitOnError)
 	wayfarerID := fs.String("wayfarer-id", "", "wayfarer identifier")
+	deviceID := fs.String("device-id", "", "device identifier")
 	msgID := fs.String("msg-id", "", "message id")
 	_ = fs.Parse(args)
-	if *wayfarerID == "" || *msgID == "" {
-		log.Fatal("--wayfarer-id and --msg-id are required")
+	if *wayfarerID == "" || *deviceID == "" || *msgID == "" {
+		log.Fatal("--wayfarer-id, --device-id, and --msg-id are required")
 	}
 
-	writeFrame(conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID})
+	writeFrame(conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: *wayfarerID, DeviceID: *deviceID})
 	_ = readFrame(conn)
 
 	frame := model.WSFrame{Type: model.FrameTypeAck, MsgID: *msgID}
@@ -174,10 +178,10 @@ func printJSON(v any) {
 
 func usage() {
 	msg := errors.New("usage: relaylink <ws-url> <hello|send|pull|ack> [flags]\n" +
-		"hello --wayfarer-id <id>\n" +
-		"send --wayfarer-id <id> --to <wayfarer_id> --payload-file <path> --ttl <seconds>\n" +
-		"pull --wayfarer-id <id> --limit <N> [--out-dir <dir>]\n" +
-		"ack --wayfarer-id <id> --msg-id <uuid>")
+		"hello --wayfarer-id <id> --device-id <id>\n" +
+		"send --wayfarer-id <id> --device-id <id> --to <wayfarer_id> --payload-file <path> --ttl <seconds>\n" +
+		"pull --wayfarer-id <id> --device-id <id> --limit <N> [--out-dir <dir>]\n" +
+		"ack --wayfarer-id <id> --device-id <id> --msg-id <uuid>")
 	fmt.Fprintln(os.Stderr, msg)
 	os.Exit(2)
 }

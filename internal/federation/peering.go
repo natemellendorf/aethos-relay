@@ -2,7 +2,9 @@ package federation
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -642,8 +644,8 @@ func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestF
 			continue
 		}
 
-		normalizedPayload := model.NormalizePayloadB64(msg.Payload)
-		if _, err := model.DecodePayloadB64(normalizedPayload); err != nil {
+		normalizedPayload := strings.TrimSpace(msg.Payload)
+		if _, err := decodeFederationPayloadB64(normalizedPayload); err != nil {
 			pm.dropCorruptMessage(msg.ID, "relay_request", peerRelayID(peer), err)
 			continue
 		}
@@ -691,7 +693,7 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 	if msg == nil {
 		return
 	}
-	msg.Payload = model.NormalizePayloadB64(msg.Payload)
+	msg.Payload = strings.TrimSpace(msg.Payload)
 	if msg.ID == "" || msg.From == "" || msg.To == "" || msg.Payload == "" {
 		return
 	}
@@ -705,7 +707,7 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
 		return
 	}
-	if _, err := model.DecodePayloadB64(msg.Payload); err != nil {
+	if _, err := decodeFederationPayloadB64(msg.Payload); err != nil {
 		log.Printf("federation: rejecting relay_forward %s from %s: invalid payload_b64: %v", msg.ID, peerRelayID(peer), err)
 		return
 	}
@@ -828,7 +830,7 @@ func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
 
 // deliverMessage delivers a message to local recipients.
 func (pm *PeerManager) deliverMessage(msg *model.Message) {
-	decodedPayload, err := model.DecodePayloadB64(msg.Payload)
+	decodedPayload, err := decodeFederationPayloadB64(msg.Payload)
 	if err != nil {
 		pm.dropCorruptMessage(msg.ID, "deliver_local", msg.To, err)
 		return
@@ -847,12 +849,10 @@ func (pm *PeerManager) deliverMessage(msg *model.Message) {
 			MsgID:      msg.ID,
 			From:       msg.From,
 			PayloadB64: payloadB64,
-			At:         receivedAt,
 			ReceivedAt: receivedAt,
 		})
 		select {
 		case r.Send <- data:
-			r.TrackMessageDeliveryRecipient(msg.ID, recipientID)
 			if !pm.engine.IsAckDrivenSuppression() {
 				if err := pm.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
 					log.Printf("federation: failed to mark delivered for %s: %v", recipientID, err)
@@ -1078,8 +1078,8 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 		return
 	}
 
-	normalizedPayload := model.NormalizePayloadB64(msg.Payload)
-	if _, err := model.DecodePayloadB64(normalizedPayload); err != nil {
+	normalizedPayload := strings.TrimSpace(msg.Payload)
+	if _, err := decodeFederationPayloadB64(normalizedPayload); err != nil {
 		pm.dropCorruptMessage(msg.ID, "forward_to_peers", originRelayID, err)
 		return
 	}
@@ -1149,6 +1149,26 @@ func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) 
 			}
 		}
 	}
+}
+
+func decodeFederationPayloadB64(raw string) ([]byte, error) {
+	normalized := strings.TrimSpace(raw)
+	if normalized == "" {
+		return nil, fmt.Errorf("invalid payload_b64: empty payload")
+	}
+	if decoded, err := model.DecodePayloadB64(normalized); err == nil {
+		return decoded, nil
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(normalized); err == nil {
+		return decoded, nil
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(normalized); err == nil {
+		return decoded, nil
+	}
+	if decoded, err := base64.URLEncoding.DecodeString(normalized); err == nil {
+		return decoded, nil
+	}
+	return nil, fmt.Errorf("invalid payload_b64")
 }
 
 // GetHealthyPeers returns a list of healthy peer IDs.

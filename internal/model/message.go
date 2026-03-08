@@ -2,7 +2,6 @@ package model
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -37,6 +36,7 @@ type WSFrame struct {
 	Type       string          `json:"type"`
 	Code       string          `json:"code,omitempty"`
 	Message    string          `json:"message,omitempty"`
+	RelayID    string          `json:"relay_id,omitempty"`
 	WayfarerID string          `json:"wayfarer_id,omitempty"`
 	DeviceID   string          `json:"device_id,omitempty"`
 	From       string          `json:"from,omitempty"`
@@ -46,15 +46,16 @@ type WSFrame struct {
 	MsgID      string          `json:"msg_id,omitempty"`
 	Limit      int             `json:"limit,omitempty"`
 	Messages   []WSPullMessage `json:"messages,omitempty"`
-	At         int64           `json:"at,omitempty"`
 	ReceivedAt int64           `json:"received_at,omitempty"`
 	ExpiresAt  int64           `json:"expires_at,omitempty"`
 }
 
 // WSPullMessage represents a message entry in a `messages` pull response.
 type WSPullMessage struct {
-	Message
-	ReceivedAt int64 `json:"received_at"`
+	MsgID      string `json:"msg_id"`
+	From       string `json:"from"`
+	PayloadB64 string `json:"payload_b64"`
+	ReceivedAt int64  `json:"received_at"`
 }
 
 // Frame types (protocol v1)
@@ -179,88 +180,44 @@ type Client struct {
 		Close() error
 	}
 	Send chan []byte
-
-	payloadEncodingPref atomic.Uint32
-
-	deliveryMu               sync.Mutex
-	deliveryRecipientByMsgID map[string]string
 }
 
 // GetPayloadEncodingPref returns the connection's outbound payload encoding preference.
 func (c *Client) GetPayloadEncodingPref() PayloadEncodingPref {
-	if c == nil {
-		return PayloadEncodingPrefBase64
-	}
-	pref := PayloadEncodingPref(c.payloadEncodingPref.Load())
-	if pref == PayloadEncodingPrefBase64URL {
-		return pref
-	}
-	return PayloadEncodingPrefBase64
+	_ = c
+	return PayloadEncodingPrefBase64URL
 }
 
 // SetPayloadEncodingPref updates the connection's outbound payload encoding preference.
 func (c *Client) SetPayloadEncodingPref(pref PayloadEncodingPref) {
-	if c == nil {
-		return
-	}
-	if pref != PayloadEncodingPrefBase64URL {
-		pref = PayloadEncodingPrefBase64
-	}
-	c.payloadEncodingPref.Store(uint32(pref))
+	_ = c
+	_ = pref
 }
 
-// TrackMessageDeliveryRecipient records which recipient identity was used when
-// sending a specific message to this connection.
+// TrackMessageDeliveryRecipient is kept for compatibility and is a no-op.
 func (c *Client) TrackMessageDeliveryRecipient(msgID, recipientID string) {
-	if msgID == "" || recipientID == "" {
-		return
-	}
-	c.deliveryMu.Lock()
-	if c.deliveryRecipientByMsgID == nil {
-		c.deliveryRecipientByMsgID = make(map[string]string)
-	}
-	c.deliveryRecipientByMsgID[msgID] = recipientID
-	c.deliveryMu.Unlock()
+	_ = c
+	_ = msgID
+	_ = recipientID
 }
 
-// ConsumeMessageDeliveryRecipient returns and removes the tracked recipient
-// identity for a message.
+// ConsumeMessageDeliveryRecipient is kept for compatibility and always returns empty.
 func (c *Client) ConsumeMessageDeliveryRecipient(msgID string) string {
-	if msgID == "" {
-		return ""
-	}
-	c.deliveryMu.Lock()
-	defer c.deliveryMu.Unlock()
-	if c.deliveryRecipientByMsgID == nil {
-		return ""
-	}
-	recipientID, ok := c.deliveryRecipientByMsgID[msgID]
-	if !ok {
-		return ""
-	}
-	delete(c.deliveryRecipientByMsgID, msgID)
-	return recipientID
+	_ = c
+	_ = msgID
+	return ""
 }
 
-// MessageDeliveryRecipient returns the tracked recipient identity for a
-// message without mutating tracking state.
+// MessageDeliveryRecipient is kept for compatibility and always returns empty.
 func (c *Client) MessageDeliveryRecipient(msgID string) string {
-	if c == nil || msgID == "" {
-		return ""
-	}
-	c.deliveryMu.Lock()
-	defer c.deliveryMu.Unlock()
-	if c.deliveryRecipientByMsgID == nil {
-		return ""
-	}
-	return c.deliveryRecipientByMsgID[msgID]
+	_ = c
+	_ = msgID
+	return ""
 }
 
-// ResetDeliveryTracking clears per-message recipient identity tracking.
+// ResetDeliveryTracking is kept for compatibility and is a no-op.
 func (c *Client) ResetDeliveryTracking() {
-	c.deliveryMu.Lock()
-	c.deliveryRecipientByMsgID = make(map[string]string)
-	c.deliveryMu.Unlock()
+	_ = c
 }
 
 // ClientRegistry manages connected clients.

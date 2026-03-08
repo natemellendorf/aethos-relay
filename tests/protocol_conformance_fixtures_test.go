@@ -21,8 +21,7 @@ import (
 const conformanceFixtureRoot = "testdata/aethos/client_relay_v1"
 
 const (
-	fixtureExpectationCanonicalV1        = "canonical_v1"
-	fixtureExpectationTransitionalCompat = "transitional_compat"
+	fixtureExpectationCanonicalV1 = "canonical_v1"
 )
 
 type protocolFixtureCase struct {
@@ -74,6 +73,7 @@ type protocolFixtureStep struct {
 type protocolFixtureRunner struct {
 	t        *testing.T
 	relay    *relayHarness
+	relayID  string
 	wsURL    string
 	clients  map[string]protocolFixtureClient
 	conns    map[string]*websocket.Conn
@@ -105,6 +105,7 @@ func newProtocolFixtureRunner(t *testing.T, fixtureCase protocolFixtureCase) *pr
 	return &protocolFixtureRunner{
 		t:        t,
 		relay:    relay,
+		relayID:  relayID,
 		wsURL:    wsURL,
 		clients:  clients,
 		conns:    make(map[string]*websocket.Conn),
@@ -183,7 +184,7 @@ func (r *protocolFixtureRunner) expectFrame(step protocolFixtureStep) {
 		if !ok {
 			r.t.Fatalf("frame missing expected field %q", key)
 		}
-		if normalizeComparable(got) != normalizeComparable(want) {
+		if normalizeComparable(got) != normalizeComparable(r.resolveFixtureExpectedValue(want)) {
 			r.t.Fatalf("frame field mismatch for %q: got %v want %v", key, got, want)
 		}
 	}
@@ -206,7 +207,7 @@ func (r *protocolFixtureRunner) expectMessages(step protocolFixtureStep) {
 		if !ok {
 			r.t.Fatalf("messages frame missing expected field %q", key)
 		}
-		if normalizeComparable(got) != normalizeComparable(want) {
+		if normalizeComparable(got) != normalizeComparable(r.resolveFixtureExpectedValue(want)) {
 			r.t.Fatalf("messages frame field mismatch for %q: got %v want %v", key, got, want)
 		}
 	}
@@ -369,6 +370,9 @@ func (r *protocolFixtureRunner) resolveToken(token string) string {
 	if !strings.HasPrefix(token, "$") {
 		return token
 	}
+	if token == "$relay.relay_id" {
+		return r.relayID
+	}
 
 	key := strings.TrimPrefix(token, "$")
 	if captured, ok := r.captures[key]; ok {
@@ -395,6 +399,14 @@ func (r *protocolFixtureRunner) resolveToken(token string) string {
 
 	r.t.Fatalf("unknown token: %q", token)
 	return ""
+}
+
+func (r *protocolFixtureRunner) resolveFixtureExpectedValue(value any) any {
+	s, ok := value.(string)
+	if !ok || !strings.HasPrefix(s, "$") {
+		return value
+	}
+	return r.resolveTokenValue(s)
 }
 
 func (r *protocolFixtureRunner) mustCaptureString(variable string) string {
@@ -550,10 +562,6 @@ func mustLoadProtocolFixtureCase(t *testing.T, relativePath string) protocolFixt
 	case fixtureExpectationCanonicalV1:
 		if len(fixtureCase.KnownDivergences) != 0 {
 			t.Fatalf("fixture case %q canonical_v1 must not declare known_divergences", path)
-		}
-	case fixtureExpectationTransitionalCompat:
-		if len(fixtureCase.KnownDivergences) == 0 {
-			t.Fatalf("fixture case %q transitional_compat must declare known_divergences", path)
 		}
 	default:
 		t.Fatalf("fixture case %q has unsupported expectation_mode %q", path, fixtureCase.ExpectationMode)
