@@ -366,7 +366,7 @@ func TestHandlePullIsDeliveredToFailureMapsToInternalError(t *testing.T) {
 	assertErrorFrameCompat(t, resp, model.ErrorCodeInternalError, "failed to pull messages")
 }
 
-func TestHandleAckUsesConnectionDeliveryIdentityWithoutTracking(t *testing.T) {
+func TestHandleAckWithoutTrackingFallsBackToWayfarerIdentity(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	client := newClientForWSHandler()
 	client.WayfarerID = "wayfarer-b"
@@ -381,8 +381,8 @@ func TestHandleAckUsesConnectionDeliveryIdentityWithoutTracking(t *testing.T) {
 	if len(st.markDelivered) != 1 {
 		t.Fatalf("expected one ack delivery write, got %d", len(st.markDelivered))
 	}
-	if st.markDelivered[0].recipientID != client.DeliveryID {
-		t.Fatalf("ack should use connection delivery identity, got %q want %q", st.markDelivered[0].recipientID, client.DeliveryID)
+	if st.markDelivered[0].recipientID != client.WayfarerID {
+		t.Fatalf("ack should use wayfarer fallback identity, got %q want %q", st.markDelivered[0].recipientID, client.WayfarerID)
 	}
 }
 
@@ -446,8 +446,8 @@ func TestHandleAckCanonicalModeIsIdempotent(t *testing.T) {
 	if len(st.markDelivered) != 0 {
 		t.Fatalf("canonical mode should not write legacy delivery state on ack, got %v", st.markDelivered)
 	}
-	if !st.ackedByMsg["msg-idempotent"][client.DeliveryID] {
-		t.Fatalf("canonical mode should persist ack state for delivery identity %q", client.DeliveryID)
+	if !st.ackedByMsg["msg-idempotent"][client.WayfarerID] {
+		t.Fatalf("canonical mode should persist ack state for wayfarer fallback %q", client.WayfarerID)
 	}
 }
 
