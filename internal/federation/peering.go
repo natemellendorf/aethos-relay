@@ -707,10 +707,12 @@ func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardF
 		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
 		return
 	}
-	if _, err := decodeFederationPayloadB64(msg.Payload); err != nil {
+	decodedPayload, err := decodeFederationPayloadB64(msg.Payload)
+	if err != nil {
 		log.Printf("federation: rejecting relay_forward %s from %s: invalid payload_b64: %v", msg.ID, peerRelayID(peer), err)
 		return
 	}
+	msg.Payload = model.EncodePayloadB64(decodedPayload, model.PayloadEncodingPrefBase64URL)
 
 	peer.healthMu.Lock()
 	peer.Health.MessagesReceived++

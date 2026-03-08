@@ -663,7 +663,7 @@ func TestHandleRelayForward_RejectsInvalidPayloadB64(t *testing.T) {
 	}
 }
 
-func TestHandleRelayForward_NormalizesPayloadWhitespaceBeforePersist(t *testing.T) {
+func TestHandleRelayForward_CanonicalizesLegacyPayloadBeforePersist(t *testing.T) {
 	st := newMockStore()
 	clients := model.NewClientRegistry()
 	go clients.Run()
@@ -674,7 +674,7 @@ func TestHandleRelayForward_NormalizesPayloadWhitespaceBeforePersist(t *testing.
 		ID:        "normalized-relay-forward",
 		From:      "alice",
 		To:        "bob",
-		Payload:   " \n\t-_8\r ",
+		Payload:   " \n\tdGVzdA==\r ",
 		CreatedAt: now,
 		ExpiresAt: now.Add(time.Hour),
 	}
@@ -689,8 +689,11 @@ func TestHandleRelayForward_NormalizesPayloadWhitespaceBeforePersist(t *testing.
 	if err != nil {
 		t.Fatalf("expected message to be stored: %v", err)
 	}
-	if stored.Payload != "-_8" {
-		t.Fatalf("expected trimmed canonical payload, got %q", stored.Payload)
+	if stored.Payload != "dGVzdA" {
+		t.Fatalf("expected canonical base64url payload, got %q", stored.Payload)
+	}
+	if _, err := model.DecodePayloadB64(stored.Payload); err != nil {
+		t.Fatalf("expected persisted payload to pass strict decode: %v", err)
 	}
 }
 
