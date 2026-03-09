@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/natemellendorf/aethos/refs/heads/main/docs/img/banner.jpg" alt="Aethos banner" width="960">
+</p>
+
 # aethos-relay
 
 WebSocket relay server for Aethos with message queuing, TTL persistence, and relay federation.
