@@ -39,6 +39,7 @@ func (s *BBoltEnvelopeStore) Open() error {
 			model.BucketByDestination,
 			model.BucketByExpiry,
 			model.BucketSeen,
+			model.BucketRelayIngest,
 			model.BucketMeta,
 		}
 		for _, b := range buckets {
@@ -241,6 +242,84 @@ func (s *BBoltEnvelopeStore) IsSeenBy(ctx context.Context, envID string, relayID
 		return nil
 	})
 	return seen, err
+}
+
+// MarkSeenAndRelayIngestEmitted persists seen bookkeeping and ingest marker in one transaction.
+// Returns true only when ingest marker is newly created in this call.
+func (s *BBoltEnvelopeStore) MarkSeenAndRelayIngestEmitted(ctx context.Context, itemID string, relayIDs []string) (bool, error) {
+	if itemID == "" {
+		return false, fmt.Errorf("relay ingest item_id is required")
+	}
+
+	newlyMarked := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		seenBucket := tx.Bucket(model.BucketSeen)
+		for _, relayID := range relayIDs {
+			if relayID == "" {
+				continue
+			}
+			seenKey := model.SeenKey(itemID, relayID)
+			if err := seenBucket.Put(seenKey, []byte(time.Now().Format(time.RFC3339Nano))); err != nil {
+				return err
+			}
+		}
+
+		markerBucket := tx.Bucket(model.BucketRelayIngest)
+		markerKey := model.RelayIngestKey(itemID)
+		if markerBucket.Get(markerKey) != nil {
+			return nil
+		}
+		newlyMarked = true
+		return markerBucket.Put(markerKey, []byte(time.Now().Format(time.RFC3339Nano)))
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return newlyMarked, nil
+}
+
+// MarkRelayIngestEmitted marks RELAY_INGEST as durably emitted for item_id.
+// Returns true only when marker is newly created in this call.
+func (s *BBoltEnvelopeStore) MarkRelayIngestEmitted(ctx context.Context, itemID string) (bool, error) {
+	if itemID == "" {
+		return false, fmt.Errorf("relay ingest item_id is required")
+	}
+
+	newlyMarked := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(model.BucketRelayIngest)
+		markerKey := model.RelayIngestKey(itemID)
+		if bucket.Get(markerKey) != nil {
+			return nil
+		}
+		newlyMarked = true
+		return bucket.Put(markerKey, []byte(time.Now().Format(time.RFC3339Nano)))
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return newlyMarked, nil
+}
+
+// IsRelayIngestEmitted checks whether RELAY_INGEST marker exists for item_id.
+func (s *BBoltEnvelopeStore) IsRelayIngestEmitted(ctx context.Context, itemID string) (bool, error) {
+	if itemID == "" {
+		return false, fmt.Errorf("relay ingest item_id is required")
+	}
+
+	var emitted bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(model.BucketRelayIngest)
+		emitted = bucket.Get(model.RelayIngestKey(itemID)) != nil
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return emitted, nil
 }
 
 // GetAllDestinationIDs returns all unique destination IDs with envelopes.

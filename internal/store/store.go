@@ -90,6 +90,18 @@ type EnvelopeStore interface {
 	// IsSeenBy checks if an envelope has been seen by a specific relay.
 	IsSeenBy(ctx context.Context, envID string, relayID string) (bool, error)
 
+	// MarkRelayIngestEmitted marks RELAY_INGEST as durably emitted for item_id.
+	// Returns true when the marker is newly created.
+	MarkRelayIngestEmitted(ctx context.Context, itemID string) (bool, error)
+
+	// IsRelayIngestEmitted checks whether RELAY_INGEST marker exists for item_id.
+	IsRelayIngestEmitted(ctx context.Context, itemID string) (bool, error)
+
+	// MarkSeenAndRelayIngestEmitted persists seen bookkeeping and ingest marker
+	// in a single durable transaction when supported.
+	// Returns true when the ingest marker is newly created.
+	MarkSeenAndRelayIngestEmitted(ctx context.Context, itemID string, relayIDs []string) (bool, error)
+
 	// GetAllDestinationIDs returns all unique destination IDs with envelopes.
 	GetAllDestinationIDs(ctx context.Context) ([]string, error)
 

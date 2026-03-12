@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	GossipVersion    uint64 = 1
-	MaxFrameBytes           = 1 << 20 // 1 MiB
-	MaxWantItems     uint64 = 256
-	MaxTransferItems uint64 = 32
+	GossipVersion       uint64 = 1
+	MaxFrameBytes              = 1 << 20 // 1 MiB
+	MaxWantItems        uint64 = 256
+	MaxTransferItems    uint64 = 32
+	MaxRelayIngestItems int    = 256
 
 	FrameTypeHello       = "HELLO"
 	FrameTypeSummary     = "SUMMARY"
@@ -218,6 +219,9 @@ func ParseRelayIngestPayload(payload map[string]any) (RelayIngestPayload, error)
 	itemIDs, err := parseStringSlice(payload, "item_ids")
 	if err != nil {
 		return RelayIngestPayload{}, err
+	}
+	if len(itemIDs) > MaxRelayIngestItems {
+		return RelayIngestPayload{}, fmt.Errorf("gossipv1: relay_ingest item_ids exceeds limit: %d > %d", len(itemIDs), MaxRelayIngestItems)
 	}
 
 	return RelayIngestPayload{ItemIDs: itemIDs}, nil

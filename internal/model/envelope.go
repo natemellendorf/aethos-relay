@@ -12,6 +12,7 @@ var (
 	BucketByDestination = []byte("by_destination")
 	BucketByExpiry      = []byte("by_expiry")
 	BucketSeen          = []byte("seen")
+	BucketRelayIngest   = []byte("relay_ingest")
 	BucketMeta          = []byte("meta")
 	MetaLastSweep       = []byte("last_sweep")
 )
@@ -210,4 +211,9 @@ func SeenKey(envelopeID string, relayID string) []byte {
 	buf.WriteByte(0)
 	buf.WriteString(relayID)
 	return buf.Bytes()
+}
+
+// RelayIngestKey creates a key for relay_ingest marker bucket.
+func RelayIngestKey(itemID string) []byte {
+	return []byte(itemID)
 }

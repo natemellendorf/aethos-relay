@@ -2,6 +2,7 @@ package storeforward
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -28,12 +29,13 @@ type RelayIngestObserver func(context.Context, RelayIngestSignal)
 
 // Engine owns store-and-forward decisions shared by client and federation paths.
 type Engine struct {
-	store                store.Store
-	envelopeStore        store.EnvelopeStore
-	relayID              string
-	maxTTL               time.Duration
-	ackDrivenSuppression bool
-	relayIngestObserver  RelayIngestObserver
+	store                 store.Store
+	envelopeStore         store.EnvelopeStore
+	relayID               string
+	maxTTL                time.Duration
+	ackDrivenSuppression  bool
+	relayIngestObserverMu sync.RWMutex
+	relayIngestObserver   RelayIngestObserver
 
 	now func() time.Time
 }
@@ -66,14 +68,19 @@ func (e *Engine) ConfigureFederation(relayID string, envelopeStore store.Envelop
 
 // SetRelayIngestObserver configures an observer for durable relay ingest effects.
 func (e *Engine) SetRelayIngestObserver(observer RelayIngestObserver) {
+	e.relayIngestObserverMu.Lock()
+	defer e.relayIngestObserverMu.Unlock()
 	e.relayIngestObserver = observer
 }
 
 func (e *Engine) emitRelayIngest(ctx context.Context, signal RelayIngestSignal) {
-	if e.relayIngestObserver == nil {
+	e.relayIngestObserverMu.RLock()
+	observer := e.relayIngestObserver
+	e.relayIngestObserverMu.RUnlock()
+	if observer == nil {
 		return
 	}
-	e.relayIngestObserver(ctx, signal)
+	observer(ctx, signal)
 }
 
 func (e *Engine) setNowForTests(now func() time.Time) {

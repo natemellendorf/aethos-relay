@@ -98,7 +98,7 @@ func TestProcessEventsFatalTerminates(t *testing.T) {
 	}
 }
 
-func TestSessionAdapterIgnoresUnauthenticatedRelayIngest(t *testing.T) {
+func TestSessionAdapterReportsUntrustedUnauthenticatedRelayIngest(t *testing.T) {
 	adapter := gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-a"), false)
 
 	relayIngestFrame, err := gossipv1.EncodeEnvelope(gossipv1.FrameTypeRelayIngest, map[string]any{"item_ids": []string{"a"}})
@@ -119,6 +119,29 @@ func TestSessionAdapterIgnoresUnauthenticatedRelayIngest(t *testing.T) {
 	}
 	if adapter.UntrustedRelayIngestCount() != 1 {
 		t.Fatalf("expected unauth relay_ingest count 1, got %d", adapter.UntrustedRelayIngestCount())
+	}
+}
+
+func TestSessionAdapterRejectsRelayIngestAboveItemLimit(t *testing.T) {
+	adapter := gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-a"), true)
+
+	itemIDs := make([]string, gossipv1.MaxRelayIngestItems+1)
+	for i := range itemIDs {
+		itemIDs[i] = "item"
+	}
+
+	relayIngestFrame, err := gossipv1.EncodeEnvelope(gossipv1.FrameTypeRelayIngest, map[string]any{"item_ids": itemIDs})
+	if err != nil {
+		t.Fatalf("encode relay_ingest: %v", err)
+	}
+	prefixed, err := gossipv1.EncodeLengthPrefixed(relayIngestFrame)
+	if err != nil {
+		t.Fatalf("prefix relay_ingest: %v", err)
+	}
+
+	events := adapter.PushInbound(prefixed)
+	if len(events) != 1 || events[0].Type != gossipv1.EventTypeFatal {
+		t.Fatalf("expected fatal relay_ingest limit event, got %#v", events)
 	}
 }
 

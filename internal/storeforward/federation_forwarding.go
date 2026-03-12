@@ -3,6 +3,7 @@ package storeforward
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,6 +14,10 @@ var (
 	ErrForwardMessageInvalid  = errors.New("relay forward message invalid")
 	ErrForwardMessageTooLarge = errors.New("relay forward payload too large")
 )
+
+type relayIngestAtomicMarker interface {
+	MarkSeenAndRelayIngestEmitted(ctx context.Context, itemID string, relayIDs []string) (bool, error)
+}
 
 // RelayForwardStatus captures how an inbound forwarded payload was handled.
 type RelayForwardStatus string
@@ -46,26 +51,31 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 		return RelayForwardResult{Status: RelayForwardExpired}, nil
 	}
 
+	seenBySource := false
 	if e.envelopeStore != nil && sourceRelayID != "" {
 		seen, err := e.envelopeStore.IsSeenBy(ctx, msg.ID, sourceRelayID)
 		if err != nil {
 			return RelayForwardResult{}, err
 		}
-		if seen {
+		seenBySource = seen
+	}
+
+	messageAlreadyExists := false
+	existing, err := e.store.GetMessageByID(ctx, msg.ID)
+	switch {
+	case err == nil && existing != nil:
+		messageAlreadyExists = true
+	case err != nil && !isNotFoundErr(err):
+		return RelayForwardResult{}, err
+	}
+
+	if !messageAlreadyExists {
+		if seenBySource {
 			return RelayForwardResult{Status: RelayForwardSeenLoop}, nil
 		}
-	}
-
-	existing, err := e.store.GetMessageByID(ctx, msg.ID)
-	if err == nil && existing != nil {
-		return RelayForwardResult{Status: RelayForwardDuplicate}, nil
-	}
-	if err != nil && !isNotFoundErr(err) {
-		return RelayForwardResult{}, err
-	}
-
-	if err := e.store.PersistMessage(ctx, msg); err != nil {
-		return RelayForwardResult{}, err
+		if err := e.store.PersistMessage(ctx, msg); err != nil {
+			return RelayForwardResult{}, err
+		}
 	}
 
 	envelope, err := e.persistEnvelopeState(ctx, msg, sourceRelayID)
@@ -73,24 +83,48 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 		return RelayForwardResult{}, err
 	}
 
-	if sourceRelayID != "" && e.envelopeStore != nil {
-		if err := e.envelopeStore.MarkSeen(ctx, msg.ID, sourceRelayID); err != nil {
-			return RelayForwardResult{}, err
+	markerCreated := false
+	if e.envelopeStore != nil {
+		relayIDs := relayIngestSeenRelayIDs(sourceRelayID, e.relayID)
+		if atomicMarker, ok := e.envelopeStore.(relayIngestAtomicMarker); ok {
+			markerCreated, err = atomicMarker.MarkSeenAndRelayIngestEmitted(ctx, relayIngestItemID(msg), relayIDs)
+			if err != nil {
+				return RelayForwardResult{}, err
+			}
+		} else {
+			for _, relayID := range relayIDs {
+				if err := e.envelopeStore.MarkSeen(ctx, msg.ID, relayID); err != nil {
+					return RelayForwardResult{}, err
+				}
+			}
+
+			markerCreated, err = e.envelopeStore.MarkRelayIngestEmitted(ctx, relayIngestItemID(msg))
+			if err != nil {
+				return RelayForwardResult{}, err
+			}
 		}
+	} else if !messageAlreadyExists {
+		markerCreated = true
 	}
-	if e.relayID != "" && e.envelopeStore != nil {
-		if err := e.envelopeStore.MarkSeen(ctx, msg.ID, e.relayID); err != nil {
-			return RelayForwardResult{}, err
+
+	if markerCreated {
+		e.emitRelayIngest(ctx, RelayIngestSignal{
+			ItemID:      relayIngestItemID(msg),
+			Trusted:     isAuthenticatedRelayContext(sourceRelayID),
+			SourceRelay: sourceRelayID,
+		})
+	}
+
+	status := RelayForwardAccepted
+	if messageAlreadyExists {
+		if seenBySource {
+			status = RelayForwardSeenLoop
+		} else {
+			status = RelayForwardDuplicate
 		}
 	}
 
-	e.emitRelayIngest(ctx, RelayIngestSignal{
-		ItemID:      relayIngestItemID(msg),
-		Trusted:     isAuthenticatedRelayContext(sourceRelayID),
-		SourceRelay: sourceRelayID,
-	})
-
-	return RelayForwardResult{Status: RelayForwardAccepted, Envelope: envelope}, nil
+	return RelayForwardResult{Status: status, Envelope: envelope}, nil
 }
 
 // PrepareForwardingEnvelope increments local hop state for an outbound forward.
@@ -245,4 +279,21 @@ func isAuthenticatedRelayContext(sourceRelayID string) bool {
 	// trusted RELAY_INGEST producers. Today, a non-empty source relay ID is
 	// supplied only by validated federation sessions.
 	return sourceRelayID != ""
+}
+
+func relayIngestSeenRelayIDs(sourceRelayID string, localRelayID string) []string {
+	seen := make(map[string]struct{}, 2)
+	if sourceRelayID != "" {
+		seen[sourceRelayID] = struct{}{}
+	}
+	if localRelayID != "" {
+		seen[localRelayID] = struct{}{}
+	}
+
+	relayIDs := make([]string, 0, len(seen))
+	for relayID := range seen {
+		relayIDs = append(relayIDs, relayID)
+	}
+	sort.Strings(relayIDs)
+	return relayIDs
 }

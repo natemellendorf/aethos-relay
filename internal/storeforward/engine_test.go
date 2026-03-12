@@ -24,8 +24,25 @@ type ingestStoreSpy struct {
 	persistErr   error
 }
 
+type ingestEnvelopeStoreSpy struct {
+	envelopes             map[string]*model.Envelope
+	seenByEnvelopeRelay   map[string]map[string]bool
+	relayIngestEmitted    map[string]bool
+	failMarkSeenRemaining int
+	failMarkSeenErr       error
+	failAtomicMarkErr     error
+}
+
 func newIngestStoreSpy() *ingestStoreSpy {
 	return &ingestStoreSpy{messages: map[string]*model.Message{}}
+}
+
+func newIngestEnvelopeStoreSpy() *ingestEnvelopeStoreSpy {
+	return &ingestEnvelopeStoreSpy{
+		envelopes:           map[string]*model.Envelope{},
+		seenByEnvelopeRelay: map[string]map[string]bool{},
+		relayIngestEmitted:  map[string]bool{},
+	}
 }
 
 func (s *ingestStoreSpy) Open() error  { return nil }
@@ -94,6 +111,105 @@ func (s *ingestStoreSpy) GetAllRecipientIDs(ctx context.Context) ([]string, erro
 
 func (s *ingestStoreSpy) GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error) {
 	return nil, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) Open() error  { return nil }
+func (s *ingestEnvelopeStoreSpy) Close() error { return nil }
+
+func (s *ingestEnvelopeStoreSpy) PersistEnvelope(ctx context.Context, env *model.Envelope) error {
+	if env == nil {
+		return errors.New("nil envelope")
+	}
+	cp := *env
+	s.envelopes[env.ID] = &cp
+	return nil
+}
+
+func (s *ingestEnvelopeStoreSpy) GetEnvelopeByID(ctx context.Context, envID string) (*model.Envelope, error) {
+	env, ok := s.envelopes[envID]
+	if !ok {
+		return nil, errors.New("envelope not found")
+	}
+	cp := *env
+	return &cp, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) GetEnvelopesByDestination(ctx context.Context, destID string, limit int) ([]*model.Envelope, error) {
+	return nil, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) RemoveEnvelope(ctx context.Context, envID string) error {
+	delete(s.envelopes, envID)
+	delete(s.seenByEnvelopeRelay, envID)
+	return nil
+}
+
+func (s *ingestEnvelopeStoreSpy) GetExpiredEnvelopes(ctx context.Context, before time.Time) ([]*model.Envelope, error) {
+	return nil, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) MarkSeen(ctx context.Context, envID string, relayID string) error {
+	if s.failMarkSeenRemaining > 0 {
+		s.failMarkSeenRemaining--
+		if s.failMarkSeenErr != nil {
+			return s.failMarkSeenErr
+		}
+		return errors.New("mark seen failed")
+	}
+
+	if s.seenByEnvelopeRelay[envID] == nil {
+		s.seenByEnvelopeRelay[envID] = map[string]bool{}
+	}
+	s.seenByEnvelopeRelay[envID][relayID] = true
+	return nil
+}
+
+func (s *ingestEnvelopeStoreSpy) IsSeenBy(ctx context.Context, envID string, relayID string) (bool, error) {
+	if s.seenByEnvelopeRelay[envID] == nil {
+		return false, nil
+	}
+	return s.seenByEnvelopeRelay[envID][relayID], nil
+}
+
+func (s *ingestEnvelopeStoreSpy) MarkRelayIngestEmitted(ctx context.Context, itemID string) (bool, error) {
+	if itemID == "" {
+		return false, errors.New("item_id required")
+	}
+	if s.relayIngestEmitted[itemID] {
+		return false, nil
+	}
+	s.relayIngestEmitted[itemID] = true
+	return true, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) MarkSeenAndRelayIngestEmitted(ctx context.Context, itemID string, relayIDs []string) (bool, error) {
+	if s.failAtomicMarkErr != nil {
+		return false, s.failAtomicMarkErr
+	}
+
+	for _, relayID := range relayIDs {
+		if err := s.MarkSeen(ctx, itemID, relayID); err != nil {
+			return false, err
+		}
+	}
+
+	return s.MarkRelayIngestEmitted(ctx, itemID)
+}
+
+func (s *ingestEnvelopeStoreSpy) IsRelayIngestEmitted(ctx context.Context, itemID string) (bool, error) {
+	return s.relayIngestEmitted[itemID], nil
+}
+
+func (s *ingestEnvelopeStoreSpy) GetAllDestinationIDs(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) GetLastSweepTime(ctx context.Context) (time.Time, error) {
+	return time.Time{}, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) SetLastSweepTime(ctx context.Context, t time.Time) error {
+	return nil
 }
 
 func newEngineHarness(t *testing.T, maxTTL time.Duration) *engineHarness {
@@ -697,5 +813,63 @@ func TestRelayIngestTrustBoundaryRequiresAuthenticatedRelayContext(t *testing.T)
 	}
 	if !trustedFlags[1] {
 		t.Fatal("expected authenticated relay context to be trusted")
+	}
+}
+
+func TestRelayIngestRetriesCompleteDurableBoundaryAndEmitExactlyOnce(t *testing.T) {
+	messageStore := newIngestStoreSpy()
+	envelopeStore := newIngestEnvelopeStoreSpy()
+	envelopeStore.failMarkSeenRemaining = 1
+	envelopeStore.failMarkSeenErr = errors.New("injected mark_seen failure")
+
+	eng := New(messageStore, time.Hour)
+	eng.ConfigureFederation("relay-local", envelopeStore)
+
+	signalCount := 0
+	eng.SetRelayIngestObserver(func(_ context.Context, signal RelayIngestSignal) {
+		signalCount++
+		if signal.ItemID != "item-retry" {
+			t.Fatalf("unexpected item_id: %q", signal.ItemID)
+		}
+	})
+
+	msg := &model.Message{
+		ID:        "item-retry",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "QQ",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
+
+	if _, err := eng.AcceptRelayForward(context.Background(), "relay-source", msg, 1024); err == nil {
+		t.Fatal("expected first ingest to fail during durable boundary")
+	}
+	if signalCount != 0 {
+		t.Fatalf("expected no relay_ingest signal on partial failure, got %d", signalCount)
+	}
+	if emitted, _ := envelopeStore.IsRelayIngestEmitted(context.Background(), msg.ID); emitted {
+		t.Fatal("relay_ingest marker should not exist after partial failure")
+	}
+
+	retry, err := eng.AcceptRelayForward(context.Background(), "relay-source", msg, 1024)
+	if err != nil {
+		t.Fatalf("retry ingest unexpectedly failed: %v", err)
+	}
+	if retry.Status != RelayForwardDuplicate {
+		t.Fatalf("expected retry status duplicate after source-mark failure path, got %s", retry.Status)
+	}
+	if signalCount != 1 {
+		t.Fatalf("expected exactly one relay_ingest signal after successful retry, got %d", signalCount)
+	}
+	if emitted, _ := envelopeStore.IsRelayIngestEmitted(context.Background(), msg.ID); !emitted {
+		t.Fatal("relay_ingest marker should exist after retry success")
+	}
+
+	if _, err := eng.AcceptRelayForward(context.Background(), "relay-source", msg, 1024); err != nil {
+		t.Fatalf("idempotent post-retry ingest unexpectedly failed: %v", err)
+	}
+	if signalCount != 1 {
+		t.Fatalf("expected no duplicate relay_ingest signal after marker exists, got %d", signalCount)
 	}
 }
