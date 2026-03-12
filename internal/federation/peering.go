@@ -1,84 +1,50 @@
 package federation
 
 import (
-	"context"
-	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
-	"github.com/natemellendorf/aethos-relay/internal/metrics"
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
-	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
 const (
-	// ProtocolVersion is the federation protocol version.
-	ProtocolVersion = "1.0"
-
-	// HeartbeatInterval is how often to send ping to peers.
 	HeartbeatInterval = 30 * time.Second
 
-	// InventoryGossipInterval is how often to gossip inventory.
-	InventoryGossipInterval = 15 * time.Second
-
-	// ReconnectBaseDelay is the base delay for exponential backoff.
 	ReconnectBaseDelay = 1 * time.Second
+	ReconnectMaxDelay  = 60 * time.Second
 
-	// ReconnectMaxDelay is the maximum delay for exponential backoff.
-	ReconnectMaxDelay = 60 * time.Second
-
-	// MaxForwardedPayloadSize is the maximum allowed byte length of a forwarded
-	// message's base64-encoded payload.
-	MaxForwardedPayloadSize = 64 * 1024
-
-	// DecodeWarningInterval is the minimum time between repeated malformed-frame
-	// warnings for the same peer and decode stage.
-	DecodeWarningInterval = 10 * time.Second
-
-	// DecodeWarningRawPrefixLimit bounds raw frame preview logging.
-	DecodeWarningRawPrefixLimit = 160
-
-	// decodeWarningRawPrefixTrimSlack captures nearby non-whitespace bytes when
-	// leading/trailing whitespace is trimmed from malformed frame previews.
-	decodeWarningRawPrefixTrimSlack = 32
+	ProtocolDiagnosticsInterval = 10 * time.Second
 )
 
-var decodeWarningWhitespaceReplacer = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
-
-// Peer represents a connected relay peer.
 type Peer struct {
 	ID            string
 	URL           string
-	Outbound      bool // true if we dialed this peer (enables auto-reconnect)
+	Outbound      bool
 	Conn          *websocket.Conn
-	Send          chan []byte
-	LastInventory time.Time
 	ConnectedAt   time.Time
+	LastHelloAt   time.Time
 	Health        PeerHealth
 	healthMu      sync.Mutex
 	Done          chan struct{}
 	doneOnce      sync.Once
-
-	// Peer-specific metrics for scoring
-	Metrics *model.PeerMetrics
-	// TAR batcher for traffic analysis resistance
-	Batcher *PeerBatcher
+	adapter       *gossipv1.SessionAdapter
+	adapterMu     sync.Mutex
+	LastMalformed time.Time
+	Metrics       *model.PeerMetrics
 }
 
-// PeerHealth tracks peer health metrics with failure tracking.
 type PeerHealth struct {
 	Uptime            time.Duration
 	LastSeen          time.Time
-	LastForwardAt     time.Time
 	MessagesForwarded int
 	MessagesReceived  int
 	FailureCount      int
@@ -86,148 +52,133 @@ type PeerHealth struct {
 	IsHealthy         bool
 }
 
-// RecordFailure records a failure for exponential backoff.
 func (h *PeerHealth) RecordFailure() {
 	h.FailureCount++
-	// Exponential backoff: 2^failure_count seconds, max 5 minutes
 	backoff := time.Duration(min(h.FailureCount*h.FailureCount, 300)) * time.Second
 	h.BackoffUntil = time.Now().Add(backoff)
 	h.IsHealthy = false
 }
 
-// RecordSuccess records a successful operation.
 func (h *PeerHealth) RecordSuccess() {
 	h.FailureCount = 0
 	h.BackoffUntil = time.Time{}
 	h.IsHealthy = true
 }
 
-// IsBackingOff returns true if the peer is currently backing off from failures.
 func (h *PeerHealth) IsBackingOff() bool {
 	return time.Now().Before(h.BackoffUntil)
 }
 
-// PeerManager manages connections to relay peers.
 type PeerManager struct {
-	relayID    string
-	peers      map[string]*Peer
-	peersMu    sync.RWMutex
-	store      store.Store
-	clients    *model.ClientRegistry
-	maxTTL     time.Duration
-	ctx        context.Context
-	cancel     context.CancelFunc
-	inbound    chan *Peer
-	outbound   chan string
-	disconnect chan *Peer
+	relayID string
+	store   store.Store
+	clients *model.ClientRegistry
+	maxTTL  time.Duration
 
-	// TAR configuration
-	tarConfig *TARConfig
-	// Forwarding strategy configuration
+	ctxStop chan struct{}
+
+	peers   map[string]*Peer
+	peersMu sync.RWMutex
+
+	outbound chan string
+	inbound  chan *Peer
+
+	tarConfig        *TARConfig
 	forwardingConfig *ForwardingConfig
-	// Forwarding strategy
-	forwardingStrategy *ForwardingStrategy
-	// Peer metrics (for scoring)
+
 	peerMetrics map[string]*model.PeerMetrics
 	metricsMu   sync.RWMutex
-	engine      *storeforward.Engine
 
-	decodeWarningsMu sync.Mutex
-	decodeWarnings   map[string]time.Time
+	eventObserverMu sync.RWMutex
+	eventObserver   func(*Peer, gossipv1.Event) error
 }
 
-// NewPeerManager creates a new peer manager.
-func NewPeerManager(relayID string, store store.Store, clients *model.ClientRegistry, maxTTL time.Duration) *PeerManager {
-	return NewPeerManagerWithConfig(relayID, store, clients, maxTTL, DefaultTARConfig(), DefaultForwardingConfig())
+func NewPeerManager(relayID string, st store.Store, clients *model.ClientRegistry, maxTTL time.Duration) *PeerManager {
+	return NewPeerManagerWithConfig(relayID, st, clients, maxTTL, DefaultTARConfig(), DefaultForwardingConfig())
 }
 
-// NewPeerManagerWithConfig creates a new peer manager with explicit TAR and forwarding config.
-func NewPeerManagerWithConfig(relayID string, store store.Store, clients *model.ClientRegistry, maxTTL time.Duration, tarConfig *TARConfig, forwardingConfig *ForwardingConfig) *PeerManager {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Validate configs
-	tarConfig.Validate()
-	forwardingConfig.Validate()
-
-	engine := storeforward.New(store, maxTTL)
-	engine.ConfigureFederation(relayID, nil)
+func NewPeerManagerWithConfig(relayID string, st store.Store, clients *model.ClientRegistry, maxTTL time.Duration, tarConfig *TARConfig, forwardingConfig *ForwardingConfig) *PeerManager {
+	if err := tarConfig.Validate(); err != nil {
+		panic(err)
+	}
+	if err := forwardingConfig.Validate(); err != nil {
+		panic(err)
+	}
 
 	return &PeerManager{
-		relayID:            relayID,
-		peers:              make(map[string]*Peer),
-		store:              store,
-		clients:            clients,
-		maxTTL:             maxTTL,
-		ctx:                ctx,
-		cancel:             cancel,
-		inbound:            make(chan *Peer, 100),
-		outbound:           make(chan string, 100),
-		disconnect:         make(chan *Peer, 100),
-		tarConfig:          tarConfig,
-		forwardingConfig:   forwardingConfig,
-		forwardingStrategy: NewForwardingStrategy(forwardingConfig),
-		peerMetrics:        make(map[string]*model.PeerMetrics),
-		engine:             engine,
-		decodeWarnings:     make(map[string]time.Time),
+		relayID:          relayID,
+		store:            st,
+		clients:          clients,
+		maxTTL:           maxTTL,
+		ctxStop:          make(chan struct{}),
+		peers:            make(map[string]*Peer),
+		outbound:         make(chan string, 100),
+		inbound:          make(chan *Peer, 100),
+		tarConfig:        tarConfig,
+		forwardingConfig: forwardingConfig,
+		peerMetrics:      make(map[string]*model.PeerMetrics),
 	}
 }
 
-// AddPeerURL adds a peer URL to connect to.
-func (pm *PeerManager) AddPeerURL(url string) {
-	pm.outbound <- url
-}
-
-// SetEnvelopeStore wires envelope persistence into the store-and-forward engine.
 func (pm *PeerManager) SetEnvelopeStore(envelopeStore store.EnvelopeStore) {
-	pm.engine.ConfigureFederation(pm.relayID, envelopeStore)
+	_ = envelopeStore
 }
 
-// SetAckDrivenSuppression enables canonical ack-driven suppression semantics
-// for local client delivery paths.
 func (pm *PeerManager) SetAckDrivenSuppression(enabled bool) {
-	pm.engine.SetAckDrivenSuppression(enabled)
+	_ = enabled
 }
 
-// Run starts the peer manager.
-func (pm *PeerManager) Run() {
-	// Start gossip ticker
-	go pm.gossipLoop()
+func (pm *PeerManager) SetEventObserver(observer func(*Peer, gossipv1.Event) error) {
+	pm.eventObserverMu.Lock()
+	defer pm.eventObserverMu.Unlock()
+	pm.eventObserver = observer
+}
 
-	// Start peer handler loop
+func (pm *PeerManager) AddPeerURL(url string) {
+	select {
+	case pm.outbound <- url:
+	case <-pm.ctxStop:
+	}
+}
+
+func (pm *PeerManager) Run() {
 	for {
 		select {
-		case <-pm.ctx.Done():
+		case <-pm.ctxStop:
 			pm.cleanup()
 			return
-		case url := <-pm.outbound:
-			go pm.dialPeer(url)
 		case peer := <-pm.inbound:
 			pm.addPeer(peer)
-		case peer := <-pm.disconnect:
-			pm.removePeer(peer)
+		case url := <-pm.outbound:
+			go pm.dialPeer(url)
 		}
 	}
 }
 
-// cleanup closes all peer connections.
+func (pm *PeerManager) Stop() {
+	select {
+	case <-pm.ctxStop:
+		return
+	default:
+		close(pm.ctxStop)
+	}
+}
+
 func (pm *PeerManager) cleanup() {
 	pm.peersMu.Lock()
 	defer pm.peersMu.Unlock()
 	for _, peer := range pm.peers {
 		peer.doneOnce.Do(func() { close(peer.Done) })
-		peer.Conn.Close()
+		_ = peer.Conn.Close()
 	}
 }
 
-// dialPeer initiates an outbound connection to a peer.
 func (pm *PeerManager) dialPeer(url string) {
-	// Use exponential backoff for reconnection
 	delay := ReconnectBaseDelay
-	maxRetries := 10
 
-	for i := 0; i < maxRetries; i++ {
+	for attempt := 0; attempt < 10; attempt++ {
 		select {
-		case <-pm.ctx.Done():
+		case <-pm.ctxStop:
 			return
 		default:
 		}
@@ -241,942 +192,305 @@ func (pm *PeerManager) dialPeer(url string) {
 		}
 		conn.SetReadLimit(model.WebSocketReadLimitBytes)
 
-		peerID := uuid.New().String()
 		peer := &Peer{
-			ID:          peerID,
+			ID:          uuid.New().String(),
 			URL:         url,
 			Outbound:    true,
 			Conn:        conn,
-			Send:        make(chan []byte, 256),
 			ConnectedAt: time.Now(),
 			Health:      PeerHealth{LastSeen: time.Now()},
 			Done:        make(chan struct{}),
+			Metrics:     model.NewPeerMetrics(url),
 		}
 
-		// Send hello
-		hello := model.RelayHelloFrame{
-			Type:    model.FrameTypeRelayHello,
-			RelayID: pm.relayID,
-			Version: ProtocolVersion,
-		}
-		if err := conn.WriteJSON(hello); err != nil {
-			log.Printf("federation: hello failed %s: %v", url, err)
-			conn.Close()
+		if err := pm.runEncounter(peer); err != nil {
+			log.Printf("federation: gossipv1 encounter failed %s: %v", url, err)
+			_ = conn.Close()
 			time.Sleep(delay)
 			delay = min(delay*2, ReconnectMaxDelay)
 			continue
 		}
 
-		// Wait for hello_ok
-		var helloResp model.RelayHelloFrame
-		if err := conn.ReadJSON(&helloResp); err != nil {
-			log.Printf("federation: hello response failed %s: %v", url, err)
-			conn.Close()
-			time.Sleep(delay)
-			delay = min(delay*2, ReconnectMaxDelay)
-			continue
-		}
-
-		if helloResp.Type != model.FrameTypeRelayOK {
-			log.Printf("federation: unexpected handshake response type %q from %s, expected %q", helloResp.Type, url, model.FrameTypeRelayOK)
-			conn.Close()
-			time.Sleep(delay)
-			delay = min(delay*2, ReconnectMaxDelay)
-			continue
-		}
-
-		// Use the peer's relay_id as its canonical identifier if provided.
-		if helloResp.RelayID != "" {
-			peer.ID = helloResp.RelayID
-		}
-
-		log.Printf("federation: connected to peer %s (relay_id: %s)", url, peer.ID)
-
-		// Start peer loops
-		go pm.readLoop(peer)
-		go pm.writeLoop(peer)
-
-		// Register peer
 		pm.inbound <- peer
 		return
 	}
 
 	log.Printf("federation: max retries exceeded for %s", url)
-
-	// After max retries, don't give up permanently. Instead, periodically
-	// re-enqueue this URL for another connection attempt while the
-	// PeerManager context is still active.
-	go func(url string, initialDelay time.Duration) {
-		// Use a conservative retry interval based on the last backoff delay,
-		// but ensure it is at least the base delay to avoid tight loops.
-		retryInterval := initialDelay
-		if retryInterval < ReconnectBaseDelay {
-			retryInterval = ReconnectBaseDelay
-		}
-
-		ticker := time.NewTicker(retryInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-pm.ctx.Done():
-				return
-			case <-ticker.C:
-				select {
-				case <-pm.ctx.Done():
-					return
-				case pm.outbound <- url:
-					// URL re-enqueued for another dialPeer attempt.
-				}
-			}
-		}
-	}(url, delay)
 }
 
-// readLoop reads messages from a peer.
+func (pm *PeerManager) runEncounter(peer *Peer) error {
+	localHello := gossipv1.BuildRelayHello(pm.relayID)
+	adapter := gossipv1.NewSessionAdapter(localHello, true)
+	peer.adapterMu.Lock()
+	peer.adapter = adapter
+	peer.adapterMu.Unlock()
+
+	helloBytes, err := adapter.InitialHelloBytes()
+	if err != nil {
+		return err
+	}
+	if err := peer.Conn.WriteMessage(websocket.BinaryMessage, helloBytes); err != nil {
+		return fmt.Errorf("send HELLO: %w", err)
+	}
+
+	if err := peer.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	msgType, data, err := peer.Conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("read HELLO: %w", err)
+	}
+	if msgType != websocket.BinaryMessage {
+		return errors.New("expected binary gossip frame")
+	}
+
+	events := adapter.PushInbound(data)
+	if err := pm.processEvents(peer, adapter, events); err != nil {
+		return err
+	}
+	if !adapter.IsHealthy() {
+		return errors.New("gossip session unhealthy after HELLO")
+	}
+
+	_ = peer.Conn.SetReadDeadline(time.Time{})
+	go pm.readLoop(peer)
+	go pm.writeLoop(peer)
+	return nil
+}
+
+func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapter, events []gossipv1.Event) error {
+	for _, event := range events {
+		if event.Type == gossipv1.EventTypeFatal {
+			return event.Err
+		}
+
+		switch event.Type {
+		case gossipv1.EventTypeHelloValidated:
+			peer.healthMu.Lock()
+			peer.Health.LastSeen = time.Now()
+			peer.Health.IsHealthy = true
+			peer.LastHelloAt = time.Now()
+			peer.healthMu.Unlock()
+		case gossipv1.EventTypeIgnored:
+			// Intentionally ignored.
+		}
+
+		pm.eventObserverMu.RLock()
+		observer := pm.eventObserver
+		pm.eventObserverMu.RUnlock()
+		if observer == nil {
+			continue
+		}
+
+		if err := observer(peer, event); err != nil {
+			adapter.ObserveNonFatal(err)
+			log.Printf("federation: non-fatal observer error peer=%s type=%s err=%v", peer.ID, event.Type, err)
+		}
+	}
+
+	return nil
+}
+
 func (pm *PeerManager) readLoop(peer *Peer) {
 	defer func() {
-		pm.disconnect <- peer
-		peer.Conn.Close()
+		pm.removePeer(peer)
+		_ = peer.Conn.Close()
 	}()
 
 	for {
-		var rawMsg json.RawMessage
-		err := peer.Conn.ReadJSON(&rawMsg)
+		msgType, data, err := peer.Conn.ReadMessage()
 		if err != nil {
 			log.Printf("federation: read error from %s: %v", peer.URL, err)
 			return
 		}
-
-		// Parse frame type
-		var frameType struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(rawMsg, &frameType); err != nil {
-			pm.logDecodeWarning(peer, "frame_type", err, rawMsg)
+		if msgType != websocket.BinaryMessage {
 			continue
 		}
 
-		peer.healthMu.Lock()
-		peer.Health.LastSeen = time.Now()
-		peer.healthMu.Unlock()
+		peer.adapterMu.Lock()
+		adapter := peer.adapter
+		peer.adapterMu.Unlock()
+		if adapter == nil {
+			log.Printf("federation: missing adapter for peer %s", peer.ID)
+			return
+		}
 
-		switch frameType.Type {
-		case model.FrameTypeRelayHello:
-			var frame model.RelayHelloFrame
-			if err := json.Unmarshal(rawMsg, &frame); err != nil {
-				continue
-			}
-			pm.handleRelayHello(peer, &frame)
-		case model.FrameTypeRelayInventory:
-			var frame model.RelayInventoryFrame
-			if err := json.Unmarshal(rawMsg, &frame); err != nil {
-				continue
-			}
-			pm.handleRelayInventory(peer, &frame)
-		case model.FrameTypeRelayRequest:
-			var frame model.RelayRequestFrame
-			if err := json.Unmarshal(rawMsg, &frame); err != nil {
-				continue
-			}
-			pm.handleRelayRequest(peer, &frame)
-		case model.FrameTypeRelayForward:
-			var frame model.RelayForwardFrame
-			if err := json.Unmarshal(rawMsg, &frame); err != nil {
-				pm.logDecodeWarning(peer, "relay_forward", err, rawMsg)
-				continue
-			}
-			pm.handleRelayForward(peer, &frame)
-		case model.FrameTypeRelayAck:
-			// `relay_ack` is relay-level acceptance feedback for a forwarded envelope payload
-			// (called `envelope` in spec terms, forwarded as `message` in this implementation).
-			var frame model.RelayAckFrame
-			if err := json.Unmarshal(rawMsg, &frame); err != nil {
-				continue
-			}
-			pm.handleRelayAck(peer, &frame)
-		case model.FrameTypeRelayCover:
-			// Cover frames are relay-to-relay only, do not process or forward
-			// Just update last seen
+		events := adapter.PushInbound(data)
+		if err := pm.processEvents(peer, adapter, events); err != nil {
+			log.Printf("federation: fatal validation error peer=%s err=%v", peer.ID, err)
+			return
 		}
 	}
 }
 
-func (pm *PeerManager) logDecodeWarning(peer *Peer, stage string, err error, rawMsg json.RawMessage) {
-	if !pm.shouldLogDecodeWarning(peer, stage) {
-		return
-	}
-	log.Printf(
-		"federation: dropped malformed %s frame from relay_id=%s addr=%s: %v raw_prefix=%q",
-		stage,
-		peerRelayID(peer),
-		peerAddr(peer),
-		err,
-		decodeWarningRawPrefix(rawMsg),
-	)
-}
-
-func (pm *PeerManager) shouldLogDecodeWarning(peer *Peer, stage string) bool {
-	key := stage + "|" + decodeWarningPeerKey(peer)
-	now := time.Now()
-
-	pm.decodeWarningsMu.Lock()
-	defer pm.decodeWarningsMu.Unlock()
-
-	last, ok := pm.decodeWarnings[key]
-	if ok && now.Sub(last) < DecodeWarningInterval {
-		return false
-	}
-	pm.decodeWarnings[key] = now
-	return true
-}
-
-func decodeWarningPeerKey(peer *Peer) string {
-	if peer == nil {
-		return "unknown"
-	}
-	if peer.ID != "" {
-		return "relay_id:" + peer.ID
-	}
-	if peer.URL != "" {
-		return "addr:" + peer.URL
-	}
-	return "unknown"
-}
-
-func peerRelayID(peer *Peer) string {
-	if peer == nil || peer.ID == "" {
-		return "unknown"
-	}
-	return peer.ID
-}
-
-func peerAddr(peer *Peer) string {
-	if peer == nil || peer.URL == "" {
-		return "unknown"
-	}
-	return peer.URL
-}
-
-func decodeWarningRawPrefix(rawMsg json.RawMessage) string {
-	if len(rawMsg) == 0 {
-		return ""
-	}
-	rawPrefixLimit := DecodeWarningRawPrefixLimit + decodeWarningRawPrefixTrimSlack
-	if len(rawMsg) > rawPrefixLimit {
-		rawMsg = rawMsg[:rawPrefixLimit]
-	}
-	prefix := strings.TrimSpace(string(rawMsg))
-	prefix = decodeWarningWhitespaceReplacer.Replace(prefix)
-	if len(prefix) <= DecodeWarningRawPrefixLimit {
-		return prefix
-	}
-	return prefix[:DecodeWarningRawPrefixLimit-3] + "..."
-}
-
-func deliveryIdentityForClient(client *model.Client) string {
-	if client == nil {
-		return ""
-	}
-	if client.DeliveryID != "" {
-		return client.DeliveryID
-	}
-	return client.WayfarerID
-}
-
-// writeLoop writes messages to a peer.
 func (pm *PeerManager) writeLoop(peer *Peer) {
 	ticker := time.NewTicker(HeartbeatInterval)
-	defer func() {
-		ticker.Stop()
-		peer.Conn.Close()
-	}()
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-peer.Done:
 			return
 		case <-ticker.C:
-			peer.Conn.WriteMessage(websocket.PingMessage, nil)
-		case msg, ok := <-peer.Send:
-			if !ok {
-				peer.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			if err := peer.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			if err := peer.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
 	}
 }
 
-// addPeer adds a peer to the manager.
 func (pm *PeerManager) addPeer(peer *Peer) {
 	pm.peersMu.Lock()
-	defer pm.peersMu.Unlock()
 	pm.peers[peer.ID] = peer
-
-	// Initialize peer metrics for scoring
-	pm.metricsMu.Lock()
-	peer.Metrics = model.NewPeerMetrics(peer.ID)
-	pm.peerMetrics[peer.ID] = peer.Metrics
-	pm.metricsMu.Unlock()
-
-	// Initialize TAR batcher
-	peer.Batcher = NewPeerBatcher(peer.ID, 256, pm.tarConfig)
-	peer.Batcher.Start(func(frame []byte) {
-		select {
-		case peer.Send <- frame:
-		default:
-			metrics.IncrementDropped()
-		}
-	})
-
-	log.Printf("federation: peer added %s (total: %d)", peer.ID, len(pm.peers))
-	metrics.SetPeersConnected(len(pm.peers))
-}
-
-// removePeer removes a peer from the manager.
-func (pm *PeerManager) removePeer(peer *Peer) {
-	pm.peersMu.Lock()
-	delete(pm.peers, peer.ID)
-
-	// Update metrics
-	pm.metricsMu.Lock()
-	if peer.Metrics != nil {
-		peer.Metrics.RecordDisconnect()
-	}
-	pm.metricsMu.Unlock()
-
-	// Stop batcher
-	if peer.Batcher != nil {
-		peer.Batcher.Stop()
-	}
-
-	log.Printf("federation: peer removed %s (total: %d)", peer.ID, len(pm.peers))
 	pm.peersMu.Unlock()
 
-	metrics.SetPeersConnected(len(pm.peers))
+	pm.metricsMu.Lock()
+	if peer.Metrics == nil {
+		peer.Metrics = model.NewPeerMetrics(peer.ID)
+	}
+	pm.peerMetrics[peer.ID] = peer.Metrics
+	pm.metricsMu.Unlock()
+}
 
-	// Remove peer metrics
+func (pm *PeerManager) removePeer(peer *Peer) {
+	if peer == nil {
+		return
+	}
+
+	peer.doneOnce.Do(func() { close(peer.Done) })
+
+	pm.peersMu.Lock()
+	delete(pm.peers, peer.ID)
+	pm.peersMu.Unlock()
+
 	pm.metricsMu.Lock()
 	delete(pm.peerMetrics, peer.ID)
 	pm.metricsMu.Unlock()
 
-	// Re-enqueue outbound peers for reconnection while the manager is active.
 	if peer.Outbound {
 		select {
-		case <-pm.ctx.Done():
+		case <-pm.ctxStop:
 		case pm.outbound <- peer.URL:
 		}
 	}
 }
 
-// handleRelayHello handles incoming relay hello.
-func (pm *PeerManager) handleRelayHello(peer *Peer, frame *model.RelayHelloFrame) {
-	// Send hello_ok
-	resp := map[string]string{
-		"type":     model.FrameTypeRelayOK,
-		"relay_id": pm.relayID,
-	}
-	if err := peer.Conn.WriteJSON(resp); err != nil {
-		log.Printf("federation: failed to send relay_ok to peer %s: %v", peer.ID, err)
-		_ = peer.Conn.Close()
-	}
-}
-
-// handleRelayInventory handles inventory gossip from peers.
-func (pm *PeerManager) handleRelayInventory(peer *Peer, frame *model.RelayInventoryFrame) {
-	recipientID := frame.RecipientID
-	messageIDs := frame.MessageIDs
-
-	if recipientID == "" || len(messageIDs) == 0 {
-		return
-	}
-
-	peer.healthMu.Lock()
-	peer.Health.LastSeen = time.Now()
-	peer.healthMu.Unlock()
-
-	// Get local message IDs for this recipient
-	localIDs, err := pm.getLocalMessageIDs(recipientID)
-	if err != nil {
-		log.Printf("federation: get local ids failed: %v", err)
-		return
-	}
-
-	// Compute diff: what peer has that we don't
-	missingFromLocal := diff(messageIDs, localIDs)
-
-	if len(missingFromLocal) > 0 {
-		// Request missing messages from peer
-		request := model.RelayRequestFrame{
-			Type:       model.FrameTypeRelayRequest,
-			MessageIDs: missingFromLocal,
-		}
-		data, err := json.Marshal(request)
-		if err != nil {
-			log.Printf("federation: failed to marshal relay request: %v", err)
-			return
-		}
-		select {
-		case peer.Send <- data:
-		default:
-			log.Printf("federation: peer send channel full")
-		}
-	}
-}
-
-// handleRelayRequest handles requests for full messages.
-func (pm *PeerManager) handleRelayRequest(peer *Peer, frame *model.RelayRequestFrame) {
-	messageIDs := frame.MessageIDs
-	if len(messageIDs) == 0 {
-		return
-	}
-
-	ctx := context.Background()
-	for _, msgID := range messageIDs {
-		msg, err := pm.store.GetMessageByID(ctx, msgID)
-		if err != nil {
-			continue
-		}
-		if msg == nil {
-			continue
-		}
-
-		normalizedPayload := strings.TrimSpace(msg.Payload)
-		if _, err := decodeFederationPayloadB64(normalizedPayload); err != nil {
-			pm.dropCorruptMessage(msg.ID, "relay_request", peerRelayID(peer), err)
-			continue
-		}
-
-		forwardMessage := *msg
-		forwardMessage.Payload = normalizedPayload
-
-		forward := model.RelayForwardFrame{
-			Type:     model.FrameTypeRelayForward,
-			Message:  &forwardMessage,
-			Envelope: relayForwardEnvelopeFromMessage(&forwardMessage),
-		}
-		data, err := json.Marshal(forward)
-		if err != nil {
-			log.Printf("federation: failed to marshal relay forward for %s: %v", msgID, err)
-			continue
-		}
-		select {
-		case peer.Send <- data:
-			peer.healthMu.Lock()
-			peer.Health.MessagesForwarded++
-			peer.healthMu.Unlock()
-		default:
-			log.Printf("federation: peer send channel full")
-		}
-	}
-}
-
-// handleRelayForward handles incoming forwarded messages.
-func (pm *PeerManager) handleRelayForward(peer *Peer, frame *model.RelayForwardFrame) {
-	now := time.Now()
-	if envelopeErr := relayForwardEnvelopeValidationError(frame.Envelope, now); envelopeErr != "" {
-		peerID := "unknown"
-		if peer != nil && peer.ID != "" {
-			peerID = peer.ID
-		}
-		if !hasValidLegacyRelayForwardTimestamps(frame.Message, now) {
-			log.Printf("federation: rejecting relay_forward from peer %s: invalid envelope metadata (%s) and invalid legacy message timestamps", peerID, envelopeErr)
-			return
-		}
-		log.Printf("federation: warning invalid relay_forward envelope from peer %s: %s; falling back to legacy message timestamps", peerID, envelopeErr)
-	}
-
-	msg := frame.Message
-	if msg == nil {
-		return
-	}
-	msg.Payload = strings.TrimSpace(msg.Payload)
-	if msg.ID == "" || msg.From == "" || msg.To == "" || msg.Payload == "" {
-		return
-	}
-	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
-		return
-	}
-	if msg.CreatedAt.After(msg.ExpiresAt) {
-		return
-	}
-	if len(msg.Payload) > MaxForwardedPayloadSize {
-		log.Printf("federation: forwarded message %s payload too large (%d bytes), ignoring", msg.ID, len(msg.Payload))
-		return
-	}
-	if _, err := decodeFederationPayloadB64(msg.Payload); err != nil {
-		log.Printf("federation: rejecting relay_forward %s from %s: invalid payload_b64: %v", msg.ID, peerRelayID(peer), err)
-		return
-	}
-
-	peer.healthMu.Lock()
-	peer.Health.MessagesReceived++
-	peer.healthMu.Unlock()
-
-	ctx := context.Background()
-	result, err := pm.engine.AcceptRelayForward(ctx, peer.ID, msg, MaxForwardedPayloadSize)
-	if err != nil {
-		switch result.Status {
-		case storeforward.RelayForwardInvalid:
-			return
-		default:
-			log.Printf("federation: persist forwarded message failed: %v", err)
-		}
-		return
-	}
-
-	switch result.Status {
-	case storeforward.RelayForwardDuplicate:
-		log.Printf("federation: duplicate message %s, ignoring", msg.ID)
-		return
-	case storeforward.RelayForwardExpired:
-		log.Printf("federation: message %s already expired, ignoring", msg.ID)
-		return
-	case storeforward.RelayForwardSeenLoop:
-		log.Printf("federation: loop-detected message %s from %s, ignoring", msg.ID, peer.ID)
-		return
-	case storeforward.RelayForwardAccepted:
-		// continue
-	default:
-		return
-	}
-
-	log.Printf("federation: persisted forwarded message %s for %s", msg.ID, msg.To)
-
-	// Deliver if recipient is online
-	if pm.clients.IsOnline(msg.To) {
-		pm.deliverMessage(msg)
-	}
-	// Do not re-gossip forwarded messages to avoid message loops.
-}
-
-func relayForwardEnvelopeFromMessage(msg *model.Message) *model.RelayForwardEnvelopeMetadata {
-	if msg == nil {
-		return nil
-	}
-	return &model.RelayForwardEnvelopeMetadata{
-		CreatedAt: uint64(msg.CreatedAt.UnixMilli()),
-		ExpiresAt: uint64(msg.ExpiresAt.UnixMilli()),
-	}
-}
-
-func relayForwardEnvelopeValidationError(envelope *model.RelayForwardEnvelopeMetadata, now time.Time) string {
-	if envelope == nil {
-		return ""
-	}
-	if envelope.CreatedAt == 0 || envelope.ExpiresAt == 0 {
-		return "missing created_at or expires_at"
-	}
-	if envelope.CreatedAt > envelope.ExpiresAt {
-		return "created_at is after expires_at"
-	}
-	if now.UnixMilli() < 0 {
-		return "invalid local clock"
-	}
-	if uint64(now.UnixMilli()) >= envelope.ExpiresAt {
-		return "envelope is expired"
-	}
-	return ""
-}
-
-func hasValidLegacyRelayForwardTimestamps(msg *model.Message, now time.Time) bool {
-	if msg == nil {
-		return false
-	}
-	if msg.CreatedAt.IsZero() || msg.ExpiresAt.IsZero() {
-		return false
-	}
-	if msg.CreatedAt.After(msg.ExpiresAt) {
-		return false
-	}
-	return !now.After(msg.ExpiresAt)
-}
-
-// handleRelayAck handles relay acknowledgment frames.
-// `relay_ack` is relay-level acceptance telemetry for a forwarded envelope payload
-// (called `envelope` in the spec; this implementation currently forwards it in `message`).
-// This is separate from end-device `ack` delivery state.
-// Updates peer metrics based on ack status.
-func (pm *PeerManager) handleRelayAck(peer *Peer, frame *model.RelayAckFrame) {
-	if peer.Metrics == nil {
-		return
-	}
-
-	// Calculate latency based on forward time (would need envelope tracking in real impl)
-	// For now, use a default good latency
-	latencyMs := 100.0
-
-	switch frame.Status {
-	case "accepted":
-		peer.Metrics.RecordAck(latencyMs)
-		metrics.IncrementPeerAcks(peer.ID)
-	case "duplicate":
-		// Duplicate is not a failure, just log
-		log.Printf("federation: duplicate ack from peer %s for envelope %s", peer.ID, frame.EnvelopeID)
-	case "expired":
-		// Expired is a soft failure
-		peer.Metrics.RecordTimeout()
-		metrics.IncrementPeerTimeouts(peer.ID)
-	default:
-		log.Printf("federation: unknown ack status from peer %s: %s", peer.ID, frame.Status)
-	}
-
-	// Update metrics
-	metrics.SetPeerScore(peer.ID, peer.Metrics.Score)
-}
-
-// deliverMessage delivers a message to local recipients.
-func (pm *PeerManager) deliverMessage(msg *model.Message) {
-	decodedPayload, err := decodeFederationPayloadB64(msg.Payload)
-	if err != nil {
-		pm.dropCorruptMessage(msg.ID, "deliver_local", msg.To, err)
-		return
-	}
-
-	recipients := pm.clients.GetClients(msg.To)
-	for _, r := range recipients {
-		recipientID := deliveryIdentityForClient(r)
-		if recipientID == "" {
-			continue
-		}
-		payloadB64 := model.EncodePayloadB64(decodedPayload, r.GetPayloadEncodingPref())
-		receivedAt := msg.CreatedAt.Unix()
-		data, _ := json.Marshal(model.WSFrame{
-			Type:       model.FrameTypeMessage,
-			MsgID:      msg.ID,
-			From:       msg.From,
-			PayloadB64: payloadB64,
-			ReceivedAt: receivedAt,
-		})
-		select {
-		case r.Send <- data:
-			if !pm.engine.IsAckDrivenSuppression() {
-				if err := pm.engine.MarkDelivery(context.Background(), msg.ID, recipientID); err != nil {
-					log.Printf("federation: failed to mark delivered for %s: %v", recipientID, err)
-				}
-			}
-		default:
-		}
-	}
-}
-
-func (pm *PeerManager) dropCorruptMessage(msgID, stage, peerContext string, decodeErr error) {
-	if msgID == "" {
-		log.Printf("federation: skipping corrupt payload removal with empty msg_id stage=%s peer=%s: %v", stage, peerContext, decodeErr)
-		return
-	}
-
-	log.Printf("federation: dropping corrupt payload msg_id=%s stage=%s peer=%s: %v", msgID, stage, peerContext, decodeErr)
-	if err := pm.engine.RemoveMessage(context.Background(), msgID); err != nil {
-		log.Printf("federation: failed to remove corrupt payload msg_id=%s stage=%s: %v", msgID, stage, err)
-	}
-}
-
-// gossipLoop periodically gossips inventory to peers.
-func (pm *PeerManager) gossipLoop() {
-	ticker := time.NewTicker(InventoryGossipInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-pm.ctx.Done():
-			return
-		case <-ticker.C:
-			pm.gossipInventory()
-		}
-	}
-}
-
-// gossipInventory sends inventory to all peers.
-func (pm *PeerManager) gossipInventory() {
-	pm.peersMu.RLock()
-	peers := make([]*Peer, 0, len(pm.peers))
-	for _, p := range pm.peers {
-		peers = append(peers, p)
-	}
-	pm.peersMu.RUnlock()
-
-	if len(peers) == 0 {
-		return
-	}
-
-	// Get all recipients we have messages for
-	recipients := pm.getRecipientsWithMessages()
-	if len(recipients) == 0 {
-		return
-	}
-
-	for _, peer := range peers {
-		for _, recipientID := range recipients {
-			messageIDs, err := pm.getLocalMessageIDs(recipientID)
-			if err != nil || len(messageIDs) == 0 {
-				continue
-			}
-
-			inv := model.RelayInventoryFrame{
-				Type:        model.FrameTypeRelayInventory,
-				RecipientID: recipientID,
-				MessageIDs:  messageIDs,
-			}
-			data, err := json.Marshal(inv)
-			if err != nil {
-				log.Printf("federation: failed to marshal inventory for gossip: %v", err)
-				continue
-			}
-			select {
-			case peer.Send <- data:
-			default:
-			}
-		}
-		peer.LastInventory = time.Now()
-	}
-}
-
-// gossipMessage announces a new message to peers.
-func (pm *PeerManager) gossipMessage(msg *model.Message) {
-	pm.peersMu.RLock()
-	peers := make([]*Peer, 0, len(pm.peers))
-	for _, p := range pm.peers {
-		peers = append(peers, p)
-	}
-	pm.peersMu.RUnlock()
-
-	if len(peers) == 0 {
-		return
-	}
-
-	inv := model.RelayInventoryFrame{
-		Type:        model.FrameTypeRelayInventory,
-		RecipientID: msg.To,
-		MessageIDs:  []string{msg.ID},
-	}
-	data, err := json.Marshal(inv)
-	if err != nil {
-		log.Printf("federation: failed to marshal inventory for gossip: %v", err)
-		return
-	}
-
-	for _, peer := range peers {
-		select {
-		case peer.Send <- data:
-		default:
-		}
-	}
-}
-
-// getLocalMessageIDs gets all message IDs for a recipient.
-func (pm *PeerManager) getLocalMessageIDs(recipientID string) ([]string, error) {
-	return pm.store.GetAllQueuedMessageIDs(context.Background(), recipientID)
-}
-
-// getRecipientsWithMessages gets all recipients with queued messages.
-func (pm *PeerManager) getRecipientsWithMessages() []string {
-	recipients, err := pm.store.GetAllRecipientIDs(context.Background())
-	if err != nil {
-		log.Printf("failed to get recipients with queued messages: %v", err)
-		return nil
-	}
-	return recipients
-}
-
-// GetPeers returns a copy of current peers.
-func (pm *PeerManager) GetPeers() map[string]PeerHealth {
-	pm.peersMu.RLock()
-	defer pm.peersMu.RUnlock()
-
-	result := make(map[string]PeerHealth)
-	for id, peer := range pm.peers {
-		peer.healthMu.Lock()
-		peer.Health.Uptime = time.Since(peer.ConnectedAt)
-		health := peer.Health
-		peer.healthMu.Unlock()
-		result[id] = health
-	}
-	return result
-}
-
-// Stop stops the peer manager.
-func (pm *PeerManager) Stop() {
-	pm.cancel()
-}
-
-// federationUpgrader is used to upgrade inbound federation WebSocket connections.
-var federationUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
-
-// HandleInboundPeer handles an inbound peer connection (from HTTP upgrade).
 func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request) {
-	conn, err := federationUpgrader.Upgrade(w, r, nil)
+	upgrader := websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("federation: upgrade failed: %v", err)
 		return
 	}
 	conn.SetReadLimit(model.WebSocketReadLimitBytes)
 
-	peerID := uuid.New().String()
 	peer := &Peer{
-		ID:          peerID,
+		ID:          uuid.New().String(),
 		URL:         r.RemoteAddr,
 		Conn:        conn,
-		Send:        make(chan []byte, 256),
 		ConnectedAt: time.Now(),
 		Health:      PeerHealth{LastSeen: time.Now()},
 		Done:        make(chan struct{}),
+		Metrics:     model.NewPeerMetrics(r.RemoteAddr),
 	}
 
-	// Read hello
-	var hello model.RelayHelloFrame
-	if err := conn.ReadJSON(&hello); err != nil {
-		log.Printf("federation: inbound hello failed: %v", err)
-		conn.Close()
+	if err := pm.acceptInboundEncounter(peer); err != nil {
+		log.Printf("federation: inbound encounter failed from %s: %v", r.RemoteAddr, err)
+		_ = conn.Close()
 		return
 	}
-
-	// Validate hello frame - reject connections that don't identify as a relay peer.
-	if hello.Type != model.FrameTypeRelayHello || hello.RelayID == "" {
-		log.Printf("federation: invalid hello from %s: type=%q relay_id=%q", r.RemoteAddr, hello.Type, hello.RelayID)
-		conn.Close()
-		return
-	}
-
-	// Use the peer's relay_id as its canonical identifier.
-	peer.ID = hello.RelayID
-
-	// Send hello_ok
-	resp := map[string]string{
-		"type":     model.FrameTypeRelayOK,
-		"relay_id": pm.relayID,
-	}
-	if err := conn.WriteJSON(resp); err != nil {
-		conn.Close()
-		return
-	}
-
-	log.Printf("federation: inbound peer connected from %s (relay_id: %s)", r.RemoteAddr, peer.ID)
-
-	// Start loops
-	go pm.readLoop(peer)
-	go pm.writeLoop(peer)
 
 	pm.inbound <- peer
 }
 
-// AnnounceMessage announces a new message to federation.
+func (pm *PeerManager) acceptInboundEncounter(peer *Peer) error {
+	localHello := gossipv1.BuildRelayHello(pm.relayID)
+	adapter := gossipv1.NewSessionAdapter(localHello, true)
+
+	if err := peer.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	msgType, data, err := peer.Conn.ReadMessage()
+	if err != nil {
+		return err
+	}
+	if msgType != websocket.BinaryMessage {
+		return errors.New("expected binary gossip frame")
+	}
+
+	events := adapter.PushInbound(data)
+	if err := pm.processEvents(peer, adapter, events); err != nil {
+		return err
+	}
+	if !adapter.IsHealthy() {
+		return errors.New("gossip session unhealthy after inbound HELLO")
+	}
+
+	helloBytes, err := adapter.InitialHelloBytes()
+	if err != nil {
+		return err
+	}
+	if err := peer.Conn.WriteMessage(websocket.BinaryMessage, helloBytes); err != nil {
+		return err
+	}
+
+	peer.adapterMu.Lock()
+	peer.adapter = adapter
+	peer.adapterMu.Unlock()
+
+	_ = peer.Conn.SetReadDeadline(time.Time{})
+	go pm.readLoop(peer)
+	go pm.writeLoop(peer)
+	return nil
+}
+
+func (pm *PeerManager) PeerLastObserverError(peerID string) error {
+	pm.peersMu.RLock()
+	peer, ok := pm.peers[peerID]
+	pm.peersMu.RUnlock()
+	if !ok || peer == nil {
+		return nil
+	}
+
+	peer.adapterMu.Lock()
+	adapter := peer.adapter
+	peer.adapterMu.Unlock()
+	if adapter == nil {
+		return nil
+	}
+
+	return adapter.LastObserverError()
+}
+
 func (pm *PeerManager) AnnounceMessage(msg *model.Message) {
-	go pm.gossipMessage(msg)
+	_ = msg
 }
 
-// ForwardToPeers forwards a message to selected peers based on score.
-// This implements score-based routing with topK selection and exploration.
 func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) {
-	if msg == nil {
-		return
-	}
-
-	normalizedPayload := strings.TrimSpace(msg.Payload)
-	if _, err := decodeFederationPayloadB64(normalizedPayload); err != nil {
-		pm.dropCorruptMessage(msg.ID, "forward_to_peers", originRelayID, err)
-		return
-	}
-
-	forwardMessage := *msg
-	forwardMessage.Payload = normalizedPayload
-
-	// Get peer metrics
-	pm.metricsMu.RLock()
-	metricsCopy := make(map[string]*model.PeerMetrics, len(pm.peerMetrics))
-	for id, m := range pm.peerMetrics {
-		metricsCopy[id] = m
-	}
-	pm.metricsMu.RUnlock()
-
-	// Select peers based on scoring
-	selectedIDs := pm.forwardingStrategy.SelectPeers(metricsCopy, originRelayID)
-
-	if len(selectedIDs) == 0 {
-		log.Printf("federation: no selected peers to forward message %s", forwardMessage.ID)
-		return
-	}
-
-	// Forward to selected peers using batcher
-	for _, peerID := range selectedIDs {
-		pm.peersMu.RLock()
-		peer, ok := pm.peers[peerID]
-		pm.peersMu.RUnlock()
-
-		if !ok {
-			continue
-		}
-
-		// Record forward in metrics
-		if peer.Metrics != nil {
-			peer.Metrics.RecordForward()
-			metrics.SetPeerScore(peerID, peer.Metrics.Score)
-		}
-
-		// Create forward frame
-		forward := model.RelayForwardFrame{
-			Type:     model.FrameTypeRelayForward,
-			Message:  &forwardMessage,
-			Envelope: relayForwardEnvelopeFromMessage(&forwardMessage),
-		}
-
-		// Apply padding if enabled
-		data, err := json.Marshal(forward)
-		if err != nil {
-			log.Printf("federation: failed to marshal forward: %v", err)
-			continue
-		}
-
-		if pm.tarConfig.PaddingEnabled {
-			data = PadPayload(data, pm.tarConfig.PadBuckets)
-		}
-
-		// Enqueue to batcher (or send directly if no batcher)
-		if peer.Batcher != nil {
-			peer.Batcher.Enqueue(data)
-		} else {
-			select {
-			case peer.Send <- data:
-			default:
-				log.Printf("federation: peer %s send channel full, dropping", peer.ID)
-				metrics.IncrementDropped()
-			}
-		}
-	}
+	_ = msg
+	_ = originRelayID
 }
 
-func decodeFederationPayloadB64(raw string) ([]byte, error) {
-	normalized := strings.TrimSpace(raw)
-	if normalized == "" {
-		return nil, fmt.Errorf("invalid payload_b64: empty payload")
+func (pm *PeerManager) GetPeers() map[string]PeerHealth {
+	pm.peersMu.RLock()
+	defer pm.peersMu.RUnlock()
+
+	out := make(map[string]PeerHealth, len(pm.peers))
+	for id, peer := range pm.peers {
+		peer.healthMu.Lock()
+		peer.Health.Uptime = time.Since(peer.ConnectedAt)
+		health := peer.Health
+		peer.healthMu.Unlock()
+		out[id] = health
 	}
-	if decoded, err := model.DecodePayloadB64(normalized); err == nil {
-		return decoded, nil
-	}
-	if decoded, err := base64.RawStdEncoding.DecodeString(normalized); err == nil {
-		return decoded, nil
-	}
-	if decoded, err := base64.StdEncoding.DecodeString(normalized); err == nil {
-		return decoded, nil
-	}
-	if decoded, err := base64.URLEncoding.DecodeString(normalized); err == nil {
-		return decoded, nil
-	}
-	return nil, fmt.Errorf("invalid payload_b64")
+	return out
 }
 
-// GetHealthyPeers returns a list of healthy peer IDs.
 func (pm *PeerManager) GetHealthyPeers() []string {
 	pm.peersMu.RLock()
 	defer pm.peersMu.RUnlock()
 
-	var healthy []string
+	healthy := make([]string, 0, len(pm.peers))
 	for id, peer := range pm.peers {
 		peer.healthMu.Lock()
 		isHealthy := peer.Health.IsHealthy && !peer.Health.IsBackingOff()
@@ -1185,34 +499,31 @@ func (pm *PeerManager) GetHealthyPeers() []string {
 			healthy = append(healthy, id)
 		}
 	}
+
 	return healthy
 }
 
-// GetPeerCount returns the current number of connected peers.
 func (pm *PeerManager) GetPeerCount() int {
 	pm.peersMu.RLock()
 	defer pm.peersMu.RUnlock()
 	return len(pm.peers)
 }
 
-// GetPeerMetrics returns peer metrics for all connected peers.
 func (pm *PeerManager) GetPeerMetrics() []*model.PeerScoreResponse {
 	pm.metricsMu.RLock()
 	defer pm.metricsMu.RUnlock()
 
-	var responses []*model.PeerScoreResponse
+	responses := make([]*model.PeerScoreResponse, 0, len(pm.peerMetrics))
 	for _, metrics := range pm.peerMetrics {
 		responses = append(responses, metrics.ToResponse())
 	}
 	return responses
 }
 
-// IsPeerHealthy checks if a specific peer is healthy.
 func (pm *PeerManager) IsPeerHealthy(peerID string) bool {
 	pm.peersMu.RLock()
 	peer, ok := pm.peers[peerID]
 	pm.peersMu.RUnlock()
-
 	if !ok {
 		return false
 	}
@@ -1222,7 +533,6 @@ func (pm *PeerManager) IsPeerHealthy(peerID string) bool {
 	return peer.Health.IsHealthy && !peer.Health.IsBackingOff()
 }
 
-// RateLimiter implements per-peer rate limiting.
 type RateLimiter struct {
 	mu          sync.Mutex
 	requests    map[string][]time.Time
@@ -1230,7 +540,6 @@ type RateLimiter struct {
 	window      time.Duration
 }
 
-// NewRateLimiter creates a new rate limiter.
 func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
 	return &RateLimiter{
 		requests:    make(map[string][]time.Time),
@@ -1239,7 +548,6 @@ func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
 	}
 }
 
-// Allow checks if a request from the given peer is allowed.
 func (rl *RateLimiter) Allow(peerID string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -1247,33 +555,24 @@ func (rl *RateLimiter) Allow(peerID string) bool {
 	now := time.Now()
 	windowStart := now.Add(-rl.window)
 
-	// Get or create the request history for this peer
-	history, exists := rl.requests[peerID]
-	if !exists {
-		history = []time.Time{}
-	}
-
-	// Filter out old requests
-	var validRequests []time.Time
+	history := rl.requests[peerID]
+	valid := make([]time.Time, 0, len(history)+1)
 	for _, t := range history {
 		if t.After(windowStart) {
-			validRequests = append(validRequests, t)
+			valid = append(valid, t)
 		}
 	}
 
-	// Check if under limit
-	if len(validRequests) >= rl.maxRequests {
-		rl.requests[peerID] = validRequests
+	if len(valid) >= rl.maxRequests {
+		rl.requests[peerID] = valid
 		return false
 	}
 
-	// Add current request
-	validRequests = append(validRequests, now)
-	rl.requests[peerID] = validRequests
+	valid = append(valid, now)
+	rl.requests[peerID] = valid
 	return true
 }
 
-// Cleanup removes old entries from the rate limiter.
 func (rl *RateLimiter) Cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -1282,31 +581,32 @@ func (rl *RateLimiter) Cleanup() {
 	windowStart := now.Add(-rl.window)
 
 	for peerID, history := range rl.requests {
-		var validRequests []time.Time
+		valid := make([]time.Time, 0, len(history))
 		for _, t := range history {
 			if t.After(windowStart) {
-				validRequests = append(validRequests, t)
+				valid = append(valid, t)
 			}
 		}
-		if len(validRequests) == 0 {
+		if len(valid) == 0 {
 			delete(rl.requests, peerID)
-		} else {
-			rl.requests[peerID] = validRequests
+			continue
 		}
+		rl.requests[peerID] = valid
 	}
 }
 
-// diff returns elements in a that are not in b.
 func diff(a, b []string) []string {
-	set := make(map[string]bool)
+	set := make(map[string]bool, len(b))
 	for _, v := range b {
 		set[v] = true
 	}
-	var result []string
+
+	result := make([]string, 0, len(a))
 	for _, v := range a {
 		if !set[v] {
 			result = append(result, v)
 		}
 	}
+
 	return result
 }

@@ -5,8 +5,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
 func TestPeerBatcherEnqueueAndDrain(t *testing.T) {
@@ -152,9 +150,16 @@ func TestPeerBatcherCoverFramesIncludeLegacyAndCanonicalTimestamps(t *testing.T)
 		return 42
 	}
 
-	var sent []model.RelayCoverFrame
+	type coverFrame struct {
+		Type      string `json:"type"`
+		Timestamp int64  `json:"ts"`
+		SentAt    uint64 `json:"sent_at,omitempty"`
+		Nonce     int64  `json:"nonce"`
+	}
+
+	var sent []coverFrame
 	sendFunc := func(data []byte) {
-		var cover model.RelayCoverFrame
+		var cover coverFrame
 		if err := json.Unmarshal(data, &cover); err != nil {
 			t.Fatalf("decode cover frame: %v", err)
 		}
@@ -168,8 +173,8 @@ func TestPeerBatcherCoverFramesIncludeLegacyAndCanonicalTimestamps(t *testing.T)
 	}
 
 	cover := sent[0]
-	if cover.Type != model.FrameTypeRelayCover {
-		t.Fatalf("expected relay_cover frame, got %q", cover.Type)
+	if cover.Type != "COVER" {
+		t.Fatalf("expected COVER frame, got %q", cover.Type)
 	}
 	if cover.Timestamp == 0 {
 		t.Fatal("expected legacy ts field to be populated")
