@@ -56,8 +56,12 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 		}
 	}
 
-	if existing, err := e.store.GetMessageByID(ctx, msg.ID); err == nil && existing != nil {
+	existing, err := e.store.GetMessageByID(ctx, msg.ID)
+	if err == nil && existing != nil {
 		return RelayForwardResult{Status: RelayForwardDuplicate}, nil
+	}
+	if err != nil && !isNotFoundErr(err) {
+		return RelayForwardResult{}, err
 	}
 
 	if err := e.store.PersistMessage(ctx, msg); err != nil {
@@ -79,6 +83,12 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 			return RelayForwardResult{}, err
 		}
 	}
+
+	e.emitRelayIngest(ctx, RelayIngestSignal{
+		ItemID:      relayIngestItemID(msg),
+		Trusted:     isAuthenticatedRelayContext(sourceRelayID),
+		SourceRelay: sourceRelayID,
+	})
 
 	return RelayForwardResult{Status: RelayForwardAccepted, Envelope: envelope}, nil
 }
@@ -219,4 +229,20 @@ func isNotFoundErr(err error) bool {
 	}
 	// TODO: switch to errors.Is when store exports typed not-found sentinels.
 	return strings.Contains(strings.ToLower(err.Error()), "not found")
+}
+
+func relayIngestItemID(msg *model.Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	// Phase 2 defines RELAY_INGEST item_id as the durable message key.
+	return msg.ID
+}
+
+func isAuthenticatedRelayContext(sourceRelayID string) bool {
+	// Phase 2 trust boundary: only authenticated relay transport contexts are
+	// trusted RELAY_INGEST producers. Today, a non-empty source relay ID is
+	// supplied only by validated federation sessions.
+	return sourceRelayID != ""
 }

@@ -111,11 +111,35 @@ func TestSessionAdapterIgnoresUnauthenticatedRelayIngest(t *testing.T) {
 	}
 
 	events := adapter.PushInbound(prefixed)
-	if len(events) != 1 || events[0].Type != gossipv1.EventTypeIgnored {
-		t.Fatalf("expected ignored event, got %#v", events)
+	if len(events) != 1 || events[0].Type != gossipv1.EventTypeUntrustedRelay {
+		t.Fatalf("expected untrusted relay_ingest event, got %#v", events)
+	}
+	if len(events[0].ItemIDs) != 1 || events[0].ItemIDs[0] != "a" {
+		t.Fatalf("expected parsed item_ids in event, got %#v", events[0].ItemIDs)
 	}
 	if adapter.UntrustedRelayIngestCount() != 1 {
 		t.Fatalf("expected unauth relay_ingest count 1, got %d", adapter.UntrustedRelayIngestCount())
+	}
+}
+
+func TestSessionAdapterAcceptsAuthenticatedRelayIngest(t *testing.T) {
+	adapter := gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-a"), true)
+
+	relayIngestFrame, err := gossipv1.EncodeEnvelope(gossipv1.FrameTypeRelayIngest, map[string]any{"item_ids": []string{"a", "b"}})
+	if err != nil {
+		t.Fatalf("encode relay_ingest: %v", err)
+	}
+	prefixed, err := gossipv1.EncodeLengthPrefixed(relayIngestFrame)
+	if err != nil {
+		t.Fatalf("prefix relay_ingest: %v", err)
+	}
+
+	events := adapter.PushInbound(prefixed)
+	if len(events) != 1 || events[0].Type != gossipv1.EventTypeRelayIngest {
+		t.Fatalf("expected relay_ingest event, got %#v", events)
+	}
+	if len(events[0].ItemIDs) != 2 || events[0].ItemIDs[0] != "a" || events[0].ItemIDs[1] != "b" {
+		t.Fatalf("expected parsed item_ids in event, got %#v", events[0].ItemIDs)
 	}
 }
 

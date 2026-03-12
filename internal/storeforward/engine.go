@@ -1,6 +1,7 @@
 package storeforward
 
 import (
+	"context"
 	"time"
 
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -11,6 +12,20 @@ const (
 	maxPullLimit     = 100
 )
 
+// RelayIngestSignal is the relay-side ingest effect emitted after durable ingest.
+//
+// Phase 2 intentionally models RELAY_INGEST as an internal signal instead of
+// a relay-to-relay protocol frame emission, because propagation policy remains
+// disabled from Phase 1.
+type RelayIngestSignal struct {
+	ItemID      string
+	Trusted     bool
+	SourceRelay string
+}
+
+// RelayIngestObserver receives durable relay ingest signals.
+type RelayIngestObserver func(context.Context, RelayIngestSignal)
+
 // Engine owns store-and-forward decisions shared by client and federation paths.
 type Engine struct {
 	store                store.Store
@@ -18,6 +33,7 @@ type Engine struct {
 	relayID              string
 	maxTTL               time.Duration
 	ackDrivenSuppression bool
+	relayIngestObserver  RelayIngestObserver
 
 	now func() time.Time
 }
@@ -46,6 +62,18 @@ func (e *Engine) IsAckDrivenSuppression() bool {
 func (e *Engine) ConfigureFederation(relayID string, envelopeStore store.EnvelopeStore) {
 	e.relayID = relayID
 	e.envelopeStore = envelopeStore
+}
+
+// SetRelayIngestObserver configures an observer for durable relay ingest effects.
+func (e *Engine) SetRelayIngestObserver(observer RelayIngestObserver) {
+	e.relayIngestObserver = observer
+}
+
+func (e *Engine) emitRelayIngest(ctx context.Context, signal RelayIngestSignal) {
+	if e.relayIngestObserver == nil {
+		return
+	}
+	e.relayIngestObserver(ctx, signal)
 }
 
 func (e *Engine) setNowForTests(now func() time.Time) {

@@ -18,6 +18,84 @@ type engineHarness struct {
 	now           time.Time
 }
 
+type ingestStoreSpy struct {
+	messages     map[string]*model.Message
+	persistCount int
+	persistErr   error
+}
+
+func newIngestStoreSpy() *ingestStoreSpy {
+	return &ingestStoreSpy{messages: map[string]*model.Message{}}
+}
+
+func (s *ingestStoreSpy) Open() error  { return nil }
+func (s *ingestStoreSpy) Close() error { return nil }
+
+func (s *ingestStoreSpy) PersistMessage(ctx context.Context, msg *model.Message) error {
+	if s.persistErr != nil {
+		return s.persistErr
+	}
+	if msg == nil {
+		return errors.New("nil message")
+	}
+
+	cp := *msg
+	s.messages[msg.ID] = &cp
+	s.persistCount++
+	return nil
+}
+
+func (s *ingestStoreSpy) GetQueuedMessages(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
+	return nil, nil
+}
+
+func (s *ingestStoreSpy) GetQueuedMessagesRaw(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
+	return nil, nil
+}
+
+func (s *ingestStoreSpy) MarkDelivered(ctx context.Context, msgID string, recipientID string) error {
+	return nil
+}
+
+func (s *ingestStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	return false, nil
+}
+
+func (s *ingestStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	return false, nil
+}
+
+func (s *ingestStoreSpy) IsAckedBy(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	return false, nil
+}
+
+func (s *ingestStoreSpy) GetMessageByID(ctx context.Context, msgID string) (*model.Message, error) {
+	msg, ok := s.messages[msgID]
+	if !ok {
+		return nil, errors.New("message not found")
+	}
+	cp := *msg
+	return &cp, nil
+}
+
+func (s *ingestStoreSpy) RemoveMessage(ctx context.Context, msgID string) error { return nil }
+
+func (s *ingestStoreSpy) GetExpiredMessages(ctx context.Context, before time.Time) ([]*model.Message, error) {
+	return nil, nil
+}
+
+func (s *ingestStoreSpy) GetLastSweepTime(ctx context.Context) (time.Time, error) {
+	return time.Time{}, nil
+}
+
+func (s *ingestStoreSpy) SetLastSweepTime(ctx context.Context, t time.Time) error { return nil }
+
+func (s *ingestStoreSpy) GetAllRecipientIDs(ctx context.Context) ([]string, error) { return nil, nil }
+
+func (s *ingestStoreSpy) GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error) {
+	return nil, nil
+}
+
 func newEngineHarness(t *testing.T, maxTTL time.Duration) *engineHarness {
 	t.Helper()
 
@@ -464,5 +542,160 @@ func TestCurrentExpiryBehaviorForPullAndEnvelopeSweep(t *testing.T) {
 	}
 	if _, err := h.envelopeStore.GetEnvelopeByID(context.Background(), "env-active"); err != nil {
 		t.Fatalf("active envelope should remain after sweep: %v", err)
+	}
+}
+
+func TestRelayIngestDurableWritePrecedesSignal(t *testing.T) {
+	st := newIngestStoreSpy()
+	eng := New(st, time.Hour)
+
+	observed := false
+	eng.SetRelayIngestObserver(func(ctx context.Context, signal RelayIngestSignal) {
+		observed = true
+		if signal.ItemID != "item-1" {
+			t.Fatalf("unexpected item_id: %q", signal.ItemID)
+		}
+		if !signal.Trusted {
+			t.Fatal("expected trusted relay ingest in authenticated context")
+		}
+		if _, err := st.GetMessageByID(ctx, signal.ItemID); err != nil {
+			t.Fatalf("relay_ingest emitted before durable write: %v", err)
+		}
+	})
+
+	msg := &model.Message{
+		ID:        "item-1",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "QQ",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
+
+	result, err := eng.AcceptRelayForward(context.Background(), "relay-peer-a", msg, 1024)
+	if err != nil {
+		t.Fatalf("accept relay forward: %v", err)
+	}
+	if result.Status != RelayForwardAccepted {
+		t.Fatalf("unexpected status: %s", result.Status)
+	}
+	if !observed {
+		t.Fatal("expected relay_ingest signal after durable write")
+	}
+	if st.persistCount != 1 {
+		t.Fatalf("expected one durable persist, got %d", st.persistCount)
+	}
+}
+
+func TestRelayIngestDuplicateIsIdempotentByItemID(t *testing.T) {
+	st := newIngestStoreSpy()
+	eng := New(st, time.Hour)
+
+	signalCount := 0
+	eng.SetRelayIngestObserver(func(context.Context, RelayIngestSignal) {
+		signalCount++
+	})
+
+	msg := &model.Message{
+		ID:        "item-dup",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "QQ",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
+
+	first, err := eng.AcceptRelayForward(context.Background(), "relay-a", msg, 1024)
+	if err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+	if first.Status != RelayForwardAccepted {
+		t.Fatalf("expected accepted status, got %s", first.Status)
+	}
+
+	second, err := eng.AcceptRelayForward(context.Background(), "relay-b", msg, 1024)
+	if err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	if second.Status != RelayForwardDuplicate {
+		t.Fatalf("expected duplicate status, got %s", second.Status)
+	}
+
+	if st.persistCount != 1 {
+		t.Fatalf("expected one durable write, got %d", st.persistCount)
+	}
+	if signalCount != 1 {
+		t.Fatalf("expected one relay_ingest signal, got %d", signalCount)
+	}
+}
+
+func TestRelayIngestPersistenceFailureEmitsNoSignal(t *testing.T) {
+	st := newIngestStoreSpy()
+	st.persistErr = errors.New("disk full")
+	eng := New(st, time.Hour)
+
+	signalCount := 0
+	eng.SetRelayIngestObserver(func(context.Context, RelayIngestSignal) {
+		signalCount++
+	})
+
+	msg := &model.Message{
+		ID:        "item-fail",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "QQ",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
+
+	if _, err := eng.AcceptRelayForward(context.Background(), "relay-a", msg, 1024); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	if signalCount != 0 {
+		t.Fatalf("expected no relay_ingest signal on persistence failure, got %d", signalCount)
+	}
+}
+
+func TestRelayIngestTrustBoundaryRequiresAuthenticatedRelayContext(t *testing.T) {
+	st := newIngestStoreSpy()
+	eng := New(st, time.Hour)
+
+	trustedFlags := make([]bool, 0, 2)
+	eng.SetRelayIngestObserver(func(_ context.Context, signal RelayIngestSignal) {
+		trustedFlags = append(trustedFlags, signal.Trusted)
+	})
+
+	unauthMsg := &model.Message{
+		ID:        "item-unauth",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "QQ",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
+	authMsg := &model.Message{
+		ID:        "item-auth",
+		From:      "alice",
+		To:        "bob",
+		Payload:   "QQ",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+	}
+
+	if _, err := eng.AcceptRelayForward(context.Background(), "", unauthMsg, 1024); err != nil {
+		t.Fatalf("unauth ingest unexpectedly failed: %v", err)
+	}
+	if _, err := eng.AcceptRelayForward(context.Background(), "relay-auth", authMsg, 1024); err != nil {
+		t.Fatalf("auth ingest unexpectedly failed: %v", err)
+	}
+
+	if len(trustedFlags) != 2 {
+		t.Fatalf("expected two relay_ingest signals, got %d", len(trustedFlags))
+	}
+	if trustedFlags[0] {
+		t.Fatal("expected unauthenticated relay context to be untrusted")
+	}
+	if !trustedFlags[1] {
+		t.Fatal("expected authenticated relay context to be trusted")
 	}
 }

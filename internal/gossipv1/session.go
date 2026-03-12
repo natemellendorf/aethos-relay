@@ -10,6 +10,8 @@ type EventType string
 
 const (
 	EventTypeHelloValidated EventType = "hello_validated"
+	EventTypeRelayIngest    EventType = "relay_ingest"
+	EventTypeUntrustedRelay EventType = "relay_ingest_untrusted"
 	EventTypeFatal          EventType = "fatal"
 	EventTypeIgnored        EventType = "ignored"
 )
@@ -18,6 +20,7 @@ type Event struct {
 	Type      EventType
 	FrameType string
 	Hello     *HelloPayload
+	ItemIDs   []string
 	Err       error
 }
 
@@ -100,12 +103,17 @@ func (s *SessionAdapter) PushInbound(chunk []byte) []Event {
 			s.helloValidated = true
 			events = append(events, Event{Type: EventTypeHelloValidated, FrameType: envelope.Type, Hello: &hello})
 		case FrameTypeRelayIngest:
+			relayIngest, err := ParseRelayIngestPayload(envelope.Payload)
+			if err != nil {
+				s.terminated = true
+				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
+			}
 			if !s.authenticatedRelay {
 				s.untrustedRelayIngest++
-				events = append(events, Event{Type: EventTypeIgnored, FrameType: envelope.Type})
+				events = append(events, Event{Type: EventTypeUntrustedRelay, FrameType: envelope.Type, ItemIDs: relayIngest.ItemIDs})
 				continue
 			}
-			events = append(events, Event{Type: EventTypeIgnored, FrameType: envelope.Type})
+			events = append(events, Event{Type: EventTypeRelayIngest, FrameType: envelope.Type, ItemIDs: relayIngest.ItemIDs})
 		case FrameTypeSummary, FrameTypeRequest, FrameTypeTransfer, FrameTypeReceipt:
 			events = append(events, Event{Type: EventTypeIgnored, FrameType: envelope.Type})
 		default:

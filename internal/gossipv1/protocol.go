@@ -55,6 +55,10 @@ type HelloPayload struct {
 	MaxTransfer      uint64   `cbor:"max_transfer"`
 }
 
+type RelayIngestPayload struct {
+	ItemIDs []string `cbor:"item_ids"`
+}
+
 func BuildRelayHello(relayID string) HelloPayload {
 	pubKey := sha256.Sum256([]byte("relay:" + relayID))
 	nodeIDDigest := sha256.Sum256(pubKey[:])
@@ -195,6 +199,28 @@ func ParseHelloPayload(payload map[string]any) (HelloPayload, error) {
 	}
 
 	return hello, nil
+}
+
+func ParseRelayIngestPayload(payload map[string]any) (RelayIngestPayload, error) {
+	if payload == nil {
+		return RelayIngestPayload{}, fmt.Errorf("gossipv1: relay_ingest payload is required")
+	}
+
+	allowed := map[string]struct{}{
+		"item_ids": {},
+	}
+	for key := range payload {
+		if _, ok := allowed[key]; !ok {
+			return RelayIngestPayload{}, fmt.Errorf("gossipv1: unknown relay_ingest payload field %q", key)
+		}
+	}
+
+	itemIDs, err := parseStringSlice(payload, "item_ids")
+	if err != nil {
+		return RelayIngestPayload{}, err
+	}
+
+	return RelayIngestPayload{ItemIDs: itemIDs}, nil
 }
 
 func ValidateHello(hello HelloPayload) error {

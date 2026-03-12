@@ -273,6 +273,9 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 			peer.Health.IsHealthy = true
 			peer.LastHelloAt = time.Now()
 			peer.healthMu.Unlock()
+		case gossipv1.EventTypeRelayIngest, gossipv1.EventTypeUntrustedRelay:
+			// Phase 2 parses relay_ingest frames and surfaces them for observation,
+			// but does not attach trusted relay-side effects in peer manager yet.
 		case gossipv1.EventTypeIgnored:
 			// Intentionally ignored.
 		}
