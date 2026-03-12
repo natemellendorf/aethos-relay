@@ -2,6 +2,7 @@
 id: relay_phase_3
 title: "aethos-relay — Phase 3 support full Gossip V1 client encounter flow"
 depends_on: [relay_phase_1, relay_phase_2]
+external_dependencies: []
 ---
 
 Bead: aethos-relay — Phase 3 support full Gossip V1 client encounter flow

@@ -2,6 +2,7 @@
 id: relay_phase_2
 title: "aethos-relay — Phase 2 implement authenticated ingest boundary and durable RELAY_INGEST semantics"
 depends_on: [relay_phase_1]
+external_dependencies: []
 ---
 
 Bead: aethos-relay — Phase 2 implement authenticated ingest boundary and durable RELAY_INGEST semantics

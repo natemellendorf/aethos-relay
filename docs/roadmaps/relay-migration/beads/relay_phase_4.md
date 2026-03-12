@@ -2,6 +2,7 @@
 id: relay_phase_4
 title: "aethos-relay — Phase 4 align relay-to-relay Gossip V1 behavior and add interoperability coverage"
 depends_on: [relay_phase_3]
+external_dependencies: []
 ---
 
 Bead: aethos-relay — Phase 4 align relay-to-relay Gossip V1 behavior and add interoperability coverage
