@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
@@ -210,6 +211,21 @@ func TestHandleSendSendOKCanonicalFieldsOnly(t *testing.T) {
 	}
 	if len(st.persisted) != 1 || st.persisted[0].Payload != "QQ" {
 		t.Fatalf("expected persisted canonical payload QQ, got %#v", st.persisted)
+	}
+}
+
+func TestHandleSendAnnounceFailureDoesNotBreakSendFlow(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	h.SetFederationManager(federation.NewPeerManager("relay-test", nil, nil, time.Hour))
+
+	client := newClientForWSHandler()
+	client.WayfarerID = "wayfarer-a"
+
+	h.handleSend(client, &model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: "QQ", TTLSeconds: 120})
+
+	frame := decodeFrameMap(t, readQueuedPayload(t, client))
+	if frame["type"] != model.FrameTypeSendOK {
+		t.Fatalf("expected send_ok despite federation announce failure, got %#v", frame)
 	}
 }
 
