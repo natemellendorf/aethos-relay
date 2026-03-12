@@ -25,6 +25,8 @@ const (
 	ProtocolDiagnosticsInterval = 10 * time.Second
 )
 
+var ErrFederationPropagationDisabled = errors.New("federation propagation disabled in Gossip V1 Phase 1")
+
 type Peer struct {
 	ID            string
 	URL           string
@@ -462,13 +464,24 @@ func (pm *PeerManager) PeerLastObserverError(peerID string) error {
 	return adapter.LastObserverError()
 }
 
-func (pm *PeerManager) AnnounceMessage(msg *model.Message) {
-	_ = msg
+func (pm *PeerManager) AnnounceMessage(msg *model.Message) error {
+	if msg == nil {
+		return fmt.Errorf("%w: announce attempted with nil message", ErrFederationPropagationDisabled)
+	}
+
+	return fmt.Errorf("%w: announce message id=%s", ErrFederationPropagationDisabled, msg.ID)
 }
 
-func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) {
-	_ = msg
-	_ = originRelayID
+func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) error {
+	if msg == nil {
+		return fmt.Errorf("%w: forward attempted with nil message", ErrFederationPropagationDisabled)
+	}
+
+	if originRelayID == "" {
+		return fmt.Errorf("%w: forward message id=%s with empty origin relay id", ErrFederationPropagationDisabled, msg.ID)
+	}
+
+	return fmt.Errorf("%w: forward message id=%s origin=%s", ErrFederationPropagationDisabled, msg.ID, originRelayID)
 }
 
 func (pm *PeerManager) GetPeers() map[string]PeerHealth {

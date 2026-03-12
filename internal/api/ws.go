@@ -320,7 +320,9 @@ func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
 
 	// Announce to federation peers (if federation is enabled)
 	if h.federationManager != nil {
-		h.federationManager.AnnounceMessage(msg)
+		if err := h.federationManager.AnnounceMessage(msg); err != nil {
+			log.Printf("ws: federation announce skipped msg_id=%s: %v", msg.ID, err)
+		}
 	}
 }
 

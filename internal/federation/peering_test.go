@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -210,6 +211,21 @@ func TestPeerManagerMetricsAndHealthHelpers(t *testing.T) {
 	pm.removePeer(peer)
 	if pm.GetPeerCount() != 0 {
 		t.Fatalf("expected peer count 0, got %d", pm.GetPeerCount())
+	}
+}
+
+func TestAnnounceMessageFailsFastWhenPropagationDisabled(t *testing.T) {
+	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+
+	err := pm.AnnounceMessage(&model.Message{ID: "msg-123"})
+	if err == nil {
+		t.Fatal("expected announce to fail when propagation is disabled")
+	}
+	if !errors.Is(err, ErrFederationPropagationDisabled) {
+		t.Fatalf("expected disabled propagation error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "Gossip V1 Phase 1") {
+		t.Fatalf("expected phase diagnostic in error, got %q", err.Error())
 	}
 }
 
