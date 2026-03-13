@@ -85,9 +85,10 @@ type TransferPayload struct {
 }
 
 type TransferObjectRejection struct {
-	Index  uint64 `cbor:"index"`
-	ID     string `cbor:"id,omitempty"`
-	Reason string `cbor:"reason"`
+	Index    uint64 `cbor:"index"`
+	ID       string `cbor:"id,omitempty"`
+	Reason   string `cbor:"reason"`
+	HasIndex bool   `cbor:"-"`
 }
 
 type ParsedTransferPayload struct {
@@ -361,8 +362,9 @@ func ParseTransferPayloadMixed(payload map[string]any) (ParsedTransferPayload, e
 		objMap, ok := coerceStringMap(candidate)
 		if !ok {
 			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
-				Index:  uint64(idx),
-				Reason: "object must be map",
+				Index:    uint64(idx),
+				Reason:   "object must be map",
+				HasIndex: true,
 			})
 			continue
 		}
@@ -370,17 +372,19 @@ func ParseTransferPayloadMixed(payload map[string]any) (ParsedTransferPayload, e
 		obj, err := parseTransferObject(objMap)
 		if err != nil {
 			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
-				Index:  uint64(idx),
-				Reason: err.Error(),
+				Index:    uint64(idx),
+				Reason:   err.Error(),
+				HasIndex: true,
 			})
 			continue
 		}
 
 		if _, exists := seenIDs[obj.ID]; exists {
 			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
-				Index:  uint64(idx),
-				ID:     obj.ID,
-				Reason: "duplicate id in transfer frame",
+				Index:    uint64(idx),
+				ID:       obj.ID,
+				Reason:   "duplicate id in transfer frame",
+				HasIndex: true,
 			})
 			continue
 		}
@@ -411,7 +415,9 @@ func ParseReceiptPayload(payload map[string]any) (ReceiptPayload, error) {
 	if err != nil {
 		return ReceiptPayload{}, err
 	}
-	accepted = dedupeStrings(accepted)
+	if hasDuplicateStrings(accepted) {
+		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt accepted contains duplicate ids")
+	}
 	if uint64(len(accepted)) > MaxReceiptItems {
 		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt accepted exceeds limit: %d > %d", len(accepted), MaxReceiptItems)
 	}
@@ -677,19 +683,26 @@ func parseReceiptRejected(payload map[string]any) ([]TransferObjectRejection, er
 		}
 
 		entry := TransferObjectRejection{Reason: reason}
-		if value, exists := mapped["id"]; exists {
-			id, ok := value.(string)
-			if !ok {
-				return nil, fmt.Errorf("gossipv1: rejected[%d].id must be string", idx)
+		_, hasID := mapped["id"]
+		if hasID {
+			id, err := parseString(mapped, "id")
+			if err != nil {
+				return nil, err
 			}
 			entry.ID = id
 		}
-		if _, exists := mapped["index"]; exists {
+		_, hasIndex := mapped["index"]
+		if hasIndex {
 			parsedIdx, err := parseUint(mapped, "index")
 			if err != nil {
 				return nil, err
 			}
 			entry.Index = parsedIdx
+			entry.HasIndex = true
+		}
+
+		if !hasID && !hasIndex {
+			return nil, fmt.Errorf("gossipv1: rejected[%d] must include id or index", idx)
 		}
 
 		rejected = append(rejected, entry)
@@ -714,6 +727,22 @@ func dedupeStrings(input []string) []string {
 	}
 
 	return output
+}
+
+func hasDuplicateStrings(input []string) bool {
+	if len(input) <= 1 {
+		return false
+	}
+
+	seen := make(map[string]struct{}, len(input))
+	for _, value := range input {
+		if _, ok := seen[value]; ok {
+			return true
+		}
+		seen[value] = struct{}{}
+	}
+
+	return false
 }
 
 func coerceAnySlice(value any) ([]any, bool) {

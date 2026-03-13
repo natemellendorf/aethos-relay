@@ -42,25 +42,31 @@ type SessionAdapter struct {
 	lastObserverError    error
 	untrustedRelayIngest int
 	awaitingReceipt      bool
-	expectedReceipt      map[string]struct{}
+	expectedReceiptOrder []string
+	expectedReceiptIndex map[string]uint64
 }
 
 func NewSessionAdapter(localHello HelloPayload, authenticatedRelay bool) *SessionAdapter {
 	return &SessionAdapter{
-		localHello:         localHello,
-		authenticatedRelay: authenticatedRelay,
-		expectedReceipt:    make(map[string]struct{}),
+		localHello:           localHello,
+		authenticatedRelay:   authenticatedRelay,
+		expectedReceiptIndex: make(map[string]uint64),
 	}
 }
 
 func (s *SessionAdapter) SetExpectedReceipt(ids []string) {
 	s.awaitingReceipt = true
-	s.expectedReceipt = make(map[string]struct{}, len(ids))
+	s.expectedReceiptOrder = make([]string, 0, len(ids))
+	s.expectedReceiptIndex = make(map[string]uint64, len(ids))
 	for _, id := range ids {
 		if id == "" {
 			continue
 		}
-		s.expectedReceipt[id] = struct{}{}
+		if _, exists := s.expectedReceiptIndex[id]; exists {
+			continue
+		}
+		s.expectedReceiptIndex[id] = uint64(len(s.expectedReceiptOrder))
+		s.expectedReceiptOrder = append(s.expectedReceiptOrder, id)
 	}
 }
 
@@ -168,7 +174,8 @@ func (s *SessionAdapter) PushInbound(chunk []byte) []Event {
 				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
 			}
 			s.awaitingReceipt = false
-			s.expectedReceipt = make(map[string]struct{})
+			s.expectedReceiptOrder = nil
+			s.expectedReceiptIndex = make(map[string]uint64)
 			events = append(events, Event{Type: EventTypeReceipt, FrameType: envelope.Type, Receipt: &receipt})
 		default:
 			s.terminated = true
@@ -182,21 +189,56 @@ func (s *SessionAdapter) validateExpectedReceipt(receipt ReceiptPayload) error {
 		return fmt.Errorf("gossipv1: unexpected receipt without pending transfer")
 	}
 
-	for _, acceptedID := range receipt.Accepted {
-		if _, ok := s.expectedReceipt[acceptedID]; ok {
-			continue
+	if len(s.expectedReceiptOrder) == 0 {
+		if len(receipt.Accepted) == 0 && len(receipt.Rejected) == 0 {
+			return nil
 		}
-		return fmt.Errorf("gossipv1: receipt accepted id %q not present in pending transfer", acceptedID)
+		return fmt.Errorf("gossipv1: receipt acknowledged items but pending transfer is empty")
+	}
+
+	acknowledged := make(map[string]struct{}, len(s.expectedReceiptOrder))
+
+	for _, acceptedID := range receipt.Accepted {
+		if _, ok := s.expectedReceiptIndex[acceptedID]; !ok {
+			return fmt.Errorf("gossipv1: receipt accepted id %q not present in pending transfer", acceptedID)
+		}
+		if _, duplicate := acknowledged[acceptedID]; duplicate {
+			return fmt.Errorf("gossipv1: duplicate acknowledgement for id %q", acceptedID)
+		}
+		acknowledged[acceptedID] = struct{}{}
 	}
 
 	for _, rejected := range receipt.Rejected {
-		if rejected.ID == "" {
-			continue
+		resolvedByIndex := ""
+		if rejected.HasIndex {
+			if rejected.Index >= uint64(len(s.expectedReceiptOrder)) {
+				return fmt.Errorf("gossipv1: receipt rejected index %d out of bounds for pending transfer size %d", rejected.Index, len(s.expectedReceiptOrder))
+			}
+			resolvedByIndex = s.expectedReceiptOrder[rejected.Index]
 		}
-		if _, ok := s.expectedReceipt[rejected.ID]; ok {
-			continue
+
+		resolvedID := rejected.ID
+		if resolvedID == "" {
+			if !rejected.HasIndex {
+				return fmt.Errorf("gossipv1: receipt rejected entry must include id or index")
+			}
+			resolvedID = resolvedByIndex
+		} else if _, ok := s.expectedReceiptIndex[resolvedID]; !ok {
+			return fmt.Errorf("gossipv1: receipt rejected id %q not present in pending transfer", resolvedID)
 		}
-		return fmt.Errorf("gossipv1: receipt rejected id %q not present in pending transfer", rejected.ID)
+
+		if rejected.HasIndex && rejected.ID != "" && resolvedByIndex != rejected.ID {
+			return fmt.Errorf("gossipv1: receipt rejected id %q does not match index %d (%q)", rejected.ID, rejected.Index, resolvedByIndex)
+		}
+
+		if _, duplicate := acknowledged[resolvedID]; duplicate {
+			return fmt.Errorf("gossipv1: duplicate acknowledgement for id %q", resolvedID)
+		}
+		acknowledged[resolvedID] = struct{}{}
+	}
+
+	if len(acknowledged) != len(s.expectedReceiptOrder) {
+		return fmt.Errorf("gossipv1: receipt coverage mismatch: got %d acknowledgements for %d pending items", len(acknowledged), len(s.expectedReceiptOrder))
 	}
 
 	return nil
