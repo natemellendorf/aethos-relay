@@ -87,12 +87,13 @@ func TestGossipV1RelayToRelayDuplicatesAndRepeatedEncountersConverge(t *testing.
 	relayA.peerManager.AddPeerURL(relayB.fedURL)
 
 	waitForMessage(t, relayB.store, msg.ID)
+	originNodeID := gossipv1.BuildRelayHello("relay-phase4-converge-a").NodeID
 
 	for i := 0; i < 3; i++ {
 		if err := relayA.peerManager.AnnounceMessage(msg); err != nil {
 			t.Fatalf("announce repeated summary iteration=%d: %v", i, err)
 		}
-		if err := relayB.peerManager.ForwardToPeers(msg, "relay-phase4-converge-a"); err != nil {
+		if err := relayB.peerManager.ForwardToPeers(msg, originNodeID); err != nil {
 			t.Fatalf("forward repeated summary iteration=%d: %v", i, err)
 		}
 	}
@@ -163,6 +164,33 @@ func TestGossipV1RelayToRelayInvalidObjectDoesNotPoisonValidState(t *testing.T) 
 	}, "source relay observes receipt rejection for invalid object")
 }
 
+func TestGossipV1RelayToRelayForwardToPeersSuppressesOriginNode(t *testing.T) {
+	relayA, _ := startRelayForTest(t, "relay-phase4-origin-a", true, "", true)
+	defer relayA.close()
+	relayB, _ := startRelayForTest(t, "relay-phase4-origin-b", true, "", true)
+	defer relayB.close()
+
+	recorderA := newFederationEventRecorder()
+	relayA.peerManager.SetEventObserver(recorderA.observe)
+
+	relayA.peerManager.AddPeerURL(relayB.fedURL)
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return relayA.peerManager.GetPeerCount() > 0 && relayB.peerManager.GetPeerCount() > 0
+	}, "peer managers establish sessions")
+
+	originNodeID := gossipv1.BuildRelayHello("relay-phase4-origin-a").NodeID
+	sentinelID := "phase4-origin-suppression-msg-1"
+	if err := relayB.peerManager.ForwardToPeers(&model.Message{ID: sentinelID}, originNodeID); err != nil {
+		t.Fatalf("forward summary with origin suppression: %v", err)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	if recorderA.hasSummaryID(sentinelID) {
+		t.Fatalf("origin relay should not receive forwarded summary for %s", sentinelID)
+	}
+}
+
 func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
 	relay, _ := startRelayForTest(t, "relay-phase4-cross-role", true, "", true)
 	defer relay.close()
@@ -209,9 +237,10 @@ func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
 }
 
 type federationEventRecorder struct {
-	mu       sync.Mutex
-	counts   map[gossipv1.EventType]int
-	receipts []gossipv1.ReceiptPayload
+	mu        sync.Mutex
+	counts    map[gossipv1.EventType]int
+	receipts  []gossipv1.ReceiptPayload
+	summaries []gossipv1.SummaryPayload
 }
 
 func newFederationEventRecorder() *federationEventRecorder {
@@ -225,6 +254,9 @@ func (r *federationEventRecorder) observe(_ *federation.Peer, event gossipv1.Eve
 	r.counts[event.Type]++
 	if event.Type == gossipv1.EventTypeReceipt && event.Receipt != nil {
 		r.receipts = append(r.receipts, *event.Receipt)
+	}
+	if event.Type == gossipv1.EventTypeSummary && event.Summary != nil {
+		r.summaries = append(r.summaries, *event.Summary)
 	}
 
 	return nil
@@ -263,6 +295,21 @@ func (r *federationEventRecorder) hasAcceptedID(id string) bool {
 	for _, receipt := range r.receipts {
 		for _, accepted := range receipt.Accepted {
 			if accepted == id {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (r *federationEventRecorder) hasSummaryID(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, summary := range r.summaries {
+		for _, haveID := range summary.Have {
+			if haveID == id {
 				return true
 			}
 		}

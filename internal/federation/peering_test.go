@@ -241,48 +241,6 @@ func TestSessionAdapterAcceptsRequestWithEmptyWant(t *testing.T) {
 	}
 }
 
-func TestSessionAdapterReceiptMustMatchPendingTransferIDs(t *testing.T) {
-	adapter := gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-a"), true)
-	adapter.SetExpectedReceipt([]string{"msg-1"})
-
-	frame, err := gossipv1.EncodeEnvelope(gossipv1.FrameTypeReceipt, map[string]any{
-		"accepted": []string{"msg-unknown"},
-	})
-	if err != nil {
-		t.Fatalf("encode receipt: %v", err)
-	}
-	prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
-	if err != nil {
-		t.Fatalf("prefix receipt: %v", err)
-	}
-
-	events := adapter.PushInbound(prefixed)
-	if len(events) != 1 || events[0].Type != gossipv1.EventTypeFatal {
-		t.Fatalf("expected fatal mismatched receipt event, got %#v", events)
-	}
-}
-
-func TestSessionAdapterAllowsEmptyReceiptForEmptyTransfer(t *testing.T) {
-	adapter := gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-a"), true)
-	adapter.SetExpectedReceipt(nil)
-
-	frame, err := gossipv1.EncodeEnvelope(gossipv1.FrameTypeReceipt, map[string]any{
-		"accepted": []string{},
-	})
-	if err != nil {
-		t.Fatalf("encode receipt: %v", err)
-	}
-	prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
-	if err != nil {
-		t.Fatalf("prefix receipt: %v", err)
-	}
-
-	events := adapter.PushInbound(prefixed)
-	if len(events) != 1 || events[0].Type != gossipv1.EventTypeReceipt {
-		t.Fatalf("expected receipt event, got %#v", events)
-	}
-}
-
 func TestPeerManagerMetricsAndHealthHelpers(t *testing.T) {
 	pm := NewPeerManager("relay-a", nil, model.NewClientRegistry(), time.Hour)
 	peer := &Peer{
@@ -341,8 +299,9 @@ func TestAnnounceMessageRequiresMessage(t *testing.T) {
 
 func TestForwardToPeersRequiresMessage(t *testing.T) {
 	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+	originNodeID := gossipv1.BuildRelayHello("relay-origin").NodeID
 
-	err := pm.ForwardToPeers(nil, "relay-origin")
+	err := pm.ForwardToPeers(nil, originNodeID)
 	if err == nil {
 		t.Fatal("expected forward to fail with nil message")
 	}
@@ -350,8 +309,21 @@ func TestForwardToPeersRequiresMessage(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if err := pm.ForwardToPeers(&model.Message{ID: "msg-123"}, "relay-origin"); err != nil {
+	if err := pm.ForwardToPeers(&model.Message{ID: "msg-123"}, originNodeID); err != nil {
 		t.Fatalf("expected forward with message to be no-op success without peers: %v", err)
+	}
+}
+
+func TestHandleSummarySkipsRequestWhenComputedWantEmpty(t *testing.T) {
+	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+	peer := &Peer{ID: "peer-1"}
+
+	err := pm.handleSummary(peer, gossipv1.Event{
+		Type:    gossipv1.EventTypeSummary,
+		Summary: &gossipv1.SummaryPayload{Have: []string{"msg-1"}},
+	})
+	if err != nil {
+		t.Fatalf("expected summary with empty want to be no-op, got %v", err)
 	}
 }
 

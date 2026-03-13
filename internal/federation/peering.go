@@ -388,7 +388,8 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 			return
 		}
 		if msgType != websocket.BinaryMessage {
-			continue
+			log.Printf("federation: non-binary frame from %s type=%d", peer.URL, msgType)
+			return
 		}
 
 		peer.adapterMu.Lock()
@@ -558,11 +559,11 @@ func (pm *PeerManager) AnnounceMessage(msg *model.Message) error {
 	return pm.forwardSummaryToPeers([]string{msg.ID}, "")
 }
 
-func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) error {
+func (pm *PeerManager) ForwardToPeers(msg *model.Message, originNodeID string) error {
 	if msg == nil {
 		return errors.New("federation: forward message is required")
 	}
-	return pm.forwardSummaryToPeers([]string{msg.ID}, originRelayID)
+	return pm.forwardSummaryToPeers([]string{msg.ID}, originNodeID)
 }
 
 func firstFatal(events []gossipv1.Event) error {
@@ -628,6 +629,9 @@ func (pm *PeerManager) handleSummary(peer *Peer, event gossipv1.Event) error {
 	want, err := pm.computeMissingWant(context.Background(), event.Summary.Have)
 	if err != nil {
 		return err
+	}
+	if len(want) == 0 {
+		return nil
 	}
 	return pm.sendEnvelope(peer, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: want})
 }
@@ -882,7 +886,7 @@ func relayForwardErrorReason(err error) string {
 	}
 }
 
-func (pm *PeerManager) forwardSummaryToPeers(ids []string, originRelayID string) error {
+func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -915,7 +919,7 @@ func (pm *PeerManager) forwardSummaryToPeers(ids []string, originRelayID string)
 		if peer == nil {
 			continue
 		}
-		if originRelayID != "" && peer.RemoteNodeID == originRelayID {
+		if originNodeID != "" && peer.RemoteNodeID == originNodeID {
 			continue
 		}
 		peers = append(peers, peer)
