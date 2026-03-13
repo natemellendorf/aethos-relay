@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -303,18 +302,35 @@ func TestPeerManagerMetricsAndHealthHelpers(t *testing.T) {
 	}
 }
 
-func TestAnnounceMessageFailsFastWhenPropagationDisabled(t *testing.T) {
+func TestAnnounceMessageRequiresMessage(t *testing.T) {
 	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
 
-	err := pm.AnnounceMessage(&model.Message{ID: "msg-123"})
+	err := pm.AnnounceMessage(nil)
 	if err == nil {
-		t.Fatal("expected announce to fail when propagation is disabled")
+		t.Fatal("expected announce to fail with nil message")
 	}
-	if !errors.Is(err, ErrFederationPropagationDisabled) {
-		t.Fatalf("expected disabled propagation error, got %v", err)
+	if err.Error() != "federation: announce message is required" {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "Gossip V1 Phase 1") {
-		t.Fatalf("expected phase diagnostic in error, got %q", err.Error())
+
+	if err := pm.AnnounceMessage(&model.Message{ID: "msg-123"}); err != nil {
+		t.Fatalf("expected announce with message to be no-op success without peers: %v", err)
+	}
+}
+
+func TestForwardToPeersRequiresMessage(t *testing.T) {
+	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+
+	err := pm.ForwardToPeers(nil, "relay-origin")
+	if err == nil {
+		t.Fatal("expected forward to fail with nil message")
+	}
+	if err.Error() != "federation: forward message is required" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := pm.ForwardToPeers(&model.Message{ID: "msg-123"}, "relay-origin"); err != nil {
+		t.Fatalf("expected forward with message to be no-op success without peers: %v", err)
 	}
 }
 

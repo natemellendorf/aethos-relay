@@ -1,10 +1,13 @@
 package federation
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
+	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
 const (
@@ -23,25 +27,29 @@ const (
 	ReconnectMaxDelay  = 60 * time.Second
 
 	ProtocolDiagnosticsInterval = 10 * time.Second
+
+	relayForwardMaxPayloadBytes = model.MAX_ENVELOPE_SIZE
 )
 
-var ErrFederationPropagationDisabled = errors.New("federation propagation disabled in Gossip V1 Phase 1")
-
 type Peer struct {
-	ID            string
-	URL           string
-	Outbound      bool
-	Conn          *websocket.Conn
-	ConnectedAt   time.Time
-	LastHelloAt   time.Time
-	Health        PeerHealth
-	healthMu      sync.Mutex
-	Done          chan struct{}
-	doneOnce      sync.Once
-	adapter       *gossipv1.SessionAdapter
-	adapterMu     sync.Mutex
-	LastMalformed time.Time
-	Metrics       *model.PeerMetrics
+	ID             string
+	URL            string
+	RemoteNodeID   string
+	Outbound       bool
+	Conn           *websocket.Conn
+	writeMu        sync.Mutex
+	localHelloSent bool
+	summarySent    bool
+	ConnectedAt    time.Time
+	LastHelloAt    time.Time
+	Health         PeerHealth
+	healthMu       sync.Mutex
+	Done           chan struct{}
+	doneOnce       sync.Once
+	adapter        *gossipv1.SessionAdapter
+	adapterMu      sync.Mutex
+	LastMalformed  time.Time
+	Metrics        *model.PeerMetrics
 }
 
 type PeerHealth struct {
@@ -87,6 +95,8 @@ type PeerManager struct {
 
 	tarConfig        *TARConfig
 	forwardingConfig *ForwardingConfig
+	envelopeStore    store.EnvelopeStore
+	engine           *storeforward.Engine
 
 	peerMetrics map[string]*model.PeerMetrics
 	metricsMu   sync.RWMutex
@@ -107,7 +117,13 @@ func NewPeerManagerWithConfig(relayID string, st store.Store, clients *model.Cli
 		panic(err)
 	}
 
-	return &PeerManager{
+	var engine *storeforward.Engine
+	if st != nil {
+		engine = storeforward.New(st, maxTTL)
+		engine.ConfigureFederation(relayID, nil)
+	}
+
+	pm := &PeerManager{
 		relayID:          relayID,
 		store:            st,
 		clients:          clients,
@@ -118,16 +134,37 @@ func NewPeerManagerWithConfig(relayID string, st store.Store, clients *model.Cli
 		inbound:          make(chan *Peer, 100),
 		tarConfig:        tarConfig,
 		forwardingConfig: forwardingConfig,
+		engine:           engine,
 		peerMetrics:      make(map[string]*model.PeerMetrics),
 	}
+
+	if pm.engine != nil {
+		pm.engine.SetRelayIngestObserver(func(_ context.Context, signal storeforward.RelayIngestSignal) {
+			if signal.ItemID == "" {
+				return
+			}
+			if err := pm.forwardSummaryToPeers([]string{signal.ItemID}, signal.SourceRelay); err != nil {
+				log.Printf("federation: failed propagating relay ingest summary item=%s err=%v", signal.ItemID, err)
+			}
+		})
+	}
+
+	return pm
 }
 
 func (pm *PeerManager) SetEnvelopeStore(envelopeStore store.EnvelopeStore) {
-	_ = envelopeStore
+	pm.envelopeStore = envelopeStore
+	if pm.engine == nil {
+		return
+	}
+	pm.engine.ConfigureFederation(pm.relayID, envelopeStore)
 }
 
 func (pm *PeerManager) SetAckDrivenSuppression(enabled bool) {
-	_ = enabled
+	if pm.engine == nil {
+		return
+	}
+	pm.engine.SetAckDrivenSuppression(enabled)
 }
 
 func (pm *PeerManager) SetEventObserver(observer func(*Peer, gossipv1.Event) error) {
@@ -231,9 +268,10 @@ func (pm *PeerManager) runEncounter(peer *Peer) error {
 	if err != nil {
 		return err
 	}
-	if err := peer.Conn.WriteMessage(websocket.BinaryMessage, helloBytes); err != nil {
+	if err := pm.writePeerMessage(peer, websocket.BinaryMessage, helloBytes); err != nil {
 		return fmt.Errorf("send HELLO: %w", err)
 	}
+	peer.localHelloSent = true
 
 	if err := peer.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return err
@@ -268,11 +306,52 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 
 		switch event.Type {
 		case gossipv1.EventTypeHelloValidated:
+			if event.Hello == nil {
+				return errors.New("gossipv1: hello event missing payload")
+			}
+			if peer.RemoteNodeID == "" {
+				peer.RemoteNodeID = event.Hello.NodeID
+			} else if peer.RemoteNodeID != event.Hello.NodeID {
+				return fmt.Errorf("gossipv1: peer node id changed from %s to %s", peer.RemoteNodeID, event.Hello.NodeID)
+			}
+
 			peer.healthMu.Lock()
 			peer.Health.LastSeen = time.Now()
 			peer.Health.IsHealthy = true
 			peer.LastHelloAt = time.Now()
 			peer.healthMu.Unlock()
+
+			if err := pm.sendSummary(peer); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeSummary:
+			if !adapter.IsHealthy() {
+				return errors.New("gossipv1: summary before hello")
+			}
+			if err := pm.handleSummary(peer, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeRequest:
+			if !adapter.IsHealthy() {
+				return errors.New("gossipv1: request before hello")
+			}
+			if err := pm.handleRequest(peer, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeTransfer:
+			if !adapter.IsHealthy() {
+				return errors.New("gossipv1: transfer before hello")
+			}
+			if err := pm.handleTransfer(peer, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeReceipt:
+			if !adapter.IsHealthy() {
+				return errors.New("gossipv1: receipt before hello")
+			}
+			if err := pm.handleReceipt(peer, event); err != nil {
+				return err
+			}
 		case gossipv1.EventTypeRelayIngest, gossipv1.EventTypeUntrustedRelay:
 			// Phase 2 parses relay_ingest frames and surfaces them for observation,
 			// but does not attach trusted relay-side effects in peer manager yet.
@@ -337,7 +416,7 @@ func (pm *PeerManager) writeLoop(peer *Peer) {
 		case <-peer.Done:
 			return
 		case <-ticker.C:
-			if err := peer.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := pm.writePeerMessage(peer, websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
@@ -424,19 +503,24 @@ func (pm *PeerManager) acceptInboundEncounter(peer *Peer) error {
 	}
 
 	events := adapter.PushInbound(data)
-	if err := pm.processEvents(peer, adapter, events); err != nil {
+	if err := firstFatal(events); err != nil {
 		return err
-	}
-	if !adapter.IsHealthy() {
-		return errors.New("gossip session unhealthy after inbound HELLO")
 	}
 
 	helloBytes, err := adapter.InitialHelloBytes()
 	if err != nil {
 		return err
 	}
-	if err := peer.Conn.WriteMessage(websocket.BinaryMessage, helloBytes); err != nil {
+	if err := pm.writePeerMessage(peer, websocket.BinaryMessage, helloBytes); err != nil {
 		return err
+	}
+	peer.localHelloSent = true
+
+	if err := pm.processEvents(peer, adapter, events); err != nil {
+		return err
+	}
+	if !adapter.IsHealthy() {
+		return errors.New("gossip session unhealthy after inbound HELLO")
 	}
 
 	peer.adapterMu.Lock()
@@ -469,22 +553,389 @@ func (pm *PeerManager) PeerLastObserverError(peerID string) error {
 
 func (pm *PeerManager) AnnounceMessage(msg *model.Message) error {
 	if msg == nil {
-		return fmt.Errorf("%w: announce attempted with nil message", ErrFederationPropagationDisabled)
+		return errors.New("federation: announce message is required")
 	}
-
-	return fmt.Errorf("%w: announce message id=%s", ErrFederationPropagationDisabled, msg.ID)
+	return pm.forwardSummaryToPeers([]string{msg.ID}, "")
 }
 
 func (pm *PeerManager) ForwardToPeers(msg *model.Message, originRelayID string) error {
 	if msg == nil {
-		return fmt.Errorf("%w: forward attempted with nil message", ErrFederationPropagationDisabled)
+		return errors.New("federation: forward message is required")
+	}
+	return pm.forwardSummaryToPeers([]string{msg.ID}, originRelayID)
+}
+
+func firstFatal(events []gossipv1.Event) error {
+	for _, event := range events {
+		if event.Type == gossipv1.EventTypeFatal {
+			return event.Err
+		}
+	}
+	return nil
+}
+
+func (pm *PeerManager) writePeerMessage(peer *Peer, messageType int, payload []byte) error {
+	if peer == nil || peer.Conn == nil {
+		return errors.New("federation: peer connection is not available")
 	}
 
-	if originRelayID == "" {
-		return fmt.Errorf("%w: forward message id=%s with empty origin relay id", ErrFederationPropagationDisabled, msg.ID)
+	peer.writeMu.Lock()
+	defer peer.writeMu.Unlock()
+	return peer.Conn.WriteMessage(messageType, payload)
+}
+
+func (pm *PeerManager) sendEnvelope(peer *Peer, frameType string, payload any) error {
+	frame, err := gossipv1.EncodeEnvelope(frameType, payload)
+	if err != nil {
+		return err
+	}
+	prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
+	if err != nil {
+		return err
+	}
+	return pm.writePeerMessage(peer, websocket.BinaryMessage, prefixed)
+}
+
+func (pm *PeerManager) sendSummary(peer *Peer) error {
+	if peer == nil {
+		return errors.New("federation: peer is required for summary")
+	}
+	if peer.Conn == nil {
+		return nil
+	}
+	if !peer.localHelloSent {
+		return nil
+	}
+	if peer.summarySent {
+		return nil
 	}
 
-	return fmt.Errorf("%w: forward message id=%s origin=%s", ErrFederationPropagationDisabled, msg.ID, originRelayID)
+	have, err := pm.listSummaryHaveIDs(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: have}); err != nil {
+		return err
+	}
+	peer.summarySent = true
+	return nil
+}
+
+func (pm *PeerManager) handleSummary(peer *Peer, event gossipv1.Event) error {
+	if event.Summary == nil {
+		return errors.New("gossipv1: summary event missing payload")
+	}
+	want, err := pm.computeMissingWant(context.Background(), event.Summary.Have)
+	if err != nil {
+		return err
+	}
+	return pm.sendEnvelope(peer, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: want})
+}
+
+func (pm *PeerManager) handleRequest(peer *Peer, event gossipv1.Event) error {
+	if event.Request == nil {
+		return errors.New("gossipv1: request event missing payload")
+	}
+	if len(event.Request.Want) == 0 {
+		return nil
+	}
+
+	objects, expectedReceiptIDs, err := pm.buildTransferObjects(context.Background(), event.Request.Want)
+	if err != nil {
+		return err
+	}
+
+	peer.adapterMu.Lock()
+	if peer.adapter != nil {
+		peer.adapter.SetExpectedReceipt(expectedReceiptIDs)
+	}
+	peer.adapterMu.Unlock()
+
+	return pm.sendEnvelope(peer, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: objects})
+}
+
+func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
+	if event.Transfer == nil {
+		return errors.New("gossipv1: transfer event missing payload")
+	}
+	if pm.engine == nil {
+		return errors.New("federation: relay forward engine is not configured")
+	}
+
+	receipt := gossipv1.ReceiptPayload{
+		Accepted: make([]string, 0, len(event.Transfer.Objects)),
+		Rejected: append([]gossipv1.TransferObjectRejection(nil), event.Transfer.Rejected...),
+	}
+
+	for _, indexed := range event.Transfer.Objects {
+		msg, err := transferObjectToMessage(indexed.Object)
+		if err != nil {
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
+				Index:  indexed.Index,
+				ID:     indexed.Object.ID,
+				Reason: err.Error(),
+			})
+			continue
+		}
+
+		result, err := pm.engine.AcceptRelayForward(context.Background(), peer.RemoteNodeID, msg, relayForwardMaxPayloadBytes)
+		if err != nil {
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
+				Index:  indexed.Index,
+				ID:     indexed.Object.ID,
+				Reason: relayForwardErrorReason(err),
+			})
+			continue
+		}
+
+		switch result.Status {
+		case storeforward.RelayForwardAccepted, storeforward.RelayForwardDuplicate, storeforward.RelayForwardSeenLoop:
+			receipt.Accepted = append(receipt.Accepted, msg.ID)
+		case storeforward.RelayForwardExpired:
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "object already expired"})
+		case storeforward.RelayForwardTooLarge:
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "payload exceeds relay limit"})
+		case storeforward.RelayForwardInvalid:
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "invalid transfer object"})
+		default:
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "relay forward rejected"})
+		}
+	}
+
+	if len(receipt.Accepted) > 1 {
+		sort.Strings(receipt.Accepted)
+	}
+
+	return pm.sendEnvelope(peer, gossipv1.FrameTypeReceipt, receipt)
+}
+
+func (pm *PeerManager) handleReceipt(_ *Peer, event gossipv1.Event) error {
+	if event.Receipt == nil {
+		return errors.New("gossipv1: receipt event missing payload")
+	}
+	return nil
+}
+
+func (pm *PeerManager) listSummaryHaveIDs(ctx context.Context) ([]string, error) {
+	if pm.store == nil {
+		return []string{}, nil
+	}
+
+	recipients, err := pm.store.GetAllRecipientIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	have := make([]string, 0)
+	for _, recipientID := range recipients {
+		ids, err := pm.store.GetAllQueuedMessageIDs(ctx, recipientID)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			if id == "" {
+				continue
+			}
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			have = append(have, id)
+		}
+	}
+
+	if len(have) > 1 {
+		sort.Strings(have)
+	}
+	if uint64(len(have)) > gossipv1.MaxSummaryItems {
+		have = have[:gossipv1.MaxSummaryItems]
+	}
+
+	return have, nil
+}
+
+func (pm *PeerManager) computeMissingWant(ctx context.Context, have []string) ([]string, error) {
+	if pm.store == nil {
+		return []string{}, nil
+	}
+	if len(have) == 0 {
+		return []string{}, nil
+	}
+
+	want := make([]string, 0, len(have))
+	for _, id := range have {
+		if id == "" {
+			continue
+		}
+		msg, err := pm.store.GetMessageByID(ctx, id)
+		if err != nil {
+			if isNotFoundError(err) {
+				want = append(want, id)
+				continue
+			}
+			return nil, err
+		}
+		if msg == nil {
+			want = append(want, id)
+		}
+	}
+
+	if len(want) > 1 {
+		sort.Strings(want)
+	}
+	if uint64(len(want)) > gossipv1.MaxWantItems {
+		want = want[:gossipv1.MaxWantItems]
+	}
+
+	return want, nil
+}
+
+func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string) ([]gossipv1.TransferObject, []string, error) {
+	if pm.store == nil {
+		return []gossipv1.TransferObject{}, []string{}, nil
+	}
+	objects := make([]gossipv1.TransferObject, 0, len(want))
+	ids := make([]string, 0, len(want))
+	now := time.Now().UTC()
+
+	for _, id := range want {
+		if uint64(len(objects)) >= gossipv1.MaxTransferItems {
+			break
+		}
+		if id == "" {
+			continue
+		}
+
+		msg, err := pm.store.GetMessageByID(ctx, id)
+		if err != nil {
+			if isNotFoundError(err) {
+				continue
+			}
+			return nil, nil, err
+		}
+		if msg == nil || !msg.ExpiresAt.After(now) {
+			continue
+		}
+
+		objects = append(objects, gossipv1.TransferObject{
+			ID:         msg.ID,
+			From:       msg.From,
+			To:         msg.To,
+			PayloadB64: msg.Payload,
+			CreatedAt:  msg.CreatedAt.UTC().Unix(),
+			ExpiresAt:  msg.ExpiresAt.UTC().Unix(),
+		})
+		ids = append(ids, msg.ID)
+	}
+
+	return objects, ids, nil
+}
+
+func transferObjectToMessage(object gossipv1.TransferObject) (*model.Message, error) {
+	if object.ID == "" {
+		return nil, errors.New("id is required")
+	}
+	if object.From == "" {
+		return nil, errors.New("from is required")
+	}
+	if object.To == "" {
+		return nil, errors.New("to is required")
+	}
+	if object.PayloadB64 == "" {
+		return nil, errors.New("payload_b64 is required")
+	}
+	if _, err := model.DecodePayloadB64(object.PayloadB64); err != nil {
+		return nil, errors.New("invalid payload_b64")
+	}
+	if object.CreatedAt <= 0 {
+		return nil, errors.New("created_at must be > 0")
+	}
+	if object.ExpiresAt <= object.CreatedAt {
+		return nil, errors.New("expires_at must be greater than created_at")
+	}
+
+	createdAt := time.Unix(object.CreatedAt, 0).UTC()
+	expiresAt := time.Unix(object.ExpiresAt, 0).UTC()
+	if !expiresAt.After(createdAt) {
+		return nil, errors.New("expires_at must be greater than created_at")
+	}
+
+	return &model.Message{
+		ID:        object.ID,
+		From:      object.From,
+		To:        object.To,
+		Payload:   object.PayloadB64,
+		CreatedAt: createdAt,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func relayForwardErrorReason(err error) string {
+	switch {
+	case errors.Is(err, storeforward.ErrForwardMessageTooLarge):
+		return "payload exceeds relay limit"
+	case errors.Is(err, storeforward.ErrForwardMessageInvalid):
+		return "invalid transfer object"
+	default:
+		return "persist failed"
+	}
+}
+
+func (pm *PeerManager) forwardSummaryToPeers(ids []string, originRelayID string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(ids))
+	have := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		have = append(have, id)
+	}
+	if len(have) == 0 {
+		return nil
+	}
+	if len(have) > 1 {
+		sort.Strings(have)
+	}
+	if uint64(len(have)) > gossipv1.MaxSummaryItems {
+		have = have[:gossipv1.MaxSummaryItems]
+	}
+
+	pm.peersMu.RLock()
+	peers := make([]*Peer, 0, len(pm.peers))
+	for _, peer := range pm.peers {
+		if peer == nil {
+			continue
+		}
+		if originRelayID != "" && peer.RemoteNodeID == originRelayID {
+			continue
+		}
+		peers = append(peers, peer)
+	}
+	pm.peersMu.RUnlock()
+
+	for _, peer := range peers {
+		if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: have}); err != nil {
+			log.Printf("federation: failed forwarding summary to peer=%s err=%v", peer.ID, err)
+		}
+	}
+
+	return nil
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
 func (pm *PeerManager) GetPeers() map[string]PeerHealth {

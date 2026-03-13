@@ -110,6 +110,7 @@ func TestCompatibilityHarnessRejectsNonBinaryFrames(t *testing.T) {
 
 type relayHarness struct {
 	store       *store.BBoltStore
+	envelope    *store.BBoltEnvelopeStore
 	clients     *model.ClientRegistry
 	server      *httptest.Server
 	peerManager *federation.PeerManager
@@ -121,6 +122,9 @@ func (r *relayHarness) close() {
 		r.peerManager.Stop()
 	}
 	r.server.Close()
+	if r.envelope != nil {
+		_ = r.envelope.Close()
+	}
 	_ = r.store.Close()
 }
 
@@ -142,8 +146,15 @@ func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, pee
 	mux.HandleFunc("/ws", wsHandler.HandleWebSocket)
 
 	var pm *federation.PeerManager
+	var envelopeStore *store.BBoltEnvelopeStore
 	if federationEnabled {
+		envelopeStore = store.NewBBoltEnvelopeStore(dir + "/relay.db.envelopes")
+		if err := envelopeStore.Open(); err != nil {
+			t.Fatalf("open envelope store: %v", err)
+		}
+
 		pm = federation.NewPeerManager(relayID, st, clients, 24*time.Hour)
+		pm.SetEnvelopeStore(envelopeStore)
 		pm.SetAckDrivenSuppression(ackDrivenSuppression)
 		wsHandler.SetFederationManager(pm)
 		mux.HandleFunc("/federation/ws", pm.HandleInboundPeer)
@@ -157,7 +168,7 @@ func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, pee
 
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/ws"
 	fedURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/federation/ws"
-	return &relayHarness{store: st, clients: clients, server: srv, peerManager: pm, fedURL: fedURL}, wsURL
+	return &relayHarness{store: st, envelope: envelopeStore, clients: clients, server: srv, peerManager: pm, fedURL: fedURL}, wsURL
 }
 
 func mustDial(t *testing.T, wsURL string) *websocket.Conn {
