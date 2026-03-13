@@ -262,6 +262,27 @@ func TestSessionAdapterReceiptMustMatchPendingTransferIDs(t *testing.T) {
 	}
 }
 
+func TestSessionAdapterAllowsEmptyReceiptForEmptyTransfer(t *testing.T) {
+	adapter := gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-a"), true)
+	adapter.SetExpectedReceipt(nil)
+
+	frame, err := gossipv1.EncodeEnvelope(gossipv1.FrameTypeReceipt, map[string]any{
+		"accepted": []string{},
+	})
+	if err != nil {
+		t.Fatalf("encode receipt: %v", err)
+	}
+	prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
+	if err != nil {
+		t.Fatalf("prefix receipt: %v", err)
+	}
+
+	events := adapter.PushInbound(prefixed)
+	if len(events) != 1 || events[0].Type != gossipv1.EventTypeReceipt {
+		t.Fatalf("expected receipt event, got %#v", events)
+	}
+}
+
 func TestPeerManagerMetricsAndHealthHelpers(t *testing.T) {
 	pm := NewPeerManager("relay-a", nil, model.NewClientRegistry(), time.Hour)
 	peer := &Peer{

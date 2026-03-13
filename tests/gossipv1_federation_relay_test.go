@@ -43,17 +43,22 @@ func TestGossipV1RelayToRelayFullEncounterReplicatesMessage(t *testing.T) {
 		return relayA.peerManager.GetPeerCount() > 0 && relayB.peerManager.GetPeerCount() > 0
 	}, "peer managers establish sessions")
 
-	eventCounts := mergeEventCounts(recorderA.snapshotCounts(), recorderB.snapshotCounts())
 	required := []gossipv1.EventType{
 		gossipv1.EventTypeHelloValidated,
 		gossipv1.EventTypeSummary,
 		gossipv1.EventTypeRequest,
+		gossipv1.EventTypeTransfer,
+		gossipv1.EventTypeReceipt,
 	}
-	for _, eventType := range required {
-		if eventCounts[eventType] == 0 {
-			t.Fatalf("expected at least one %s event, got 0", eventType)
+	waitForCondition(t, 5*time.Second, func() bool {
+		eventCounts := mergeEventCounts(recorderA.snapshotCounts(), recorderB.snapshotCounts())
+		for _, eventType := range required {
+			if eventCounts[eventType] == 0 {
+				return false
+			}
 		}
-	}
+		return true
+	}, "relays observe full hello-summary-request-transfer-receipt encounter")
 
 	waitForCondition(t, 5*time.Second, func() bool {
 		return recorderA.hasAcceptedID(msg.ID)
@@ -156,6 +161,51 @@ func TestGossipV1RelayToRelayInvalidObjectDoesNotPoisonValidState(t *testing.T) 
 	waitForCondition(t, 5*time.Second, func() bool {
 		return recorderA.hasRejectedID(invalid.ID)
 	}, "source relay observes receipt rejection for invalid object")
+}
+
+func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
+	relay, _ := startRelayForTest(t, "relay-phase4-cross-role", true, "", true)
+	defer relay.close()
+
+	conn := mustDial(t, relay.fedURL)
+	defer conn.Close()
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeHello, gossipv1.BuildRelayHello("client-like-federation-peer"))
+
+	remoteHello := readEnvelope(t, conn)
+	assertFrameType(t, remoteHello, gossipv1.FrameTypeHello)
+
+	initialSummary := readEnvelope(t, conn)
+	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: []string{"phase4-cross-role-msg-1"}})
+
+	request := readEnvelope(t, conn)
+	assertFrameType(t, request, gossipv1.FrameTypeRequest)
+
+	now := time.Now().UTC()
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{{
+		ID:         "phase4-cross-role-msg-1",
+		From:       "sender-cross-role",
+		To:         "wayfarer-cross-role",
+		PayloadB64: "QQ",
+		CreatedAt:  now.Unix(),
+		ExpiresAt:  now.Add(time.Hour).Unix(),
+	}}})
+
+	receipt := readEnvelope(t, conn)
+	assertFrameType(t, receipt, gossipv1.FrameTypeReceipt)
+	parsedReceipt, err := gossipv1.ParseReceiptPayload(receipt.Payload)
+	if err != nil {
+		t.Fatalf("parse receipt: %v", err)
+	}
+	if len(parsedReceipt.Accepted) != 1 || parsedReceipt.Accepted[0] != "phase4-cross-role-msg-1" {
+		t.Fatalf("unexpected receipt payload: %#v", parsedReceipt)
+	}
+
+	if _, err := relay.store.GetMessageByID(context.Background(), "phase4-cross-role-msg-1"); err != nil {
+		t.Fatalf("expected persisted cross-role message: %v", err)
+	}
 }
 
 type federationEventRecorder struct {

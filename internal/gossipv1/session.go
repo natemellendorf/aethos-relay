@@ -41,6 +41,7 @@ type SessionAdapter struct {
 	lastFrameType        string
 	lastObserverError    error
 	untrustedRelayIngest int
+	awaitingReceipt      bool
 	expectedReceipt      map[string]struct{}
 }
 
@@ -53,6 +54,7 @@ func NewSessionAdapter(localHello HelloPayload, authenticatedRelay bool) *Sessio
 }
 
 func (s *SessionAdapter) SetExpectedReceipt(ids []string) {
+	s.awaitingReceipt = true
 	s.expectedReceipt = make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		if id == "" {
@@ -165,6 +167,7 @@ func (s *SessionAdapter) PushInbound(chunk []byte) []Event {
 				s.terminated = true
 				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
 			}
+			s.awaitingReceipt = false
 			s.expectedReceipt = make(map[string]struct{})
 			events = append(events, Event{Type: EventTypeReceipt, FrameType: envelope.Type, Receipt: &receipt})
 		default:
@@ -175,7 +178,7 @@ func (s *SessionAdapter) PushInbound(chunk []byte) []Event {
 }
 
 func (s *SessionAdapter) validateExpectedReceipt(receipt ReceiptPayload) error {
-	if len(s.expectedReceipt) == 0 {
+	if !s.awaitingReceipt {
 		return fmt.Errorf("gossipv1: unexpected receipt without pending transfer")
 	}
 
