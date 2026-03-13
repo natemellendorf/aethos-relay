@@ -10,6 +10,10 @@ type EventType string
 
 const (
 	EventTypeHelloValidated EventType = "hello_validated"
+	EventTypeSummary        EventType = "summary"
+	EventTypeRequest        EventType = "request"
+	EventTypeTransfer       EventType = "transfer"
+	EventTypeReceipt        EventType = "receipt"
 	EventTypeRelayIngest    EventType = "relay_ingest"
 	EventTypeUntrustedRelay EventType = "relay_ingest_untrusted"
 	EventTypeFatal          EventType = "fatal"
@@ -20,6 +24,10 @@ type Event struct {
 	Type      EventType
 	FrameType string
 	Hello     *HelloPayload
+	Summary   *SummaryPayload
+	Request   *RequestPayload
+	Transfer  *ParsedTransferPayload
+	Receipt   *ReceiptPayload
 	ItemIDs   []string
 	Err       error
 }
@@ -33,12 +41,24 @@ type SessionAdapter struct {
 	lastFrameType        string
 	lastObserverError    error
 	untrustedRelayIngest int
+	expectedReceipt      map[string]struct{}
 }
 
 func NewSessionAdapter(localHello HelloPayload, authenticatedRelay bool) *SessionAdapter {
 	return &SessionAdapter{
 		localHello:         localHello,
 		authenticatedRelay: authenticatedRelay,
+		expectedReceipt:    make(map[string]struct{}),
+	}
+}
+
+func (s *SessionAdapter) SetExpectedReceipt(ids []string) {
+	s.expectedReceipt = make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		s.expectedReceipt[id] = struct{}{}
 	}
 }
 
@@ -114,13 +134,69 @@ func (s *SessionAdapter) PushInbound(chunk []byte) []Event {
 				continue
 			}
 			events = append(events, Event{Type: EventTypeRelayIngest, FrameType: envelope.Type, ItemIDs: relayIngest.ItemIDs})
-		case FrameTypeSummary, FrameTypeRequest, FrameTypeTransfer, FrameTypeReceipt:
-			events = append(events, Event{Type: EventTypeIgnored, FrameType: envelope.Type})
+		case FrameTypeSummary:
+			summary, err := ParseSummaryPayload(envelope.Payload)
+			if err != nil {
+				s.terminated = true
+				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
+			}
+			events = append(events, Event{Type: EventTypeSummary, FrameType: envelope.Type, Summary: &summary})
+		case FrameTypeRequest:
+			request, err := ParseRequestPayload(envelope.Payload)
+			if err != nil {
+				s.terminated = true
+				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
+			}
+			events = append(events, Event{Type: EventTypeRequest, FrameType: envelope.Type, Request: &request})
+		case FrameTypeTransfer:
+			transfer, err := ParseTransferPayloadMixed(envelope.Payload)
+			if err != nil {
+				s.terminated = true
+				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
+			}
+			events = append(events, Event{Type: EventTypeTransfer, FrameType: envelope.Type, Transfer: &transfer})
+		case FrameTypeReceipt:
+			receipt, err := ParseReceiptPayload(envelope.Payload)
+			if err != nil {
+				s.terminated = true
+				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
+			}
+			if err := s.validateExpectedReceipt(receipt); err != nil {
+				s.terminated = true
+				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
+			}
+			s.expectedReceipt = make(map[string]struct{})
+			events = append(events, Event{Type: EventTypeReceipt, FrameType: envelope.Type, Receipt: &receipt})
 		default:
 			s.terminated = true
 			return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: fmt.Errorf("gossipv1: unknown frame type %q", envelope.Type)})
 		}
 	}
+}
+
+func (s *SessionAdapter) validateExpectedReceipt(receipt ReceiptPayload) error {
+	if len(s.expectedReceipt) == 0 {
+		return fmt.Errorf("gossipv1: unexpected receipt without pending transfer")
+	}
+
+	for _, acceptedID := range receipt.Accepted {
+		if _, ok := s.expectedReceipt[acceptedID]; ok {
+			continue
+		}
+		return fmt.Errorf("gossipv1: receipt accepted id %q not present in pending transfer", acceptedID)
+	}
+
+	for _, rejected := range receipt.Rejected {
+		if rejected.ID == "" {
+			continue
+		}
+		if _, ok := s.expectedReceipt[rejected.ID]; ok {
+			continue
+		}
+		return fmt.Errorf("gossipv1: receipt rejected id %q not present in pending transfer", rejected.ID)
+	}
+
+	return nil
 }
 
 func (s *SessionAdapter) ObserveNonFatal(err error) {

@@ -2,18 +2,17 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
-	"unicode"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"github.com/natemellendorf/aethos-relay/internal/federation"
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -34,36 +33,43 @@ func NewOriginChecker(allowedOrigins string, devMode bool) *OriginChecker {
 		allowedOrigins: make(map[string]bool),
 		devMode:        devMode,
 	}
-	// In dev mode, allow all origins
 	if devMode {
 		return oc
 	}
-	// Parse allowed origins
+
 	for _, origin := range strings.Split(allowedOrigins, ",") {
 		origin = strings.TrimSpace(origin)
-		if origin != "" {
-			oc.allowedOrigins[origin] = true
+		if origin == "" {
+			continue
 		}
+		oc.allowedOrigins[origin] = true
 	}
+
 	return oc
 }
 
 // Check validates if the origin is allowed.
 func (oc *OriginChecker) Check(r *http.Request) bool {
-	// Dev mode allows all origins
 	if oc.devMode {
 		return true
 	}
-	// If no origins configured, deny all
 	if len(oc.allowedOrigins) == 0 {
 		return false
 	}
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		// No origin header - check if it's a same-origin request
 		return true
 	}
+
 	return oc.allowedOrigins[origin]
+}
+
+type clientSession struct {
+	client            *model.Client
+	adapter           *gossipv1.SessionAdapter
+	handshakeComplete bool
+	queueRecipient    string
+	lastSummaryHave   []string
 }
 
 // WSHandler handles WebSocket connections.
@@ -85,6 +91,7 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 	originChecker := NewOriginChecker(allowedOrigins, devMode)
 	engine := storeforward.New(store, maxTTL)
 	engine.SetAckDrivenSuppression(true)
+
 	return &WSHandler{
 		store:             store,
 		engine:            engine,
@@ -113,15 +120,13 @@ func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
 	}
 }
 
-// SetAutoDeliverQueued controls automatic queued delivery on hello.
-// This defaults to true and exists to enable deterministic integration tests.
+// SetAutoDeliverQueued remains for backwards-compatible test wiring.
 func (h *WSHandler) SetAutoDeliverQueued(enabled bool) {
 	h.autoDeliverQueued = enabled
 }
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
 func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Check origin before upgrading
 	if !h.originChecker.Check(r) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
@@ -129,7 +134,7 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true // Origin already validated above
+			return true
 		},
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -147,38 +152,383 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer metrics.ConnectionsCurrent.Dec()
 
 	client := &model.Client{
-		Conn:       conn,
-		Send:       make(chan []byte, 256),
-		WayfarerID: "",
+		Conn: conn,
+		Send: make(chan []byte, 256),
 	}
-	// Start writer goroutine
-	go h.writePump(client)
+	session := &clientSession{
+		client:  client,
+		adapter: gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello(h.relayID), false),
+	}
 
-	// Start reader goroutine
-	h.readPump(client)
+	go h.writePump(client)
+	h.readPump(session)
 }
 
-// readPump reads messages from the WebSocket.
-func (h *WSHandler) readPump(client *model.Client) {
+func (h *WSHandler) readPump(session *clientSession) {
 	defer func() {
-		if client.WayfarerID != "" {
-			h.clients.Unregister(client)
+		if session.client.WayfarerID != "" {
+			h.clients.Unregister(session.client)
 		}
-		client.Conn.Close()
+		session.client.Conn.Close()
 	}()
 
+	if err := h.sendLocalHello(session.client, session.adapter); err != nil {
+		log.Printf("ws: send local hello failed: %v", err)
+		return
+	}
+
 	for {
-		var frame model.WSFrame
-		err := client.Conn.ReadJSON(&frame)
+		msgType, data, err := session.client.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("ws: read error: %v", err)
 			}
+			return
+		}
+		if msgType != websocket.BinaryMessage {
+			log.Printf("ws: rejected non-binary frame type=%d", msgType)
+			return
+		}
+
+		metrics.IncrementReceived()
+		events := session.adapter.PushInbound(data)
+		if err := h.processEvents(session, events); err != nil {
+			log.Printf("ws: protocol event failed: %v", err)
+			return
+		}
+	}
+}
+
+func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Event) error {
+	for _, event := range events {
+		if event.Type == gossipv1.EventTypeFatal {
+			return event.Err
+		}
+
+		switch event.Type {
+		case gossipv1.EventTypeHelloValidated:
+			if err := h.handleHelloValidated(session, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeSummary:
+			if !session.handshakeComplete {
+				return fmt.Errorf("gossipv1: summary before hello")
+			}
+			if err := h.handleSummary(session, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeRequest:
+			if !session.handshakeComplete {
+				return fmt.Errorf("gossipv1: request before hello")
+			}
+			if err := h.handleRequest(session, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeTransfer:
+			if !session.handshakeComplete {
+				return fmt.Errorf("gossipv1: transfer before hello")
+			}
+			if err := h.handleTransfer(session, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeReceipt:
+			if !session.handshakeComplete {
+				return fmt.Errorf("gossipv1: receipt before hello")
+			}
+			if err := h.handleReceipt(session, event); err != nil {
+				return err
+			}
+		case gossipv1.EventTypeRelayIngest, gossipv1.EventTypeUntrustedRelay, gossipv1.EventTypeIgnored:
+			// No-op on client path.
+		}
+	}
+
+	return nil
+}
+
+func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.Event) error {
+	if session.handshakeComplete {
+		return fmt.Errorf("gossipv1: duplicate hello")
+	}
+	if event.Hello == nil {
+		return fmt.Errorf("gossipv1: hello event missing payload")
+	}
+
+	session.client.WayfarerID = event.Hello.NodeID
+	session.client.DeviceID = event.Hello.NodePubKey
+	session.client.DeliveryID = storeforward.DeliveryIdentity(session.client.WayfarerID, session.client.DeviceID)
+	h.clients.Register(session.client)
+
+	session.queueRecipient = storeforward.QueueRecipient(session.client.DeliveryID)
+	session.handshakeComplete = true
+
+	have, err := h.listQueuedMessageIDs(session.queueRecipient)
+	if err != nil {
+		return err
+	}
+	session.lastSummaryHave = have
+
+	return h.sendEnvelope(session.client, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: have})
+}
+
+func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) error {
+	if event.Summary == nil {
+		return fmt.Errorf("gossipv1: summary event missing payload")
+	}
+
+	want, err := h.computeMissingWant(event.Summary.Have)
+	if err != nil {
+		return err
+	}
+
+	return h.sendEnvelope(session.client, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: want})
+}
+
+func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) error {
+	if event.Request == nil {
+		return fmt.Errorf("gossipv1: request event missing payload")
+	}
+	if len(event.Request.Want) == 0 {
+		return nil
+	}
+
+	objects := make([]gossipv1.TransferObject, 0, len(event.Request.Want))
+	expectedReceiptIDs := make([]string, 0, len(event.Request.Want))
+	now := time.Now().UTC()
+
+	for _, requestedID := range event.Request.Want {
+		if uint64(len(objects)) >= gossipv1.MaxTransferItems {
 			break
 		}
 
-		h.handleFrame(client, &frame)
+		message, err := h.store.GetMessageByID(context.Background(), requestedID)
+		if err != nil {
+			if isNotFoundError(err) {
+				continue
+			}
+			return err
+		}
+		if message == nil {
+			continue
+		}
+		if message.To != session.queueRecipient {
+			continue
+		}
+		if !message.ExpiresAt.After(now) {
+			continue
+		}
+
+		objects = append(objects, gossipv1.TransferObject{
+			ID:         message.ID,
+			From:       message.From,
+			To:         message.To,
+			PayloadB64: message.Payload,
+			CreatedAt:  message.CreatedAt.UTC().Unix(),
+			ExpiresAt:  message.ExpiresAt.UTC().Unix(),
+		})
+		expectedReceiptIDs = append(expectedReceiptIDs, message.ID)
 	}
+
+	session.adapter.SetExpectedReceipt(expectedReceiptIDs)
+	return h.sendEnvelope(session.client, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: objects})
+}
+
+func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event) error {
+	if event.Transfer == nil {
+		return fmt.Errorf("gossipv1: transfer event missing payload")
+	}
+
+	receipt := gossipv1.ReceiptPayload{
+		Accepted: make([]string, 0, len(event.Transfer.Objects)),
+		Rejected: append([]gossipv1.TransferObjectRejection(nil), event.Transfer.Rejected...),
+	}
+
+	for _, indexed := range event.Transfer.Objects {
+		validationErr := validateTransferObject(indexed.Object)
+		if validationErr != nil {
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
+				Index:  indexed.Index,
+				ID:     indexed.Object.ID,
+				Reason: validationErr.Error(),
+			})
+			continue
+		}
+
+		existing, err := h.store.GetMessageByID(context.Background(), indexed.Object.ID)
+		if err != nil && !isNotFoundError(err) {
+			return err
+		}
+		if err == nil && existing != nil {
+			receipt.Accepted = append(receipt.Accepted, indexed.Object.ID)
+			continue
+		}
+
+		decodedPayload, err := model.DecodePayloadB64(indexed.Object.PayloadB64)
+		if err != nil {
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
+				Index:  indexed.Index,
+				ID:     indexed.Object.ID,
+				Reason: "invalid payload_b64",
+			})
+			continue
+		}
+
+		createdAt := time.Unix(indexed.Object.CreatedAt, 0).UTC()
+		expiresAt := time.Unix(indexed.Object.ExpiresAt, 0).UTC()
+		if !expiresAt.After(createdAt) {
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
+				Index:  indexed.Index,
+				ID:     indexed.Object.ID,
+				Reason: "expires_at must be greater than created_at",
+			})
+			continue
+		}
+		if !expiresAt.After(time.Now().UTC()) {
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
+				Index:  indexed.Index,
+				ID:     indexed.Object.ID,
+				Reason: "object already expired",
+			})
+			continue
+		}
+
+		message := &model.Message{
+			ID:        indexed.Object.ID,
+			From:      indexed.Object.From,
+			To:        indexed.Object.To,
+			Payload:   model.EncodePayloadB64(decodedPayload, model.PayloadEncodingPrefBase64URL),
+			CreatedAt: createdAt,
+			ExpiresAt: expiresAt,
+		}
+
+		if err := h.engine.PersistMessage(context.Background(), message); err != nil {
+			metrics.IncrementStoreErrors()
+			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
+				Index:  indexed.Index,
+				ID:     indexed.Object.ID,
+				Reason: "persist failed",
+			})
+			continue
+		}
+
+		metrics.IncrementPersisted()
+		receipt.Accepted = append(receipt.Accepted, indexed.Object.ID)
+	}
+
+	if len(receipt.Accepted) > 1 {
+		sort.Strings(receipt.Accepted)
+	}
+
+	return h.sendEnvelope(session.client, gossipv1.FrameTypeReceipt, receipt)
+}
+
+func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) error {
+	if event.Receipt == nil {
+		return fmt.Errorf("gossipv1: receipt event missing payload")
+	}
+
+	for _, acceptedID := range event.Receipt.Accepted {
+		transitioned, err := h.engine.AckClientDelivery(context.Background(), acceptedID, session.client.DeliveryID)
+		if err != nil {
+			metrics.IncrementStoreErrors()
+			return err
+		}
+		if transitioned {
+			metrics.IncrementDelivered()
+		}
+	}
+
+	return nil
+}
+
+func (h *WSHandler) listQueuedMessageIDs(queueRecipient string) ([]string, error) {
+	ids, err := h.store.GetAllQueuedMessageIDs(context.Background(), queueRecipient)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) <= 1 {
+		return ids, nil
+	}
+
+	seen := make(map[string]struct{}, len(ids))
+	deduped := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		deduped = append(deduped, id)
+	}
+	sort.Strings(deduped)
+
+	return deduped, nil
+}
+
+func (h *WSHandler) computeMissingWant(summaryHave []string) ([]string, error) {
+	if len(summaryHave) == 0 {
+		return []string{}, nil
+	}
+
+	want := make([]string, 0, len(summaryHave))
+	for _, id := range summaryHave {
+		if id == "" {
+			continue
+		}
+
+		message, err := h.store.GetMessageByID(context.Background(), id)
+		if err != nil {
+			if isNotFoundError(err) {
+				want = append(want, id)
+				continue
+			}
+			return nil, err
+		}
+		if message == nil {
+			want = append(want, id)
+		}
+	}
+
+	if len(want) > 1 {
+		sort.Strings(want)
+	}
+	if uint64(len(want)) > gossipv1.MaxWantItems {
+		want = want[:gossipv1.MaxWantItems]
+	}
+
+	return want, nil
+}
+
+func validateTransferObject(object gossipv1.TransferObject) error {
+	if object.ID == "" {
+		return fmt.Errorf("id is required")
+	}
+	if object.From == "" {
+		return fmt.Errorf("from is required")
+	}
+	if object.To == "" {
+		return fmt.Errorf("to is required")
+	}
+	if object.PayloadB64 == "" {
+		return fmt.Errorf("payload_b64 is required")
+	}
+	if object.CreatedAt <= 0 {
+		return fmt.Errorf("created_at must be > 0")
+	}
+	if object.ExpiresAt <= object.CreatedAt {
+		return fmt.Errorf("expires_at must be greater than created_at")
+	}
+	return nil
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
 // writePump writes messages to the WebSocket.
@@ -196,7 +546,7 @@ func (h *WSHandler) writePump(client *model.Client) {
 				client.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			if err := client.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			if err := client.Conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
 				return
 			}
 		case <-ticker.C:
@@ -207,326 +557,44 @@ func (h *WSHandler) writePump(client *model.Client) {
 	}
 }
 
-// handleFrame handles incoming WebSocket frames.
-func (h *WSHandler) handleFrame(client *model.Client, frame *model.WSFrame) {
-	metrics.IncrementReceived()
-
-	// Reject relay-only frame types on client connections.
-	if model.IsRelayFrameType(frame.Type) {
-		h.sendError(client, model.ErrorCodeInvalidPayload, "relay frame type not allowed on client connections")
-		return
-	}
-
-	switch frame.Type {
-	case model.FrameTypeHello:
-		h.handleHello(client, frame)
-	case model.FrameTypeSend:
-		h.handleSend(client, frame)
-	case model.FrameTypeAck:
-		// `ack` marks the message delivered for this connection's recipient identity.
-		h.handleAck(client, frame)
-	case model.FrameTypePull:
-		h.handlePull(client, frame)
-	default:
-		h.sendError(client, model.ErrorCodeInvalidPayload, "unknown frame type")
-	}
-}
-
-func deliveryIdentityForClient(client *model.Client) string {
-	if client == nil {
-		return ""
-	}
-	if client.WayfarerID == "" || client.DeviceID == "" {
-		return ""
-	}
-	return storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
-}
-
-// handleHello handles the hello frame.
-func (h *WSHandler) handleHello(client *model.Client, frame *model.WSFrame) {
-	if frame.WayfarerID == "" {
-		h.sendError(client, model.ErrorCodeInvalidWayfarerID, "wayfarer_id required")
-		return
-	}
-	if frame.DeviceID == "" {
-		h.sendError(client, model.ErrorCodeInvalidPayload, "device_id required")
-		return
-	}
-
-	deliveryID := storeforward.DeliveryIdentity(frame.WayfarerID, frame.DeviceID)
-
-	// Register client.
-	client.WayfarerID = frame.WayfarerID
-	client.DeviceID = frame.DeviceID
-	client.DeliveryID = deliveryID
-	client.ID = uuid.New().String()
-	h.clients.Register(client)
-
-	// Send hello_ok
-	h.send(client, model.WSFrame{Type: model.FrameTypeHelloOK, RelayID: h.relayID})
-
-	// Deliver any queued messages
-	if h.autoDeliverQueued {
-		go h.deliverQueuedMessages(client)
-	}
-}
-
-// handleSend handles the send frame.
-func (h *WSHandler) handleSend(client *model.Client, frame *model.WSFrame) {
-	if client.WayfarerID == "" {
-		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
-		return
-	}
-	if frame.To == "" {
-		h.sendError(client, model.ErrorCodeInvalidPayload, "recipient required")
-		return
-	}
-	if frame.PayloadB64 == "" {
-		h.sendError(client, model.ErrorCodeInvalidPayload, "payload required")
-		return
-	}
-
-	if _, err := model.DecodePayloadB64(frame.PayloadB64); err != nil {
-		log.Printf("ws: rejecting send from=%s to=%s device=%s: invalid payload_b64: %v shape={%s}", client.WayfarerID, frame.To, client.DeviceID, err, payloadB64Shape(frame.PayloadB64))
-		h.sendError(client, model.ErrorCodeInvalidPayload, "invalid payload_b64")
-		return
-	}
-
-	msg, ttl := h.engine.AcceptClientSend(client.WayfarerID, frame.To, frame.PayloadB64, frame.TTLSeconds)
-
-	// Check if recipient is online
-	online := h.clients.IsOnline(frame.To)
-	log.Printf("ws: send msg_id=%s from=%s to=%s ttl=%ds online=%t", msg.ID, msg.From, msg.To, int(ttl.Seconds()), online)
-
-	if err := h.engine.PersistMessage(context.Background(), msg); err != nil {
-		metrics.IncrementStoreErrors()
-		h.sendError(client, model.ErrorCodeInternalError, "failed to persist message")
-		return
-	}
-	metrics.IncrementPersisted()
-
-	if online {
-		// Try to deliver
-		h.deliverToRecipient(msg)
-	}
-
-	// Send send_ok after durable persistence.
-	h.send(client, model.WSFrame{
-		Type:       model.FrameTypeSendOK,
-		MsgID:      msg.ID,
-		ReceivedAt: msg.CreatedAt.Unix(),
-		ExpiresAt:  msg.ExpiresAt.Unix(),
-	})
-
-	// Announce to federation peers (if federation is enabled)
-	if h.federationManager != nil {
-		if err := h.federationManager.AnnounceMessage(msg); err != nil {
-			log.Printf("ws: federation announce skipped msg_id=%s: %v", msg.ID, err)
-		}
-	}
-}
-
-// handleAck handles the ack frame.
-// `ack` marks the message delivered for this connection's delivery identity.
-func (h *WSHandler) handleAck(client *model.Client, frame *model.WSFrame) {
-	if client.WayfarerID == "" {
-		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
-		return
-	}
-	if client.DeviceID == "" {
-		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
-		return
-	}
-	if frame.MsgID == "" {
-		h.sendError(client, model.ErrorCodeInvalidPayload, "msg_id required")
-		return
-	}
-
-	recipientID := deliveryIdentityForClient(client)
-	if recipientID == "" {
-		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
-		return
-	}
-
-	transitioned, err := h.engine.AckClientDelivery(context.Background(), frame.MsgID, recipientID)
+func (h *WSHandler) sendLocalHello(client *model.Client, adapter *gossipv1.SessionAdapter) error {
+	helloBytes, err := adapter.InitialHelloBytes()
 	if err != nil {
-		metrics.IncrementStoreErrors()
-		h.sendError(client, model.ErrorCodeInternalError, "failed to acknowledge message")
-		return
+		return err
 	}
-	if transitioned {
-		metrics.IncrementDelivered()
-	}
-
-	log.Printf("ws: ack msg_id=%s from=%s recipient_id=%s ttl=%ds", frame.MsgID, client.WayfarerID, recipientID, 0)
-
-	// Send ack_ok
-	h.send(client, model.WSFrame{
-		Type:  model.FrameTypeAckOK,
-		MsgID: frame.MsgID,
-	})
+	h.sendBinary(client, helloBytes)
+	return nil
 }
 
-// handlePull handles the pull frame.
-func (h *WSHandler) handlePull(client *model.Client, frame *model.WSFrame) {
-	if client.WayfarerID == "" {
-		h.sendError(client, model.ErrorCodeAuthFailed, "not authenticated")
-		return
-	}
-
-	limit := storeforward.NormalizePullLimit(frame.Limit)
-	deliveryID := deliveryIdentityForClient(client)
-	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), deliveryID, limit)
+func (h *WSHandler) sendEnvelope(client *model.Client, frameType string, payload any) error {
+	frame, err := gossipv1.EncodeEnvelope(frameType, payload)
 	if err != nil {
-		metrics.IncrementStoreErrors()
-		h.sendError(client, model.ErrorCodeInternalError, "failed to pull messages")
-		return
+		return err
 	}
-
-	// Convert to response wire format.
-	msgs := make([]model.WSPullMessage, 0, len(messages))
-	for _, m := range messages {
-		if m == nil {
-			continue
-		}
-		decodedPayload, err := model.DecodePayloadB64(m.Payload)
-		if err != nil {
-			h.dropCorruptMessage(m.ID, deliveryID, "pull", m.Payload, err)
-			continue
-		}
-		msgs = append(msgs, model.WSPullMessage{
-			MsgID:      m.ID,
-			From:       m.From,
-			PayloadB64: model.EncodePayloadB64(decodedPayload, client.GetPayloadEncodingPref()),
-			ReceivedAt: m.CreatedAt.Unix(),
-		})
-	}
-
-	h.send(client, model.WSFrame{
-		Type:     model.FrameTypeMessages,
-		Messages: msgs,
-	})
-}
-
-// deliverQueuedMessages delivers any queued messages when a client connects.
-func (h *WSHandler) deliverQueuedMessages(client *model.Client) {
-	// Queue indexing remains wayfarer-scoped today; PullForDeliveryIdentity
-	// applies per-device filtering via suppression state checks when device_id is set.
-	messages, err := h.engine.PullForDeliveryIdentity(context.Background(), deliveryIdentityForClient(client), 100)
+	prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
 	if err != nil {
-		log.Printf("ws: failed to get queued messages: %v", err)
-		return
+		return err
 	}
-
-	for _, msg := range messages {
-		h.deliverToRecipient(msg)
-	}
+	h.sendBinary(client, prefixed)
+	return nil
 }
 
-// deliverToRecipient delivers a message to the recipient if online.
-func (h *WSHandler) deliverToRecipient(msg *model.Message) {
-	decodedPayload, err := model.DecodePayloadB64(msg.Payload)
-	if err != nil {
-		h.dropCorruptMessage(msg.ID, msg.To, "deliver", msg.Payload, err)
-		return
-	}
-
-	recipients := h.clients.GetClients(msg.To)
-	for _, r := range recipients {
-		recipientID := deliveryIdentityForClient(r)
-		if recipientID == "" {
-			continue
-		}
-		payloadB64 := model.EncodePayloadB64(decodedPayload, r.GetPayloadEncodingPref())
-		remainingTTL := int(time.Until(msg.ExpiresAt).Seconds())
-		if remainingTTL < 0 {
-			remainingTTL = 0
-		}
-		log.Printf("ws: deliver msg_id=%s from=%s to=%s recipient_id=%s ttl=%ds", msg.ID, msg.From, r.WayfarerID, recipientID, remainingTTL)
-		h.send(r, model.WSFrame{
-			Type:       model.FrameTypeMessage,
-			MsgID:      msg.ID,
-			From:       msg.From,
-			PayloadB64: payloadB64,
-			ReceivedAt: msg.CreatedAt.Unix(),
-		})
-	}
-}
-
-func payloadB64Shape(raw string) string {
-	hasWhitespace := false
-	for _, r := range raw {
-		if unicode.IsSpace(r) {
-			hasWhitespace = true
-			break
-		}
-	}
-
-	return fmt.Sprintf("len=%d padding=%t plus=%t slash=%t dash=%t underscore=%t whitespace=%t",
-		len(raw),
-		strings.Contains(raw, "="),
-		strings.Contains(raw, "+"),
-		strings.Contains(raw, "/"),
-		strings.Contains(raw, "-"),
-		strings.Contains(raw, "_"),
-		hasWhitespace,
-	)
-}
-
-func (h *WSHandler) dropCorruptMessage(msgID, recipientID, stage, payloadB64 string, decodeErr error) {
-	if msgID == "" {
-		log.Printf("ws: skipping corrupt payload removal with empty msg_id recipient=%s stage=%s: %v", recipientID, stage, decodeErr)
-		return
-	}
-
-	log.Printf("ws: dropping corrupt payload msg_id=%s recipient=%s stage=%s: %v shape={%s}", msgID, recipientID, stage, decodeErr, payloadB64Shape(payloadB64))
-	if err := h.engine.RemoveMessage(context.Background(), msgID); err != nil {
-		metrics.IncrementStoreErrors()
-		log.Printf("ws: failed to remove corrupt message msg_id=%s stage=%s: %v", msgID, stage, err)
-	}
-}
-
-// send sends a frame to the client with backpressure handling.
-// Uses a blocking send with timeout to implement bounded backpressure.
-// If the channel is full, it will wait up to 1 second for space.
-// This prevents silent message drops while still providing flow control.
-func (h *WSHandler) send(client *model.Client, frame model.WSFrame) {
-	data, err := json.Marshal(frame)
-	if err != nil {
-		log.Printf("ws: failed to marshal frame: %v", err)
-		return
-	}
+// sendBinary sends a frame to the client with bounded backpressure.
+func (h *WSHandler) sendBinary(client *model.Client, data []byte) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("ws: failed to send, channel closed for client %s", client.WayfarerID)
 			metrics.IncrementDropped()
 		}
 	}()
+
 	timer := time.NewTimer(1 * time.Second)
 	defer timer.Stop()
+
 	select {
 	case client.Send <- data:
 	case <-timer.C:
 		log.Printf("ws: failed to send, channel full after timeout for client %s", client.WayfarerID)
 		metrics.IncrementDropped()
 	}
-}
-
-// sendError sends canonical error fields (code/message).
-func (h *WSHandler) sendError(client *model.Client, code model.ErrorCode, message string) {
-	if code == "" {
-		code = model.ErrorCodeInternalError
-	}
-	if message == "" {
-		if code == model.ErrorCodeInternalError {
-			message = "internal error"
-		} else {
-			message = string(code)
-		}
-	}
-	h.send(client, model.WSFrame{
-		Type:    model.FrameTypeError,
-		Code:    string(code),
-		Message: message,
-	})
 }

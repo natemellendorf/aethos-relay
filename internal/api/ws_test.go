@@ -2,76 +2,77 @@ package api
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/natemellendorf/aethos-relay/internal/federation"
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
-	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
-type wsTestConn struct{}
-
-func (c *wsTestConn) WriteJSON(v interface{}) error               { return nil }
-func (c *wsTestConn) ReadJSON(v interface{}) error                { return nil }
-func (c *wsTestConn) WriteMessage(msgType int, data []byte) error { return nil }
-func (c *wsTestConn) ReadMessage() (int, []byte, error)           { return 0, nil, nil }
-func (c *wsTestConn) Close() error                                { return nil }
-
-type ackCall struct {
-	msgID       string
-	recipientID string
-}
-
 type wsStoreSpy struct {
-	queued      map[string][]*model.Message
-	persisted   []*model.Message
-	ackedByMsg  map[string]map[string]bool
-	markAcked   []ackCall
-	persistErr  error
-	getQueueErr error
-	ackErr      error
+	queuedByRecipient map[string][]string
+	messagesByID      map[string]*model.Message
+	ackedByMsg        map[string]map[string]bool
+	persistedIDs      []string
+	persistErrForID   map[string]error
+	ackErr            error
 }
 
 func newWSStoreSpy() *wsStoreSpy {
 	return &wsStoreSpy{
-		queued:     make(map[string][]*model.Message),
-		ackedByMsg: make(map[string]map[string]bool),
+		queuedByRecipient: make(map[string][]string),
+		messagesByID:      make(map[string]*model.Message),
+		ackedByMsg:        make(map[string]map[string]bool),
+		persistErrForID:   make(map[string]error),
 	}
 }
 
 func (s *wsStoreSpy) Open() error  { return nil }
 func (s *wsStoreSpy) Close() error { return nil }
+
 func (s *wsStoreSpy) PersistMessage(ctx context.Context, msg *model.Message) error {
-	if s.persistErr != nil {
-		return s.persistErr
+	if msg == nil {
+		return errors.New("nil message")
 	}
-	cp := *msg
-	s.persisted = append(s.persisted, &cp)
+	if err := s.persistErrForID[msg.ID]; err != nil {
+		return err
+	}
+	copy := *msg
+	s.messagesByID[msg.ID] = &copy
+	s.queuedByRecipient[msg.To] = append(s.queuedByRecipient[msg.To], msg.ID)
+	s.persistedIDs = append(s.persistedIDs, msg.ID)
 	return nil
 }
+
 func (s *wsStoreSpy) GetQueuedMessages(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
 	return s.GetQueuedMessagesRaw(ctx, recipientID, limit)
 }
+
 func (s *wsStoreSpy) GetQueuedMessagesRaw(ctx context.Context, recipientID string, limit int) ([]*model.Message, error) {
-	if s.getQueueErr != nil {
-		return nil, s.getQueueErr
+	ids := s.queuedByRecipient[recipientID]
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
 	}
-	queued := s.queued[recipientID]
-	if limit > 0 && len(queued) > limit {
-		queued = queued[:limit]
+	out := make([]*model.Message, 0, len(ids))
+	for _, id := range ids {
+		if msg, ok := s.messagesByID[id]; ok {
+			copy := *msg
+			out = append(out, &copy)
+		}
 	}
-	return queued, nil
+	return out, nil
 }
+
 func (s *wsStoreSpy) MarkDelivered(ctx context.Context, msgID string, recipientID string) error {
 	return nil
 }
+
 func (s *wsStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error) {
 	if s.ackErr != nil {
 		return false, s.ackErr
 	}
-	s.markAcked = append(s.markAcked, ackCall{msgID: msgID, recipientID: recipientID})
 	if s.ackedByMsg[msgID] == nil {
 		s.ackedByMsg[msgID] = make(map[string]bool)
 	}
@@ -81,15 +82,27 @@ func (s *wsStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientID st
 	s.ackedByMsg[msgID][recipientID] = true
 	return true, nil
 }
+
 func (s *wsStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
 	return false, nil
 }
+
 func (s *wsStoreSpy) IsAckedBy(ctx context.Context, msgID string, recipientID string) (bool, error) {
+	if s.ackedByMsg[msgID] == nil {
+		return false, nil
+	}
 	return s.ackedByMsg[msgID][recipientID], nil
 }
+
 func (s *wsStoreSpy) GetMessageByID(ctx context.Context, msgID string) (*model.Message, error) {
-	return nil, nil
+	msg, ok := s.messagesByID[msgID]
+	if !ok {
+		return nil, errors.New("message not found")
+	}
+	copy := *msg
+	return &copy, nil
 }
+
 func (s *wsStoreSpy) RemoveMessage(ctx context.Context, msgID string) error { return nil }
 func (s *wsStoreSpy) GetExpiredMessages(ctx context.Context, before time.Time) ([]*model.Message, error) {
 	return nil, nil
@@ -100,7 +113,10 @@ func (s *wsStoreSpy) GetLastSweepTime(ctx context.Context) (time.Time, error) {
 func (s *wsStoreSpy) SetLastSweepTime(ctx context.Context, t time.Time) error  { return nil }
 func (s *wsStoreSpy) GetAllRecipientIDs(ctx context.Context) ([]string, error) { return nil, nil }
 func (s *wsStoreSpy) GetAllQueuedMessageIDs(ctx context.Context, to string) ([]string, error) {
-	return nil, nil
+	ids := s.queuedByRecipient[to]
+	idsCopy := make([]string, len(ids))
+	copy(idsCopy, ids)
+	return idsCopy, nil
 }
 
 func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
@@ -108,193 +124,113 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 	st := newWSStoreSpy()
 	clients := model.NewClientRegistry()
 	go clients.Run()
-	h := NewWSHandler(st, clients, time.Hour, "", true, "relay-test")
+	h := NewWSHandler(st, clients, 24*time.Hour, "", true, "relay-test")
 	h.SetAutoDeliverQueued(false)
 	return h, st
 }
 
-func newClientForWSHandler() *model.Client {
-	return &model.Client{Conn: &wsTestConn{}, Send: make(chan []byte, 16)}
+func decodeEnvelopePayloadMap(t *testing.T, payload []byte) map[string]any {
+	t.Helper()
+	if len(payload) < 5 {
+		t.Fatalf("payload too short: %d", len(payload))
+	}
+
+	frameLen := binary.BigEndian.Uint32(payload[:4])
+	if int(frameLen) != len(payload[4:]) {
+		t.Fatalf("length prefix mismatch: prefix=%d payload=%d", frameLen, len(payload[4:]))
+	}
+
+	decoded, err := gossipv1.DecodeEnvelope(payload[4:])
+	if err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	return decoded.Payload
 }
 
-func readQueuedPayload(t *testing.T, c *model.Client) []byte {
-	t.Helper()
+func TestComputeMissingWantReturnsUnknownIDs(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	st.messagesByID["msg-1"] = &model.Message{ID: "msg-1"}
+
+	want, err := h.computeMissingWant([]string{"msg-1", "msg-2"})
+	if err != nil {
+		t.Fatalf("computeMissingWant failed: %v", err)
+	}
+	if len(want) != 1 || want[0] != "msg-2" {
+		t.Fatalf("unexpected want set: %#v", want)
+	}
+}
+
+func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 4)}}
+
+	now := time.Now().UTC()
+	event := gossipv1.Event{
+		Type: gossipv1.EventTypeTransfer,
+		Transfer: &gossipv1.ParsedTransferPayload{
+			Objects: []gossipv1.IndexedTransferObject{
+				{Index: 0, Object: gossipv1.TransferObject{
+					ID:         "msg-valid",
+					From:       "sender-a",
+					To:         "recipient-a",
+					PayloadB64: "QQ",
+					CreatedAt:  now.Add(-time.Minute).Unix(),
+					ExpiresAt:  now.Add(time.Hour).Unix(),
+				}},
+				{Index: 1, Object: gossipv1.TransferObject{
+					ID:         "msg-bad",
+					From:       "sender-a",
+					To:         "recipient-a",
+					PayloadB64: "not_base64",
+					CreatedAt:  now.Add(-time.Minute).Unix(),
+					ExpiresAt:  now.Add(time.Hour).Unix(),
+				}},
+			},
+		},
+	}
+
+	if err := h.handleTransfer(session, event); err != nil {
+		t.Fatalf("handleTransfer failed: %v", err)
+	}
+
+	if len(st.persistedIDs) != 1 || st.persistedIDs[0] != "msg-valid" {
+		t.Fatalf("expected only msg-valid persisted, got %#v", st.persistedIDs)
+	}
+
 	select {
-	case payload := <-c.Send:
-		return payload
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for queued frame")
-	}
-	return nil
-}
-
-func decodeFrameMap(t *testing.T, payload []byte) map[string]any {
-	t.Helper()
-	var frame map[string]any
-	if err := json.Unmarshal(payload, &frame); err != nil {
-		t.Fatalf("decode queued frame map: %v", err)
-	}
-	return frame
-}
-
-func TestHandleHelloRequiresDeviceID(t *testing.T) {
-	h, _ := newWSHandlerWithSpyStore(t)
-	client := newClientForWSHandler()
-
-	h.handleHello(client, &model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a"})
-
-	frame := decodeFrameMap(t, readQueuedPayload(t, client))
-	if frame["type"] != model.FrameTypeError {
-		t.Fatalf("expected error frame, got %v", frame["type"])
-	}
-	if frame["message"] != "device_id required" {
-		t.Fatalf("expected device_id required, got %v", frame["message"])
-	}
-	if _, ok := frame["msg_id"]; ok {
-		t.Fatalf("unexpected legacy msg_id field: %v", frame)
-	}
-}
-
-func TestHandleHelloOKIncludesRelayID(t *testing.T) {
-	h, _ := newWSHandlerWithSpyStore(t)
-	client := newClientForWSHandler()
-
-	h.handleHello(client, &model.WSFrame{
-		Type:       model.FrameTypeHello,
-		WayfarerID: "wayfarer-a",
-		DeviceID:   "device-a",
-	})
-
-	frame := decodeFrameMap(t, readQueuedPayload(t, client))
-	if frame["type"] != model.FrameTypeHelloOK {
-		t.Fatalf("expected hello_ok frame, got %v", frame["type"])
-	}
-	if frame["relay_id"] != "relay-test" {
-		t.Fatalf("expected relay_id relay-test, got %v", frame["relay_id"])
-	}
-}
-
-func TestHandleSendRejectsNonCanonicalPayloadB64(t *testing.T) {
-	h, _ := newWSHandlerWithSpyStore(t)
-	for _, payload := range []string{"QQ==", " \n\tQQ\r "} {
-		client := newClientForWSHandler()
-		client.WayfarerID = "wayfarer-a"
-
-		h.handleSend(client, &model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: payload})
-
-		frame := decodeFrameMap(t, readQueuedPayload(t, client))
-		if frame["type"] != model.FrameTypeError || frame["message"] != "invalid payload_b64" {
-			t.Fatalf("expected invalid payload error for %q, got %#v", payload, frame)
+	case outbound := <-session.client.Send:
+		payload := decodeEnvelopePayloadMap(t, outbound)
+		accepted, _ := payload["accepted"].([]any)
+		if len(accepted) != 1 || accepted[0] != "msg-valid" {
+			t.Fatalf("unexpected accepted list: %#v", payload["accepted"])
 		}
-	}
-}
-
-func TestHandleSendSendOKCanonicalFieldsOnly(t *testing.T) {
-	h, st := newWSHandlerWithSpyStore(t)
-	client := newClientForWSHandler()
-	client.WayfarerID = "wayfarer-a"
-
-	h.handleSend(client, &model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: "QQ", TTLSeconds: 120})
-
-	frame := decodeFrameMap(t, readQueuedPayload(t, client))
-	if frame["type"] != model.FrameTypeSendOK {
-		t.Fatalf("expected send_ok, got %#v", frame)
-	}
-	if _, ok := frame["at"]; ok {
-		t.Fatalf("send_ok must not include legacy at alias: %#v", frame)
-	}
-	if _, ok := frame["received_at"]; !ok {
-		t.Fatalf("send_ok missing received_at: %#v", frame)
-	}
-	if _, ok := frame["expires_at"]; !ok {
-		t.Fatalf("send_ok missing expires_at: %#v", frame)
-	}
-	if len(st.persisted) != 1 || st.persisted[0].Payload != "QQ" {
-		t.Fatalf("expected persisted canonical payload QQ, got %#v", st.persisted)
-	}
-}
-
-func TestHandleSendAnnounceFailureDoesNotBreakSendFlow(t *testing.T) {
-	h, _ := newWSHandlerWithSpyStore(t)
-	h.SetFederationManager(federation.NewPeerManager("relay-test", nil, nil, time.Hour))
-
-	client := newClientForWSHandler()
-	client.WayfarerID = "wayfarer-a"
-
-	h.handleSend(client, &model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: "QQ", TTLSeconds: 120})
-
-	frame := decodeFrameMap(t, readQueuedPayload(t, client))
-	if frame["type"] != model.FrameTypeSendOK {
-		t.Fatalf("expected send_ok despite federation announce failure, got %#v", frame)
-	}
-}
-
-func TestHandlePullEmitsCanonicalMessageEntry(t *testing.T) {
-	h, st := newWSHandlerWithSpyStore(t)
-	client := newClientForWSHandler()
-	client.WayfarerID = "wayfarer-b"
-	client.DeviceID = "device-a"
-	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
-
-	st.queued[client.WayfarerID] = []*model.Message{{
-		ID:        "msg-1",
-		From:      "wayfarer-a",
-		To:        "wayfarer-b",
-		Payload:   "QQ",
-		CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
-		ExpiresAt: time.Unix(1_700_000_000, 0).UTC().Add(time.Hour),
-	}}
-
-	h.handlePull(client, &model.WSFrame{Type: model.FrameTypePull, Limit: 10})
-
-	frame := decodeFrameMap(t, readQueuedPayload(t, client))
-	messages := frame["messages"].([]any)
-	entry := messages[0].(map[string]any)
-	if _, ok := entry["msg_id"]; !ok {
-		t.Fatalf("missing msg_id: %#v", entry)
-	}
-	if _, ok := entry["payload_b64"]; !ok {
-		t.Fatalf("missing payload_b64: %#v", entry)
-	}
-	if _, ok := entry["received_at"]; !ok {
-		t.Fatalf("missing received_at: %#v", entry)
-	}
-	if _, ok := entry["at"]; ok {
-		t.Fatalf("unexpected legacy at field: %#v", entry)
-	}
-	if _, ok := entry["expires_at"]; ok {
-		t.Fatalf("unexpected legacy expires_at field: %#v", entry)
-	}
-}
-
-func TestHandleAckUsesConnectionDeviceIdentity(t *testing.T) {
-	h, st := newWSHandlerWithSpyStore(t)
-	client := newClientForWSHandler()
-	client.WayfarerID = "wayfarer-b"
-	client.DeviceID = "device-a"
-	client.DeliveryID = storeforward.DeliveryIdentity(client.WayfarerID, client.DeviceID)
-
-	h.handleAck(client, &model.WSFrame{Type: model.FrameTypeAck, MsgID: "msg-1"})
-
-	if len(st.markAcked) != 1 {
-		t.Fatalf("expected one mark ack call, got %d", len(st.markAcked))
-	}
-	if st.markAcked[0].recipientID != storeforward.DeliveryIdentity("wayfarer-b", "device-a") {
-		t.Fatalf("ack recipient mismatch: %#v", st.markAcked[0])
-	}
-}
-
-func TestSendClosedChannelDoesNotPanic(t *testing.T) {
-	h, _ := newWSHandlerWithSpyStore(t)
-	client := newClientForWSHandler()
-	client.WayfarerID = "wayfarer-a"
-	close(client.Send)
-
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("send panicked on closed channel: %v", r)
+		rejected, _ := payload["rejected"].([]any)
+		if len(rejected) != 1 {
+			t.Fatalf("expected one rejected object, got %#v", payload["rejected"])
 		}
-	}()
+	default:
+		t.Fatal("expected receipt frame")
+	}
+}
 
-	h.send(client, model.WSFrame{Type: model.FrameTypeHelloOK})
+func TestHandleReceiptAcksAcceptedOnly(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{DeliveryID: "wayfarer\x00device"}}
+
+	receipt := gossipv1.ReceiptPayload{
+		Accepted: []string{"msg-a", "msg-b"},
+		Rejected: []gossipv1.TransferObjectRejection{{Index: 2, ID: "msg-c", Reason: "invalid"}},
+	}
+
+	if err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &receipt}); err != nil {
+		t.Fatalf("handleReceipt failed: %v", err)
+	}
+
+	ackedA, _ := st.IsAckedBy(context.Background(), "msg-a", "wayfarer\x00device")
+	ackedB, _ := st.IsAckedBy(context.Background(), "msg-b", "wayfarer\x00device")
+	ackedC, _ := st.IsAckedBy(context.Background(), "msg-c", "wayfarer\x00device")
+
+	if !ackedA || !ackedB || ackedC {
+		t.Fatalf("unexpected ack states: a=%t b=%t c=%t", ackedA, ackedB, ackedC)
+	}
 }
