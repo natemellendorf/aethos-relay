@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,66 @@ func TestGossipV1HelloLoopbackBetweenRelays(t *testing.T) {
 
 	assertNoObserverErrors(t, relayA.peerManager)
 	assertNoObserverErrors(t, relayB.peerManager)
+}
+
+func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
+	relay, wsURL := startRelayForTest(t, "relay-client-flow", false, "", true)
+	defer relay.close()
+
+	conn := mustDial(t, wsURL)
+	defer conn.Close()
+
+	localHello := readEnvelope(t, conn)
+	assertFrameType(t, localHello, gossipv1.FrameTypeHello)
+
+	clientHello := gossipv1.BuildRelayHello("client-flow")
+	writeEnvelope(t, conn, gossipv1.FrameTypeHello, clientHello)
+
+	initialSummary := readEnvelope(t, conn)
+	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: []string{"loop-msg-1"}})
+
+	request := readEnvelope(t, conn)
+	assertFrameType(t, request, gossipv1.FrameTypeRequest)
+
+	now := time.Now().UTC()
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{{
+		ID:         "loop-msg-1",
+		From:       "sender-1",
+		To:         clientHello.NodeID,
+		PayloadB64: "QQ",
+		CreatedAt:  now.Unix(),
+		ExpiresAt:  now.Add(time.Hour).Unix(),
+	}}})
+
+	receipt := readEnvelope(t, conn)
+	assertFrameType(t, receipt, gossipv1.FrameTypeReceipt)
+	parsedReceipt, err := gossipv1.ParseReceiptPayload(receipt.Payload)
+	if err != nil {
+		t.Fatalf("parse receipt: %v", err)
+	}
+	if len(parsedReceipt.Accepted) != 1 || parsedReceipt.Accepted[0] != "loop-msg-1" {
+		t.Fatalf("unexpected receipt payload: %#v", parsedReceipt)
+	}
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: []string{"loop-msg-1"}})
+
+	transfer := readEnvelope(t, conn)
+	assertFrameType(t, transfer, gossipv1.FrameTypeTransfer)
+	parsedTransfer, err := gossipv1.ParseTransferPayloadMixed(transfer.Payload)
+	if err != nil {
+		t.Fatalf("parse transfer: %v", err)
+	}
+	if len(parsedTransfer.Objects) != 1 || parsedTransfer.Objects[0].Object.ID != "loop-msg-1" {
+		t.Fatalf("unexpected transfer payload: %#v", parsedTransfer)
+	}
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeReceipt, gossipv1.ReceiptPayload{Accepted: []string{"loop-msg-1"}})
+
+	if _, err := relay.store.GetMessageByID(context.Background(), "loop-msg-1"); err != nil {
+		t.Fatalf("expected persisted loopback message: %v", err)
+	}
 }
 
 type helloObserver struct {

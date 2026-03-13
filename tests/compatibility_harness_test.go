@@ -2,7 +2,7 @@ package tests
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/binary"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,9 +13,9 @@ import (
 
 	"github.com/natemellendorf/aethos-relay/internal/api"
 	"github.com/natemellendorf/aethos-relay/internal/federation"
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
-	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
 func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
@@ -27,94 +27,84 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	b := mustDial(t, wsURL)
 	defer b.Close()
 
-	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a", DeviceID: "device-a"})
-	aHelloOK := readFrame(t, a)
-	if aHelloOK.RelayID == "" {
-		t.Fatal("hello_ok must include relay_id")
-	}
+	aLocalHello := readEnvelope(t, a)
+	bLocalHello := readEnvelope(t, b)
+	assertFrameType(t, aLocalHello, gossipv1.FrameTypeHello)
+	assertFrameType(t, bLocalHello, gossipv1.FrameTypeHello)
 
-	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-b", DeviceID: "device-b"})
-	bHelloOK := readFrame(t, b)
-	if bHelloOK.RelayID == "" {
-		t.Fatal("hello_ok must include relay_id")
-	}
+	writeEnvelope(t, a, gossipv1.FrameTypeHello, gossipv1.BuildRelayHello("client-a"))
+	writeEnvelope(t, b, gossipv1.FrameTypeHello, gossipv1.BuildRelayHello("client-b"))
 
-	writeFrame(t, a, model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: "QQ", TTLSeconds: 120})
-	sendOK := readFrame(t, a)
-	if sendOK.Type != model.FrameTypeSendOK {
-		t.Fatalf("expected send_ok, got %q", sendOK.Type)
-	}
-	if sendOK.MsgID == "" || sendOK.ReceivedAt == 0 || sendOK.ExpiresAt == 0 {
-		t.Fatalf("send_ok missing canonical fields: %+v", sendOK)
-	}
+	aSummary := readEnvelope(t, a)
+	bSummary := readEnvelope(t, b)
+	assertFrameType(t, aSummary, gossipv1.FrameTypeSummary)
+	assertFrameType(t, bSummary, gossipv1.FrameTypeSummary)
 
-	push := readFrame(t, b)
-	if push.Type != model.FrameTypeMessage {
-		t.Fatalf("expected message push, got %q", push.Type)
-	}
-	if push.PayloadB64 != "QQ" {
-		t.Fatalf("expected canonical payload_b64, got %q", push.PayloadB64)
-	}
-	if push.ReceivedAt == 0 {
-		t.Fatal("message must include received_at")
-	}
-
-	writeFrame(t, b, model.WSFrame{Type: model.FrameTypePull, Limit: 10})
-	pulledBeforeAck := readFrame(t, b)
-	if pulledBeforeAck.Type != model.FrameTypeMessages || len(pulledBeforeAck.Messages) != 1 {
-		t.Fatalf("expected 1 pulled message before ack, got %+v", pulledBeforeAck)
-	}
-	entry := pulledBeforeAck.Messages[0]
-	if entry.MsgID == "" || entry.From == "" || entry.PayloadB64 == "" || entry.ReceivedAt == 0 {
-		t.Fatalf("pull entry missing canonical fields: %+v", entry)
-	}
-
-	writeFrame(t, b, model.WSFrame{Type: model.FrameTypeAck, MsgID: sendOK.MsgID})
-	ackOK := readFrame(t, b)
-	if ackOK.Type != model.FrameTypeAckOK || ackOK.MsgID != sendOK.MsgID {
-		t.Fatalf("unexpected ack_ok: %+v", ackOK)
-	}
-
-	ackRecipient := storeforward.DeliveryIdentity("wayfarer-b", "device-b")
-	acked, err := relay.store.IsAckedBy(context.Background(), sendOK.MsgID, ackRecipient)
+	writeEnvelope(t, a, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: []string{"msg-1"}})
+	aRequest := readEnvelope(t, a)
+	assertFrameType(t, aRequest, gossipv1.FrameTypeRequest)
+	requestPayload, err := gossipv1.ParseRequestPayload(aRequest.Payload)
 	if err != nil {
-		t.Fatalf("check ack state: %v", err)
+		t.Fatalf("parse request payload: %v", err)
 	}
-	if !acked {
-		t.Fatal("expected canonical ack state to be persisted")
+	if len(requestPayload.Want) != 1 || requestPayload.Want[0] != "msg-1" {
+		t.Fatalf("unexpected want set: %#v", requestPayload.Want)
 	}
 
-	writeFrame(t, b, model.WSFrame{Type: model.FrameTypePull, Limit: 10})
-	pulledAfterAck := readFrame(t, b)
-	if pulledAfterAck.Type != model.FrameTypeMessages || len(pulledAfterAck.Messages) != 0 {
-		t.Fatalf("expected empty pull after ack, got %+v", pulledAfterAck)
+	now := time.Now().UTC()
+	writeEnvelope(t, a, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
+		{
+			ID:         "msg-1",
+			From:       "sender-a",
+			To:         "client-a",
+			PayloadB64: "QQ",
+			CreatedAt:  now.Unix(),
+			ExpiresAt:  now.Add(time.Hour).Unix(),
+		},
+		{
+			ID:         "msg-invalid",
+			From:       "sender-a",
+			To:         "client-a",
+			PayloadB64: "invalid",
+			CreatedAt:  now.Unix(),
+			ExpiresAt:  now.Add(time.Hour).Unix(),
+		},
+	}})
+
+	aReceipt := readEnvelope(t, a)
+	assertFrameType(t, aReceipt, gossipv1.FrameTypeReceipt)
+	receiptPayload, err := gossipv1.ParseReceiptPayload(aReceipt.Payload)
+	if err != nil {
+		t.Fatalf("parse receipt payload: %v", err)
+	}
+	if len(receiptPayload.Accepted) != 1 || receiptPayload.Accepted[0] != "msg-1" {
+		t.Fatalf("unexpected accepted ids: %#v", receiptPayload.Accepted)
+	}
+	if len(receiptPayload.Rejected) != 1 || receiptPayload.Rejected[0].ID != "msg-invalid" {
+		t.Fatalf("unexpected rejected list: %#v", receiptPayload.Rejected)
+	}
+
+	if _, err := relay.store.GetMessageByID(context.Background(), "msg-1"); err != nil {
+		t.Fatalf("expected accepted message persisted: %v", err)
+	}
+	if _, err := relay.store.GetMessageByID(context.Background(), "msg-invalid"); err == nil {
+		t.Fatal("expected rejected message to remain unpersisted")
 	}
 }
 
-func TestCompatibilityHarnessRejectsLegacyShapes(t *testing.T) {
+func TestCompatibilityHarnessRejectsNonBinaryFrames(t *testing.T) {
 	relay, wsURL := startRelayForTest(t, "relay-harness-reject", false, "", true)
 	defer relay.close()
 
 	conn := mustDial(t, wsURL)
 	defer conn.Close()
 
-	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a"})
-	errFrame := readFrame(t, conn)
-	if errFrame.Type != model.FrameTypeError || errFrame.Message != "device_id required" {
-		t.Fatalf("expected device_id required error, got %+v", errFrame)
+	_ = readEnvelope(t, conn)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`)); err != nil {
+		t.Fatalf("write text message: %v", err)
 	}
-
-	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeHello, WayfarerID: "wayfarer-a", DeviceID: "device-a"})
-	_ = readFrame(t, conn)
-
-	legacyPayload := base64.StdEncoding.EncodeToString([]byte{0x41}) // "QQ=="
-	writeFrame(t, conn, model.WSFrame{Type: model.FrameTypeSend, To: "wayfarer-b", PayloadB64: legacyPayload})
-	errFrame = readFrame(t, conn)
-	if errFrame.Type != model.FrameTypeError || errFrame.Message != "invalid payload_b64" {
-		t.Fatalf("expected invalid payload_b64 error, got %+v", errFrame)
-	}
-	if errFrame.MsgID != "" {
-		t.Fatalf("error must not include legacy msg_id alias, got %+v", errFrame)
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("expected connection close after non-binary message")
 	}
 }
 
@@ -180,18 +170,47 @@ func mustDial(t *testing.T, wsURL string) *websocket.Conn {
 	return conn
 }
 
-func writeFrame(t *testing.T, conn *websocket.Conn, frame model.WSFrame) {
+func writeEnvelope(t *testing.T, conn *websocket.Conn, frameType string, payload any) {
 	t.Helper()
-	if err := conn.WriteJSON(frame); err != nil {
-		t.Fatalf("write frame %+v: %v", frame, err)
+	frame, err := gossipv1.EncodeEnvelope(frameType, payload)
+	if err != nil {
+		t.Fatalf("encode envelope: %v", err)
+	}
+	packet, err := gossipv1.EncodeLengthPrefixed(frame)
+	if err != nil {
+		t.Fatalf("encode length prefix: %v", err)
+	}
+	if err := conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+		t.Fatalf("write envelope: %v", err)
 	}
 }
 
-func readFrame(t *testing.T, conn *websocket.Conn) model.WSFrame {
+func readEnvelope(t *testing.T, conn *websocket.Conn) gossipv1.DecodedEnvelope {
 	t.Helper()
-	var frame model.WSFrame
-	if err := conn.ReadJSON(&frame); err != nil {
-		t.Fatalf("read frame: %v", err)
+	msgType, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read message: %v", err)
 	}
-	return frame
+	if msgType != websocket.BinaryMessage {
+		t.Fatalf("expected binary message, got %d", msgType)
+	}
+	if len(payload) < 4 {
+		t.Fatalf("binary message too short: %d", len(payload))
+	}
+	frameLen := binary.BigEndian.Uint32(payload[:4])
+	if int(frameLen) != len(payload)-4 {
+		t.Fatalf("length prefix mismatch: prefix=%d actual=%d", frameLen, len(payload)-4)
+	}
+	decoded, err := gossipv1.DecodeEnvelope(payload[4:])
+	if err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	return decoded
+}
+
+func assertFrameType(t *testing.T, envelope gossipv1.DecodedEnvelope, want string) {
+	t.Helper()
+	if envelope.Type != want {
+		t.Fatalf("unexpected frame type: got %q want %q", envelope.Type, want)
+	}
 }

@@ -234,3 +234,67 @@ func TestHandleReceiptAcksAcceptedOnly(t *testing.T) {
 		t.Fatalf("unexpected ack states: a=%t b=%t c=%t", ackedA, ackedB, ackedC)
 	}
 }
+
+func TestHandleRequestEmptyWantIsNoOp(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 1), DeliveryID: "client\x00device"}}
+
+	err := h.handleRequest(session, gossipv1.Event{Type: gossipv1.EventTypeRequest, Request: &gossipv1.RequestPayload{Want: []string{}}})
+	if err != nil {
+		t.Fatalf("handleRequest failed: %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		t.Fatalf("expected no outbound transfer, got %d bytes", len(outbound))
+	default:
+	}
+}
+
+func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 1), DeliveryID: "client\x00device"}}
+
+	now := time.Now().UTC()
+	st.messagesByID["msg-dup"] = &model.Message{
+		ID:        "msg-dup",
+		From:      "sender-a",
+		To:        "recipient-a",
+		Payload:   "QQ",
+		CreatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+	}
+
+	event := gossipv1.Event{
+		Type: gossipv1.EventTypeTransfer,
+		Transfer: &gossipv1.ParsedTransferPayload{Objects: []gossipv1.IndexedTransferObject{{
+			Index: 0,
+			Object: gossipv1.TransferObject{
+				ID:         "msg-dup",
+				From:       "sender-a",
+				To:         "recipient-a",
+				PayloadB64: "QQ",
+				CreatedAt:  now.Add(-time.Minute).Unix(),
+				ExpiresAt:  now.Add(time.Hour).Unix(),
+			},
+		}}},
+	}
+
+	if err := h.handleTransfer(session, event); err != nil {
+		t.Fatalf("handleTransfer failed: %v", err)
+	}
+	if len(st.persistedIDs) != 0 {
+		t.Fatalf("duplicate transfer should not persist again, got %#v", st.persistedIDs)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		payload := decodeEnvelopePayloadMap(t, outbound)
+		accepted, _ := payload["accepted"].([]any)
+		if len(accepted) != 1 || accepted[0] != "msg-dup" {
+			t.Fatalf("unexpected receipt accepted list: %#v", payload["accepted"])
+		}
+	default:
+		t.Fatal("expected receipt frame")
+	}
+}
