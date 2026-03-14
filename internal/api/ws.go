@@ -67,10 +67,14 @@ func (oc *OriginChecker) Check(r *http.Request) bool {
 type clientSession struct {
 	client            *model.Client
 	adapter           *gossipv1.SessionAdapter
+	sessionID         string
+	peerLabel         string
 	handshakeComplete bool
 	queueRecipient    string
 	lastSummaryHave   []string
 }
+
+const wsDebugItemSampleLimit = 4
 
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
@@ -155,25 +159,36 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Conn: conn,
 		Send: make(chan []byte, 256),
 	}
+	sessionID := gossipv1.NewDebugSessionID("ws")
+	peerLabel := r.RemoteAddr
+	debug := gossipv1.NewDebugSessionLogger(sessionID, peerLabel)
+	debug.Log("in", "CONNECTION", "session_state", "state", "accepted_upgrade", "http_remote_addr", r.RemoteAddr)
 	session := &clientSession{
-		client:  client,
-		adapter: gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello(h.relayID), false),
+		client:    client,
+		adapter:   gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello(h.relayID), false),
+		sessionID: sessionID,
+		peerLabel: peerLabel,
 	}
 
-	go h.writePump(client)
+	go h.writePump(session)
 	h.readPump(session)
 }
 
 func (h *WSHandler) readPump(session *clientSession) {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	debug.Log("local", "SESSION", "session_state", "state", "read_pump_started")
+
 	defer func() {
+		debug.Log("local", "SESSION", "session_state", "state", "read_pump_stopped")
 		if session.client.WayfarerID != "" {
 			h.clients.Unregister(session.client)
 		}
 		session.client.Conn.Close()
 	}()
 
-	if err := h.sendLocalHello(session.client, session.adapter); err != nil {
+	if err := h.sendLocalHello(session, session.adapter); err != nil {
 		log.Printf("ws: send local hello failed: %v", err)
+		debug.Log("out", gossipv1.FrameTypeHello, "send_failed", "transport_ok", false, "protocol_ok", false, "err", err)
 		return
 	}
 
@@ -183,63 +198,104 @@ func (h *WSHandler) readPump(session *clientSession) {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("ws: read error: %v", err)
 			}
+			debug.Log("in", "CONNECTION", "recv_failed", "transport_ok", false, "protocol_ok", false, "close_reason", err, "err", err)
 			return
 		}
 		if msgType != websocket.BinaryMessage {
 			log.Printf("ws: rejected non-binary frame type=%d", msgType)
+			debug.Log("in", "NON_BINARY", "recv_rejected", "msg_type_raw", msgType, "bytes_in", len(data), "transport_ok", true, "protocol_ok", false)
 			return
 		}
+		debug.Log("in", gossipv1.FrameTypeFromPrefixedBinaryFrame(data), "received", "bytes_in", len(data), "transport_ok", true)
 
 		metrics.IncrementReceived()
 		events := session.adapter.PushInbound(data)
 		if err := h.processEvents(session, events); err != nil {
 			log.Printf("ws: protocol event failed: %v", err)
+			debug.Log("in", session.adapter.LastFrameType(), "process_failed", "transport_ok", true, "protocol_ok", false, "store_ok", false, "err", err)
 			return
 		}
 	}
 }
 
 func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Event) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+
 	for _, event := range events {
 		if event.Type == gossipv1.EventTypeFatal {
+			debug.Log("in", session.adapter.LastFrameType(), "protocol_fatal", "transport_ok", true, "protocol_ok", false, "store_ok", false, "err", event.Err)
 			return event.Err
 		}
 
 		switch event.Type {
 		case gossipv1.EventTypeHelloValidated:
+			if event.Hello != nil {
+				debug.Log("in", gossipv1.FrameTypeHello, "hello_received", "transport_ok", true, "protocol_ok", true, "remote_node_id", event.Hello.NodeID)
+			}
 			if err := h.handleHelloValidated(session, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeHello, "hello_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
+			debug.Log("local", "SESSION", "session_state", "state", "hello_validated")
 		case gossipv1.EventTypeSummary:
 			if !session.handshakeComplete {
 				return fmt.Errorf("gossipv1: summary before hello")
 			}
+			if event.Summary != nil {
+				count, sample, hash := gossipv1.ItemIDSample(event.Summary.Have, wsDebugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeSummary, "summary_received", "transport_ok", true, "protocol_ok", true, "item_count", event.Summary.ItemCount, "bloom_bytes", len(event.Summary.BloomFilter), "have_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+			}
 			if err := h.handleSummary(session, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeSummary, "summary_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeRequest:
 			if !session.handshakeComplete {
 				return fmt.Errorf("gossipv1: request before hello")
 			}
+			if event.Request != nil {
+				count, sample, hash := gossipv1.ItemIDSample(event.Request.Want, wsDebugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeRequest, "request_received", "transport_ok", true, "protocol_ok", true, "requested_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+			}
 			if err := h.handleRequest(session, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeRequest, "request_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeTransfer:
 			if !session.handshakeComplete {
 				return fmt.Errorf("gossipv1: transfer before hello")
 			}
+			if event.Transfer != nil {
+				transferIDs := make([]string, 0, len(event.Transfer.Objects))
+				for _, indexed := range event.Transfer.Objects {
+					transferIDs = append(transferIDs, indexed.Object.ID)
+				}
+				count, sample, hash := gossipv1.ItemIDSample(transferIDs, wsDebugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_received", "transport_ok", true, "protocol_ok", true, "object_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "parse_rejected_count", len(event.Transfer.Rejected))
+			}
 			if err := h.handleTransfer(session, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeReceipt:
 			if !session.handshakeComplete {
 				return fmt.Errorf("gossipv1: receipt before hello")
 			}
+			if event.Receipt != nil {
+				acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, wsDebugItemSampleLimit)
+				rejectedIDs := make([]string, 0, len(event.Receipt.Rejected))
+				for _, rejected := range event.Receipt.Rejected {
+					rejectedIDs = append(rejectedIDs, rejected.ID)
+				}
+				rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_received", "transport_ok", true, "protocol_ok", true, "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
+			}
 			if err := h.handleReceipt(session, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeRelayIngest, gossipv1.EventTypeUntrustedRelay, gossipv1.EventTypeIgnored:
-			// No-op on client path.
+			debug.Log("in", event.FrameType, "frame_ignored", "protocol_ok", true)
 		}
 	}
 
@@ -247,6 +303,8 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 }
 
 func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.Event) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+
 	if session.handshakeComplete {
 		return fmt.Errorf("gossipv1: duplicate hello")
 	}
@@ -258,37 +316,65 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 	session.client.DeviceID = event.Hello.NodePubKey
 	session.client.DeliveryID = storeforward.DeliveryIdentity(session.client.WayfarerID, session.client.DeviceID)
 	h.clients.Register(session.client)
+	session.peerLabel = session.client.WayfarerID
+	debug = gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	debug.Log("local", gossipv1.FrameTypeHello, "identity_bound", "wayfarer_id", session.client.WayfarerID, "device_id", session.client.DeviceID)
 
 	session.queueRecipient = storeforward.QueueRecipient(session.client.DeliveryID)
 	session.handshakeComplete = true
+	debug.Log("local", "SESSION", "session_state", "state", "handshake_complete", "queue_recipient", session.queueRecipient)
 
 	have, err := h.listQueuedMessageIDs(session.queueRecipient)
 	if err != nil {
+		debug.Log("local", gossipv1.FrameTypeSummary, "summary_inventory_failed", "store_ok", false, "err", err)
 		return err
 	}
 	session.lastSummaryHave = have
+	canonicalSummary := gossipv1.BuildSummaryPayload(have)
+	haveCount, haveSample, haveHash := gossipv1.ItemIDSample(have, wsDebugItemSampleLimit)
+	debug.Log(
+		"out",
+		gossipv1.FrameTypeSummary,
+		"summary_constructed",
+		"summary_path", "ws.handleHelloValidated:listQueuedMessageIDs->canonical_summary",
+		"canonical_builder", "gossipv1.BuildSummaryPayload",
+		"source_inventory_count", len(have),
+		"item_count", canonicalSummary.ItemCount,
+		"bloom_bytes", len(canonicalSummary.BloomFilter),
+		"item_ids_sample", haveSample,
+		"item_ids_hash", haveHash,
+		"have_count", haveCount,
+	)
 
-	return h.sendEnvelope(session.client, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload(have))
+	return h.sendEnvelope(session, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload(have))
 }
 
 func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+
 	if event.Summary == nil {
 		return fmt.Errorf("gossipv1: summary event missing payload")
 	}
 
 	want, err := h.computeMissingWant(event.Summary.Have)
 	if err != nil {
+		debug.Log("local", gossipv1.FrameTypeSummary, "summary_compute_want_failed", "store_ok", false, "err", err)
 		return err
 	}
+	wantCount, wantSample, wantHash := gossipv1.ItemIDSample(want, wsDebugItemSampleLimit)
+	debug.Log("local", gossipv1.FrameTypeSummary, "summary_computed_want", "requested_count", wantCount, "item_ids_sample", wantSample, "item_ids_hash", wantHash, "store_ok", true)
 
-	return h.sendEnvelope(session.client, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: want})
+	return h.sendEnvelope(session, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: want})
 }
 
 func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+
 	if event.Request == nil {
 		return fmt.Errorf("gossipv1: request event missing payload")
 	}
 	if len(event.Request.Want) == 0 {
+		debug.Log("in", gossipv1.FrameTypeRequest, "request_empty", "requested_count", 0, "protocol_ok", true)
 		return nil
 	}
 
@@ -298,23 +384,29 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 
 	for _, requestedID := range event.Request.Want {
 		if uint64(len(objects)) >= gossipv1.MaxTransferItems {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "max_transfer_limit_reached", "store_ok", true)
 			break
 		}
 
 		message, err := h.store.GetMessageByID(context.Background(), requestedID)
 		if err != nil {
 			if isNotFoundError(err) {
+				debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "missing", "reason", "not_found", "store_ok", true)
 				continue
 			}
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "lookup_failed", "store_ok", false, "err", err)
 			return err
 		}
 		if message == nil {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "missing", "reason", "nil_message", "store_ok", true)
 			continue
 		}
 		if message.To != session.queueRecipient {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "recipient_mismatch", "store_ok", true)
 			continue
 		}
 		if !message.ExpiresAt.After(now) {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "expired", "store_ok", true)
 			continue
 		}
 
@@ -327,13 +419,19 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 			ExpiresAt:  message.ExpiresAt.UTC().Unix(),
 		})
 		expectedReceiptIDs = append(expectedReceiptIDs, message.ID)
+		debug.LogItem("out", gossipv1.FrameTypeTransfer, message.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
 	}
+	transferCount, transferSample, transferHash := gossipv1.ItemIDSample(expectedReceiptIDs, wsDebugItemSampleLimit)
+	debug.Log("out", gossipv1.FrameTypeTransfer, "request_serviced", "object_count", len(objects), "expected_receipt_count", transferCount, "item_ids_sample", transferSample, "item_ids_hash", transferHash, "store_ok", true)
 
 	session.adapter.SetExpectedReceipt(expectedReceiptIDs)
-	return h.sendEnvelope(session.client, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: objects})
+	return h.sendEnvelope(session, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: objects})
 }
 
 func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	traceCtx := gossipv1.WithDebugTrace(context.Background(), session.sessionID, session.peerLabel)
+
 	if event.Transfer == nil {
 		return fmt.Errorf("gossipv1: transfer event missing payload")
 	}
@@ -346,6 +444,7 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 	for _, indexed := range event.Transfer.Objects {
 		validationErr := validateTransferObject(indexed.Object)
 		if validationErr != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", validationErr.Error(), "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
 				Index:  indexed.Index,
 				ID:     indexed.Object.ID,
@@ -356,15 +455,18 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 
 		existing, err := h.store.GetMessageByID(context.Background(), indexed.Object.ID)
 		if err != nil && !isNotFoundError(err) {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_store_lookup_failed", "store_ok", false, "err", err)
 			return err
 		}
 		if err == nil && existing != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_accepted", "decision", "duplicate", "store_ok", true)
 			receipt.Accepted = append(receipt.Accepted, indexed.Object.ID)
 			continue
 		}
 
 		decodedPayload, err := model.DecodePayloadB64(indexed.Object.PayloadB64)
 		if err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "invalid payload_b64", "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
 				Index:  indexed.Index,
 				ID:     indexed.Object.ID,
@@ -376,6 +478,7 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 		createdAt := time.Unix(indexed.Object.CreatedAt, 0).UTC()
 		expiresAt := time.Unix(indexed.Object.ExpiresAt, 0).UTC()
 		if !expiresAt.After(createdAt) {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "expires_at must be greater than created_at", "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
 				Index:  indexed.Index,
 				ID:     indexed.Object.ID,
@@ -384,6 +487,7 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 			continue
 		}
 		if !expiresAt.After(time.Now().UTC()) {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "object already expired", "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
 				Index:  indexed.Index,
 				ID:     indexed.Object.ID,
@@ -401,8 +505,9 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 			ExpiresAt: expiresAt,
 		}
 
-		if err := h.engine.PersistMessage(context.Background(), message); err != nil {
+		if err := h.engine.PersistMessage(traceCtx, message); err != nil {
 			metrics.IncrementStoreErrors()
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "persist failed", "store_ok", false, "err", err)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
 				Index:  indexed.Index,
 				ID:     indexed.Object.ID,
@@ -412,17 +517,27 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 		}
 
 		metrics.IncrementPersisted()
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_accepted", "decision", "inserted", "store_ok", true)
 		receipt.Accepted = append(receipt.Accepted, indexed.Object.ID)
 	}
 
 	if len(receipt.Accepted) > 1 {
 		sort.Strings(receipt.Accepted)
 	}
+	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, wsDebugItemSampleLimit)
+	rejectedIDs := make([]string, 0, len(receipt.Rejected))
+	for _, rejected := range receipt.Rejected {
+		rejectedIDs = append(rejectedIDs, rejected.ID)
+	}
+	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
+	debug.Log("out", gossipv1.FrameTypeReceipt, "receipt_constructed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
 
-	return h.sendEnvelope(session.client, gossipv1.FrameTypeReceipt, receipt)
+	return h.sendEnvelope(session, gossipv1.FrameTypeReceipt, receipt)
 }
 
 func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+
 	if event.Receipt == nil {
 		return fmt.Errorf("gossipv1: receipt event missing payload")
 	}
@@ -431,12 +546,18 @@ func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) 
 		transitioned, err := h.engine.AckClientDelivery(context.Background(), acceptedID, session.client.DeliveryID)
 		if err != nil {
 			metrics.IncrementStoreErrors()
+			debug.LogItem("in", gossipv1.FrameTypeReceipt, acceptedID, "receipt_ack_failed", "store_ok", false, "err", err)
 			return err
 		}
 		if transitioned {
 			metrics.IncrementDelivered()
+			debug.LogItem("in", gossipv1.FrameTypeReceipt, acceptedID, "receipt_ack_applied", "store_ok", true)
+			continue
 		}
+		debug.LogItem("in", gossipv1.FrameTypeReceipt, acceptedID, "receipt_ack_noop", "store_ok", true)
 	}
+	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, wsDebugItemSampleLimit)
+	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
 
 	return nil
 }
@@ -532,59 +653,184 @@ func isNotFoundError(err error) bool {
 }
 
 // writePump writes messages to the WebSocket.
-func (h *WSHandler) writePump(client *model.Client) {
+func (h *WSHandler) writePump(session *clientSession) {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	debug.Log("local", "SESSION", "session_state", "state", "write_pump_started")
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer func() {
 		ticker.Stop()
-		client.Conn.Close()
+		session.client.Conn.Close()
+		debug.Log("local", "SESSION", "session_state", "state", "write_pump_stopped")
 	}()
 
 	for {
 		select {
-		case message, ok := <-client.Send:
+		case message, ok := <-session.client.Send:
 			if !ok {
-				client.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				if err := session.client.Conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
+					debug.Log("out", "CLOSE", "close_frame_failed", "transport_ok", false, "err", err)
+				} else {
+					debug.Log("out", "CLOSE", "close_frame_sent", "transport_ok", true)
+				}
 				return
 			}
-			if err := client.Conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+			frameType := gossipv1.FrameTypeFromPrefixedBinaryFrame(message)
+			if err := session.client.Conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+				debug.Log("out", frameType, "send_failed", "bytes_out", len(message), "transport_ok", false, "protocol_ok", true, "err", err)
 				return
 			}
+			debug.Log("out", frameType, "sent_transport", "bytes_out", len(message), "transport_ok", true, "protocol_ok", true)
 		case <-ticker.C:
-			if err := client.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := session.client.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				debug.Log("out", "PING", "heartbeat_failed", "transport_ok", false, "err", err)
 				return
 			}
+			debug.Log("out", "PING", "heartbeat_sent", "bytes_out", 0, "transport_ok", true)
 		}
 	}
 }
 
-func (h *WSHandler) sendLocalHello(client *model.Client, adapter *gossipv1.SessionAdapter) error {
+func summaryHaveFromPayload(payload any) []string {
+	switch typed := payload.(type) {
+	case map[string]any:
+		raw, ok := typed["have"]
+		if !ok {
+			return nil
+		}
+		rawIDs, ok := raw.([]string)
+		if ok {
+			return append([]string(nil), rawIDs...)
+		}
+		asAny, ok := raw.([]any)
+		if !ok {
+			return nil
+		}
+		ids := make([]string, 0, len(asAny))
+		for _, value := range asAny {
+			id, ok := value.(string)
+			if !ok {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		return ids
+	default:
+		return nil
+	}
+}
+
+func (h *WSHandler) sendLocalHello(session *clientSession, adapter *gossipv1.SessionAdapter) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+
 	helloBytes, err := adapter.InitialHelloBytes()
 	if err != nil {
+		debug.Log("out", gossipv1.FrameTypeHello, "encode_failed", "transport_ok", false, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
-	h.sendBinary(client, helloBytes)
+	queued := h.sendBinary(session.client, helloBytes)
+	debug.Log("out", gossipv1.FrameTypeHello, "sent", "bytes_out", len(helloBytes), "transport_ok", queued, "protocol_ok", true, "store_ok", true)
 	return nil
 }
 
-func (h *WSHandler) sendEnvelope(client *model.Client, frameType string, payload any) error {
+func (h *WSHandler) sendEnvelope(session *clientSession, frameType string, payload any) error {
+	peerLabel := session.peerLabel
+	if peerLabel == "" {
+		peerLabel = "-"
+	}
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, peerLabel)
+
 	frame, err := gossipv1.EncodeEnvelope(frameType, payload)
 	if err != nil {
+		debug.Log("out", frameType, "encode_failed", "transport_ok", false, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
 	prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
 	if err != nil {
+		debug.Log("out", frameType, "prefix_failed", "transport_ok", false, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
-	h.sendBinary(client, prefixed)
+
+	metadata := make([]any, 0, 12)
+	switch frameType {
+	case gossipv1.FrameTypeSummary:
+		if summary, ok := payload.(gossipv1.SummaryPayload); ok {
+			count, sample, hash := gossipv1.ItemIDSample(summary.Have, wsDebugItemSampleLimit)
+			metadata = append(metadata,
+				"item_count", summary.ItemCount,
+				"bloom_bytes", len(summary.BloomFilter),
+				"have_count", count,
+				"item_ids_sample", sample,
+				"item_ids_hash", hash,
+			)
+		} else {
+			have := summaryHaveFromPayload(payload)
+			count, sample, hash := gossipv1.ItemIDSample(have, wsDebugItemSampleLimit)
+			metadata = append(metadata,
+				"item_count", count,
+				"have_count", count,
+				"item_ids_sample", sample,
+				"item_ids_hash", hash,
+			)
+		}
+	case gossipv1.FrameTypeRequest:
+		if request, ok := payload.(gossipv1.RequestPayload); ok {
+			count, sample, hash := gossipv1.ItemIDSample(request.Want, wsDebugItemSampleLimit)
+			metadata = append(metadata,
+				"requested_count", count,
+				"item_ids_sample", sample,
+				"item_ids_hash", hash,
+			)
+		}
+	case gossipv1.FrameTypeTransfer:
+		if transfer, ok := payload.(gossipv1.TransferPayload); ok {
+			ids := make([]string, 0, len(transfer.Objects))
+			for _, object := range transfer.Objects {
+				ids = append(ids, object.ID)
+			}
+			count, sample, hash := gossipv1.ItemIDSample(ids, wsDebugItemSampleLimit)
+			metadata = append(metadata,
+				"object_count", count,
+				"accepted_item_ids_sample", sample,
+				"accepted_item_ids_hash", hash,
+			)
+		}
+	case gossipv1.FrameTypeReceipt:
+		if receipt, ok := payload.(gossipv1.ReceiptPayload); ok {
+			acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, wsDebugItemSampleLimit)
+			rejectedIDs := make([]string, 0, len(receipt.Rejected))
+			for _, rejected := range receipt.Rejected {
+				rejectedIDs = append(rejectedIDs, rejected.ID)
+			}
+			rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
+			metadata = append(metadata,
+				"item_count", acceptedCount+rejectedCount,
+				"accepted_count", acceptedCount,
+				"accepted_item_ids_sample", acceptedSample,
+				"accepted_item_ids_hash", acceptedHash,
+				"rejected_count", rejectedCount,
+				"rejected_item_ids_sample", rejectedSample,
+				"rejected_item_ids_hash", rejectedHash,
+			)
+		}
+	}
+
+	queued := h.sendBinary(session.client, prefixed)
+	logFields := make([]any, 0, len(metadata)+6)
+	logFields = append(logFields, metadata...)
+	logFields = append(logFields, "bytes_out", len(prefixed), "transport_ok", queued, "protocol_ok", true, "store_ok", true)
+	debug.Log("out", frameType, "sent", logFields...)
 	return nil
 }
 
 // sendBinary sends a frame to the client with bounded backpressure.
-func (h *WSHandler) sendBinary(client *model.Client, data []byte) {
+func (h *WSHandler) sendBinary(client *model.Client, data []byte) bool {
+	queued := false
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("ws: failed to send, channel closed for client %s", client.WayfarerID)
 			metrics.IncrementDropped()
+			queued = false
 		}
 	}()
 
@@ -593,8 +839,11 @@ func (h *WSHandler) sendBinary(client *model.Client, data []byte) {
 
 	select {
 	case client.Send <- data:
+		queued = true
 	case <-timer.C:
 		log.Printf("ws: failed to send, channel full after timeout for client %s", client.WayfarerID)
 		metrics.IncrementDropped()
 	}
+
+	return queued
 }

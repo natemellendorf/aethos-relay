@@ -17,6 +17,7 @@ import (
 	"github.com/natemellendorf/aethos-relay/internal/api"
 	"github.com/natemellendorf/aethos-relay/internal/federation"
 	"github.com/natemellendorf/aethos-relay/internal/gossip"
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/metrics"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 	"github.com/natemellendorf/aethos-relay/internal/store"
@@ -30,6 +31,7 @@ func main() {
 		"auto-peer-discovery":      {},
 		"federation-pad-enabled":   {},
 		"federation-cover-enabled": {},
+		"gossipv1-debug":           {},
 	}
 	os.Args = normalizeBoolFlagArgs(os.Args, boolFlags)
 
@@ -44,6 +46,7 @@ func main() {
 	devMode := flag.Bool("dev-mode", false, "Enable development mode (allows all origins, for local development only)")
 	ackDrivenSuppression := flag.Bool("ack-driven-suppression", false, "Use canonical ack-driven delivery suppression (default legacy mark-on-push)")
 	scrubInvalidPayloadsStartup := flag.Bool("scrub-invalid-payloads-startup", true, "Remove queued messages with invalid payload_b64 at startup")
+	gossipV1Debug := flag.Bool("gossipv1-debug", false, "Enable verbose structured Gossip V1 debug logging")
 
 	// Federation flags
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
@@ -78,6 +81,7 @@ func main() {
 		log.SetFlags(0)
 		log.SetOutput(os.Stderr)
 	}
+	gossipv1.SetDebugLoggingEnabled(*gossipV1Debug)
 
 	// Generate relay ID if not provided
 	if *relayID == "" {
@@ -95,6 +99,7 @@ func main() {
 	log.Printf("Dev mode: %v", *devMode)
 	log.Printf("Ack-driven suppression: %v", *ackDrivenSuppression)
 	log.Printf("Scrub invalid payloads on startup: %v", *scrubInvalidPayloadsStartup)
+	log.Printf("Gossip V1 debug logging: %v", *gossipV1Debug)
 	if *ackDrivenSuppression {
 		log.Printf("WARNING: ack-driven suppression enabled: queue suppression uses ack_state and legacy delivery_state during migration")
 	}

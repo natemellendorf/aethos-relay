@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
@@ -39,15 +40,24 @@ type RelayForwardResult struct {
 
 // AcceptRelayForward validates and persists an inbound relay forward payload.
 func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, msg *model.Message, maxPayloadSize int) (RelayForwardResult, error) {
+	debug := gossipv1.DebugLoggerFromContext(ctx, sourceRelayID)
+	itemID := ""
+	if msg != nil {
+		itemID = msg.ID
+	}
+
 	if !isValidForwardMessage(msg) {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, itemID, "store_ingest_rejected", "decision", RelayForwardInvalid, "reason", "invalid_transfer_object", "store_ok", false)
 		return RelayForwardResult{Status: RelayForwardInvalid}, ErrForwardMessageInvalid
 	}
 	if maxPayloadSize > 0 && len(msg.Payload) > maxPayloadSize {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_ingest_rejected", "decision", RelayForwardTooLarge, "reason", "payload_exceeds_limit", "store_ok", false)
 		return RelayForwardResult{Status: RelayForwardTooLarge}, ErrForwardMessageTooLarge
 	}
 
 	now := e.now()
 	if now.After(msg.ExpiresAt) {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_ingest_rejected", "decision", RelayForwardExpired, "reason", "object_already_expired", "store_ok", false)
 		return RelayForwardResult{Status: RelayForwardExpired}, nil
 	}
 
@@ -71,15 +81,21 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 
 	if !messageAlreadyExists {
 		if seenBySource {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_ingest_rejected", "decision", RelayForwardSeenLoop, "reason", "seen_by_source", "store_ok", false)
 			return RelayForwardResult{Status: RelayForwardSeenLoop}, nil
 		}
 		if err := e.store.PersistMessage(ctx, msg); err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_failed", "decision", RelayForwardInvalid, "reason", "persist_failed", "store_ok", false, "err", err)
 			return RelayForwardResult{}, err
 		}
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_ok", "decision", RelayForwardAccepted, "store_ok", true)
+	} else {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_skipped", "decision", RelayForwardDuplicate, "reason", "already_exists", "store_ok", true)
 	}
 
 	envelope, err := e.persistEnvelopeState(ctx, msg, sourceRelayID)
 	if err != nil {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_ingest_rejected", "decision", RelayForwardInvalid, "reason", "envelope_persist_failed", "store_ok", false, "err", err)
 		return RelayForwardResult{}, err
 	}
 
@@ -89,25 +105,30 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 		if atomicMarker, ok := e.envelopeStore.(relayIngestAtomicMarker); ok {
 			markerCreated, err = atomicMarker.MarkSeenAndRelayIngestEmitted(ctx, relayIngestItemID(msg), relayIDs)
 			if err != nil {
+				debug.LogItem("in", gossipv1.FrameTypeRelayIngest, msg.ID, "relay_ingest_marker_failed", "store_ok", false, "err", err)
 				return RelayForwardResult{}, err
 			}
 		} else {
 			for _, relayID := range relayIDs {
 				if err := e.envelopeStore.MarkSeen(ctx, msg.ID, relayID); err != nil {
+					debug.LogItem("in", gossipv1.FrameTypeRelayIngest, msg.ID, "relay_ingest_seen_mark_failed", "store_ok", false, "relay_id", relayID, "err", err)
 					return RelayForwardResult{}, err
 				}
 			}
 
 			markerCreated, err = e.envelopeStore.MarkRelayIngestEmitted(ctx, relayIngestItemID(msg))
 			if err != nil {
+				debug.LogItem("in", gossipv1.FrameTypeRelayIngest, msg.ID, "relay_ingest_marker_failed", "store_ok", false, "err", err)
 				return RelayForwardResult{}, err
 			}
 		}
 	} else if !messageAlreadyExists {
 		markerCreated = true
 	}
+	debug.LogItem("in", gossipv1.FrameTypeRelayIngest, msg.ID, "relay_ingest_marker_status", "marker_created", markerCreated, "store_ok", true)
 
 	if markerCreated {
+		debug.LogItem("out", gossipv1.FrameTypeRelayIngest, msg.ID, "relay_ingest_emitted", "trusted", isAuthenticatedRelayContext(sourceRelayID), "source_relay", sourceRelayID, "store_ok", true)
 		e.emitRelayIngest(ctx, RelayIngestSignal{
 			ItemID:      relayIngestItemID(msg),
 			Trusted:     isAuthenticatedRelayContext(sourceRelayID),
@@ -123,6 +144,7 @@ func (e *Engine) AcceptRelayForward(ctx context.Context, sourceRelayID string, m
 			status = RelayForwardDuplicate
 		}
 	}
+	debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_ingest_result", "decision", status, "store_ok", true)
 
 	return RelayForwardResult{Status: status, Envelope: envelope}, nil
 }

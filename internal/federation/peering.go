@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -29,10 +30,12 @@ const (
 	ProtocolDiagnosticsInterval = 10 * time.Second
 
 	relayForwardMaxPayloadBytes = model.MAX_ENVELOPE_SIZE
+	debugItemSampleLimit        = 4
 )
 
 type Peer struct {
 	ID             string
+	SessionID      string
 	URL            string
 	RemoteNodeID   string
 	Outbound       bool
@@ -77,6 +80,66 @@ func (h *PeerHealth) RecordSuccess() {
 
 func (h *PeerHealth) IsBackingOff() bool {
 	return time.Now().Before(h.BackoffUntil)
+}
+
+func peerDebugIdentity(peer *Peer) string {
+	if peer == nil {
+		return "-"
+	}
+	if peer.RemoteNodeID != "" {
+		return peer.RemoteNodeID
+	}
+	if peer.URL != "" {
+		return peer.URL
+	}
+	if peer.ID != "" {
+		return peer.ID
+	}
+	return "-"
+}
+
+func (pm *PeerManager) peerDebugLogger(peer *Peer) gossipv1.DebugSessionLogger {
+	if peer == nil {
+		return gossipv1.NewDebugSessionLogger("federation-unknown", "-")
+	}
+	sessionID := peer.SessionID
+	if sessionID == "" {
+		sessionID = "federation-unknown"
+	}
+	return gossipv1.NewDebugSessionLogger(sessionID, peerDebugIdentity(peer))
+}
+
+func peerSocketAddresses(peer *Peer) (string, string) {
+	if peer == nil || peer.Conn == nil {
+		return "-", "-"
+	}
+	netConn := peer.Conn.UnderlyingConn()
+	if netConn == nil {
+		return "-", "-"
+	}
+	localAddr := "-"
+	remoteAddr := "-"
+	if netConn.LocalAddr() != nil {
+		localAddr = netConn.LocalAddr().String()
+	}
+	if netConn.RemoteAddr() != nil {
+		remoteAddr = netConn.RemoteAddr().String()
+	}
+	return localAddr, remoteAddr
+}
+
+func closeReasonFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return fmt.Sprintf("code=%d text=%s", closeErr.Code, closeErr.Text)
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return "network closed"
+	}
+	return err.Error()
 }
 
 type PeerManager struct {
@@ -143,8 +206,28 @@ func NewPeerManagerWithConfig(relayID string, st store.Store, clients *model.Cli
 			if signal.ItemID == "" {
 				return
 			}
+			sampleCount, sampleIDs, sampleHash := gossipv1.ItemIDSample([]string{signal.ItemID}, debugItemSampleLimit)
+			gossipv1.NewDebugSessionLogger("relay-ingest-observer", signal.SourceRelay).LogItem(
+				"out",
+				gossipv1.FrameTypeRelayIngest,
+				signal.ItemID,
+				"relay_ingest_observed",
+				"trusted", signal.Trusted,
+				"item_count", sampleCount,
+				"item_ids_sample", sampleIDs,
+				"item_ids_hash", sampleHash,
+			)
 			if err := pm.forwardSummaryToPeers([]string{signal.ItemID}, signal.SourceRelay); err != nil {
 				log.Printf("federation: failed propagating relay ingest summary item=%s err=%v", signal.ItemID, err)
+				gossipv1.NewDebugSessionLogger("relay-ingest-observer", signal.SourceRelay).LogItem(
+					"out",
+					gossipv1.FrameTypeSummary,
+					signal.ItemID,
+					"relay_ingest_summary_forward_failed",
+					"transport_ok", false,
+					"protocol_ok", false,
+					"err", err,
+				)
 			}
 		})
 	}
@@ -214,10 +297,14 @@ func (pm *PeerManager) cleanup() {
 
 func (pm *PeerManager) dialPeer(url string) {
 	delay := ReconnectBaseDelay
+	sessionID := gossipv1.NewDebugSessionID("federation-out")
+	debug := gossipv1.NewDebugSessionLogger(sessionID, url)
+	debug.Log("out", "CONNECTION", "session_state", "state", "dialing", "max_attempts", 10)
 
 	for attempt := 0; attempt < 10; attempt++ {
 		select {
 		case <-pm.ctxStop:
+			debug.Log("local", "CONNECTION", "session_state", "state", "stopped")
 			return
 		default:
 		}
@@ -225,6 +312,7 @@ func (pm *PeerManager) dialPeer(url string) {
 		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 		if err != nil {
 			log.Printf("federation: dial failed %s: %v (retry in %v)", url, err, delay)
+			debug.Log("out", "CONNECTION", "connect_failed", "attempt", attempt+1, "retry_in", delay, "err", err)
 			time.Sleep(delay)
 			delay = min(delay*2, ReconnectMaxDelay)
 			continue
@@ -233,6 +321,7 @@ func (pm *PeerManager) dialPeer(url string) {
 
 		peer := &Peer{
 			ID:          uuid.New().String(),
+			SessionID:   sessionID,
 			URL:         url,
 			Outbound:    true,
 			Conn:        conn,
@@ -241,23 +330,31 @@ func (pm *PeerManager) dialPeer(url string) {
 			Done:        make(chan struct{}),
 			Metrics:     model.NewPeerMetrics(url),
 		}
+		localAddr, remoteAddr := peerSocketAddresses(peer)
+		debug.Log("out", "CONNECTION", "connect_ok", "attempt", attempt+1, "local_addr", localAddr, "remote_addr", remoteAddr)
 
 		if err := pm.runEncounter(peer); err != nil {
 			log.Printf("federation: gossipv1 encounter failed %s: %v", url, err)
+			debug.Log("local", "CONNECTION", "session_state", "state", "encounter_failed", "err", err)
 			_ = conn.Close()
 			time.Sleep(delay)
 			delay = min(delay*2, ReconnectMaxDelay)
 			continue
 		}
 
+		debug.Log("local", "CONNECTION", "session_state", "state", "encounter_established")
 		pm.inbound <- peer
 		return
 	}
 
 	log.Printf("federation: max retries exceeded for %s", url)
+	debug.Log("local", "CONNECTION", "session_state", "state", "max_retries_exceeded")
 }
 
 func (pm *PeerManager) runEncounter(peer *Peer) error {
+	debug := pm.peerDebugLogger(peer)
+	debug.Log("local", "SESSION", "session_state", "state", "encounter_start")
+
 	localHello := gossipv1.BuildRelayHello(pm.relayID)
 	adapter := gossipv1.NewSessionAdapter(localHello, true)
 	peer.adapterMu.Lock()
@@ -266,41 +363,55 @@ func (pm *PeerManager) runEncounter(peer *Peer) error {
 
 	helloBytes, err := adapter.InitialHelloBytes()
 	if err != nil {
+		debug.Log("out", gossipv1.FrameTypeHello, "encode_failed", "transport_ok", false, "protocol_ok", false, "err", err)
 		return err
 	}
 	if err := pm.writePeerMessage(peer, websocket.BinaryMessage, helloBytes); err != nil {
+		debug.Log("out", gossipv1.FrameTypeHello, "send_failed", "bytes_out", len(helloBytes), "transport_ok", false, "protocol_ok", false, "err", err)
 		return fmt.Errorf("send HELLO: %w", err)
 	}
+	debug.Log("out", gossipv1.FrameTypeHello, "sent", "bytes_out", len(helloBytes), "transport_ok", true, "protocol_ok", true)
 	peer.localHelloSent = true
 
 	if err := peer.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		debug.Log("local", "SESSION", "deadline_set_failed", "err", err)
 		return err
 	}
 	msgType, data, err := peer.Conn.ReadMessage()
 	if err != nil {
+		debug.Log("in", gossipv1.FrameTypeHello, "recv_failed", "transport_ok", false, "protocol_ok", false, "close_reason", closeReasonFromError(err), "err", err)
 		return fmt.Errorf("read HELLO: %w", err)
 	}
 	if msgType != websocket.BinaryMessage {
+		debug.Log("in", "NON_BINARY", "recv_rejected", "msg_type_raw", msgType, "bytes_in", len(data), "transport_ok", true, "protocol_ok", false)
 		return errors.New("expected binary gossip frame")
 	}
+	debug.Log("in", gossipv1.FrameTypeFromPrefixedBinaryFrame(data), "received", "bytes_in", len(data), "transport_ok", true)
 
 	events := adapter.PushInbound(data)
 	if err := pm.processEvents(peer, adapter, events); err != nil {
+		debug.Log("in", adapter.LastFrameType(), "process_failed", "transport_ok", true, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
 	if !adapter.IsHealthy() {
+		debug.Log("local", "SESSION", "session_unhealthy", "state", "post_hello", "protocol_ok", false)
 		return errors.New("gossip session unhealthy after HELLO")
 	}
+	debug.Log("local", "SESSION", "session_state", "state", "healthy")
 
 	_ = peer.Conn.SetReadDeadline(time.Time{})
 	go pm.readLoop(peer)
 	go pm.writeLoop(peer)
+	debug.Log("local", "SESSION", "session_state", "state", "loops_started")
 	return nil
 }
 
 func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapter, events []gossipv1.Event) error {
+	debug := pm.peerDebugLogger(peer)
+
 	for _, event := range events {
 		if event.Type == gossipv1.EventTypeFatal {
+			debug.Log("in", adapter.LastFrameType(), "protocol_fatal", "transport_ok", true, "protocol_ok", false, "store_ok", false, "err", event.Err)
 			return event.Err
 		}
 
@@ -311,52 +422,89 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 			}
 			if peer.RemoteNodeID == "" {
 				peer.RemoteNodeID = event.Hello.NodeID
+				debug = pm.peerDebugLogger(peer)
 			} else if peer.RemoteNodeID != event.Hello.NodeID {
 				return fmt.Errorf("gossipv1: peer node id changed from %s to %s", peer.RemoteNodeID, event.Hello.NodeID)
 			}
+			debug.Log("in", gossipv1.FrameTypeHello, "hello_received", "transport_ok", true, "protocol_ok", true, "remote_node_id", event.Hello.NodeID)
 
 			peer.healthMu.Lock()
 			peer.Health.LastSeen = time.Now()
 			peer.Health.IsHealthy = true
 			peer.LastHelloAt = time.Now()
 			peer.healthMu.Unlock()
+			debug.Log("local", "SESSION", "session_state", "state", "hello_validated")
 
 			if err := pm.sendSummary(peer); err != nil {
+				debug.Log("out", gossipv1.FrameTypeSummary, "summary_send_failed", "transport_ok", false, "protocol_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeSummary:
 			if !adapter.IsHealthy() {
 				return errors.New("gossipv1: summary before hello")
 			}
+			if event.Summary != nil {
+				count, sample, hash := gossipv1.ItemIDSample(event.Summary.Have, debugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeSummary, "summary_received", "transport_ok", true, "protocol_ok", true, "item_count", event.Summary.ItemCount, "bloom_bytes", len(event.Summary.BloomFilter), "have_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+			}
 			if err := pm.handleSummary(peer, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeSummary, "summary_handle_failed", "protocol_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeRequest:
 			if !adapter.IsHealthy() {
 				return errors.New("gossipv1: request before hello")
 			}
+			if event.Request != nil {
+				count, sample, hash := gossipv1.ItemIDSample(event.Request.Want, debugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeRequest, "request_received", "transport_ok", true, "protocol_ok", true, "requested_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+			}
 			if err := pm.handleRequest(peer, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeRequest, "request_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeTransfer:
 			if !adapter.IsHealthy() {
 				return errors.New("gossipv1: transfer before hello")
 			}
+			if event.Transfer != nil {
+				transferIDs := make([]string, 0, len(event.Transfer.Objects))
+				for _, indexed := range event.Transfer.Objects {
+					transferIDs = append(transferIDs, indexed.Object.ID)
+				}
+				count, sample, hash := gossipv1.ItemIDSample(transferIDs, debugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_received", "transport_ok", true, "protocol_ok", true, "object_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "parse_rejected_count", len(event.Transfer.Rejected))
+			}
 			if err := pm.handleTransfer(peer, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeReceipt:
 			if !adapter.IsHealthy() {
 				return errors.New("gossipv1: receipt before hello")
 			}
+			if event.Receipt != nil {
+				acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, debugItemSampleLimit)
+				rejectedIDs := make([]string, 0, len(event.Receipt.Rejected))
+				for _, rejected := range event.Receipt.Rejected {
+					rejectedIDs = append(rejectedIDs, rejected.ID)
+				}
+				rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_received", "transport_ok", true, "protocol_ok", true, "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
+			}
 			if err := pm.handleReceipt(peer, event); err != nil {
+				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
 		case gossipv1.EventTypeRelayIngest, gossipv1.EventTypeUntrustedRelay:
-			// Phase 2 parses relay_ingest frames and surfaces them for observation,
-			// but does not attach trusted relay-side effects in peer manager yet.
+			count, sample, hash := gossipv1.ItemIDSample(event.ItemIDs, debugItemSampleLimit)
+			if event.Type == gossipv1.EventTypeUntrustedRelay {
+				debug.Log("in", gossipv1.FrameTypeRelayIngest, "relay_ingest_untrusted", "transport_ok", true, "protocol_ok", true, "store_ok", false, "item_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+			} else {
+				debug.Log("in", gossipv1.FrameTypeRelayIngest, "relay_ingest_received", "transport_ok", true, "protocol_ok", true, "store_ok", false, "item_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+			}
 		case gossipv1.EventTypeIgnored:
-			// Intentionally ignored.
+			debug.Log("in", event.FrameType, "frame_ignored", "transport_ok", true, "protocol_ok", true)
 		}
 
 		pm.eventObserverMu.RLock()
@@ -369,6 +517,7 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 		if err := observer(peer, event); err != nil {
 			adapter.ObserveNonFatal(err)
 			log.Printf("federation: non-fatal observer error peer=%s type=%s err=%v", peer.ID, event.Type, err)
+			debug.Log("local", event.FrameType, "observer_non_fatal", "protocol_ok", true, "err", err)
 		}
 	}
 
@@ -376,7 +525,11 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 }
 
 func (pm *PeerManager) readLoop(peer *Peer) {
+	debug := pm.peerDebugLogger(peer)
+	debug.Log("local", "SESSION", "session_state", "state", "read_loop_started")
+
 	defer func() {
+		debug.Log("local", "SESSION", "session_state", "state", "read_loop_stopped")
 		pm.removePeer(peer)
 		_ = peer.Conn.Close()
 	}()
@@ -385,46 +538,61 @@ func (pm *PeerManager) readLoop(peer *Peer) {
 		msgType, data, err := peer.Conn.ReadMessage()
 		if err != nil {
 			log.Printf("federation: read error from %s: %v", peer.URL, err)
+			debug.Log("in", "CONNECTION", "recv_failed", "transport_ok", false, "protocol_ok", false, "close_reason", closeReasonFromError(err), "err", err)
 			return
 		}
 		if msgType != websocket.BinaryMessage {
 			log.Printf("federation: non-binary frame from %s type=%d", peer.URL, msgType)
+			debug.Log("in", "NON_BINARY", "recv_rejected", "msg_type_raw", msgType, "bytes_in", len(data), "transport_ok", true, "protocol_ok", false)
 			return
 		}
+		debug.Log("in", gossipv1.FrameTypeFromPrefixedBinaryFrame(data), "received", "bytes_in", len(data), "transport_ok", true)
 
 		peer.adapterMu.Lock()
 		adapter := peer.adapter
 		peer.adapterMu.Unlock()
 		if adapter == nil {
 			log.Printf("federation: missing adapter for peer %s", peer.ID)
+			debug.Log("local", "SESSION", "adapter_missing", "protocol_ok", false)
 			return
 		}
 
 		events := adapter.PushInbound(data)
 		if err := pm.processEvents(peer, adapter, events); err != nil {
 			log.Printf("federation: fatal validation error peer=%s err=%v", peer.ID, err)
+			debug.Log("in", adapter.LastFrameType(), "process_failed", "transport_ok", true, "protocol_ok", false, "store_ok", false, "err", err)
 			return
 		}
 	}
 }
 
 func (pm *PeerManager) writeLoop(peer *Peer) {
+	debug := pm.peerDebugLogger(peer)
+	debug.Log("local", "SESSION", "session_state", "state", "write_loop_started")
+
 	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
+	defer func() {
+		ticker.Stop()
+		debug.Log("local", "SESSION", "session_state", "state", "write_loop_stopped")
+	}()
 
 	for {
 		select {
 		case <-peer.Done:
+			debug.Log("local", "SESSION", "session_state", "state", "peer_done_closed")
 			return
 		case <-ticker.C:
 			if err := pm.writePeerMessage(peer, websocket.PingMessage, nil); err != nil {
+				debug.Log("out", "PING", "heartbeat_failed", "transport_ok", false, "err", err)
 				return
 			}
+			debug.Log("out", "PING", "heartbeat_sent", "bytes_out", 0, "transport_ok", true)
 		}
 	}
 }
 
 func (pm *PeerManager) addPeer(peer *Peer) {
+	debug := pm.peerDebugLogger(peer)
 	pm.peersMu.Lock()
 	pm.peers[peer.ID] = peer
 	pm.peersMu.Unlock()
@@ -435,12 +603,16 @@ func (pm *PeerManager) addPeer(peer *Peer) {
 	}
 	pm.peerMetrics[peer.ID] = peer.Metrics
 	pm.metricsMu.Unlock()
+
+	localAddr, remoteAddr := peerSocketAddresses(peer)
+	debug.Log("local", "CONNECTION", "session_state", "state", "peer_registered", "peer_id", peer.ID, "outbound", peer.Outbound, "local_addr", localAddr, "remote_addr", remoteAddr)
 }
 
 func (pm *PeerManager) removePeer(peer *Peer) {
 	if peer == nil {
 		return
 	}
+	debug := pm.peerDebugLogger(peer)
 
 	peer.doneOnce.Do(func() { close(peer.Done) })
 
@@ -451,11 +623,15 @@ func (pm *PeerManager) removePeer(peer *Peer) {
 	pm.metricsMu.Lock()
 	delete(pm.peerMetrics, peer.ID)
 	pm.metricsMu.Unlock()
+	debug.Log("local", "CONNECTION", "session_state", "state", "peer_removed", "peer_id", peer.ID)
 
 	if peer.Outbound {
+		debug.Log("local", "CONNECTION", "session_state", "state", "reconnect_scheduled", "url", peer.URL)
 		select {
 		case <-pm.ctxStop:
+			debug.Log("local", "CONNECTION", "session_state", "state", "reconnect_skipped_stop")
 		case pm.outbound <- peer.URL:
+			debug.Log("local", "CONNECTION", "session_state", "state", "reconnect_enqueued")
 		}
 	}
 }
@@ -471,6 +647,7 @@ func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request)
 
 	peer := &Peer{
 		ID:          uuid.New().String(),
+		SessionID:   gossipv1.NewDebugSessionID("federation-in"),
 		URL:         r.RemoteAddr,
 		Conn:        conn,
 		ConnectedAt: time.Now(),
@@ -478,51 +655,70 @@ func (pm *PeerManager) HandleInboundPeer(w http.ResponseWriter, r *http.Request)
 		Done:        make(chan struct{}),
 		Metrics:     model.NewPeerMetrics(r.RemoteAddr),
 	}
+	debug := pm.peerDebugLogger(peer)
+	localAddr, remoteAddr := peerSocketAddresses(peer)
+	debug.Log("in", "CONNECTION", "session_state", "state", "accepted_upgrade", "http_remote_addr", r.RemoteAddr, "local_addr", localAddr, "remote_addr", remoteAddr)
 
 	if err := pm.acceptInboundEncounter(peer); err != nil {
 		log.Printf("federation: inbound encounter failed from %s: %v", r.RemoteAddr, err)
+		debug.Log("local", "CONNECTION", "session_state", "state", "encounter_failed", "err", err)
 		_ = conn.Close()
 		return
 	}
 
+	debug.Log("local", "CONNECTION", "session_state", "state", "encounter_established")
 	pm.inbound <- peer
 }
 
 func (pm *PeerManager) acceptInboundEncounter(peer *Peer) error {
+	debug := pm.peerDebugLogger(peer)
+	debug.Log("local", "SESSION", "session_state", "state", "inbound_encounter_start")
+
 	localHello := gossipv1.BuildRelayHello(pm.relayID)
 	adapter := gossipv1.NewSessionAdapter(localHello, true)
 
 	if err := peer.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		debug.Log("local", "SESSION", "deadline_set_failed", "err", err)
 		return err
 	}
 	msgType, data, err := peer.Conn.ReadMessage()
 	if err != nil {
+		debug.Log("in", gossipv1.FrameTypeHello, "recv_failed", "transport_ok", false, "protocol_ok", false, "close_reason", closeReasonFromError(err), "err", err)
 		return err
 	}
 	if msgType != websocket.BinaryMessage {
+		debug.Log("in", "NON_BINARY", "recv_rejected", "msg_type_raw", msgType, "bytes_in", len(data), "transport_ok", true, "protocol_ok", false)
 		return errors.New("expected binary gossip frame")
 	}
+	debug.Log("in", gossipv1.FrameTypeFromPrefixedBinaryFrame(data), "received", "bytes_in", len(data), "transport_ok", true)
 
 	events := adapter.PushInbound(data)
 	if err := firstFatal(events); err != nil {
+		debug.Log("in", adapter.LastFrameType(), "protocol_fatal", "transport_ok", true, "protocol_ok", false, "err", err)
 		return err
 	}
 
 	helloBytes, err := adapter.InitialHelloBytes()
 	if err != nil {
+		debug.Log("out", gossipv1.FrameTypeHello, "encode_failed", "transport_ok", false, "protocol_ok", false, "err", err)
 		return err
 	}
 	if err := pm.writePeerMessage(peer, websocket.BinaryMessage, helloBytes); err != nil {
+		debug.Log("out", gossipv1.FrameTypeHello, "send_failed", "bytes_out", len(helloBytes), "transport_ok", false, "protocol_ok", false, "err", err)
 		return err
 	}
+	debug.Log("out", gossipv1.FrameTypeHello, "sent", "bytes_out", len(helloBytes), "transport_ok", true, "protocol_ok", true)
 	peer.localHelloSent = true
 
 	if err := pm.processEvents(peer, adapter, events); err != nil {
+		debug.Log("in", adapter.LastFrameType(), "process_failed", "transport_ok", true, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
 	if !adapter.IsHealthy() {
+		debug.Log("local", "SESSION", "session_unhealthy", "state", "post_hello", "protocol_ok", false)
 		return errors.New("gossip session unhealthy after inbound HELLO")
 	}
+	debug.Log("local", "SESSION", "session_state", "state", "healthy")
 
 	peer.adapterMu.Lock()
 	peer.adapter = adapter
@@ -531,6 +727,7 @@ func (pm *PeerManager) acceptInboundEncounter(peer *Peer) error {
 	_ = peer.Conn.SetReadDeadline(time.Time{})
 	go pm.readLoop(peer)
 	go pm.writeLoop(peer)
+	debug.Log("local", "SESSION", "session_state", "state", "loops_started")
 	return nil
 }
 
@@ -575,6 +772,35 @@ func firstFatal(events []gossipv1.Event) error {
 	return nil
 }
 
+func summaryHaveFromPayload(payload any) []string {
+	switch typed := payload.(type) {
+	case map[string]any:
+		raw, ok := typed["have"]
+		if !ok {
+			return nil
+		}
+		rawIDs, ok := raw.([]string)
+		if ok {
+			return append([]string(nil), rawIDs...)
+		}
+		asAny, ok := raw.([]any)
+		if !ok {
+			return nil
+		}
+		ids := make([]string, 0, len(asAny))
+		for _, value := range asAny {
+			id, ok := value.(string)
+			if !ok {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		return ids
+	default:
+		return nil
+	}
+}
+
 func (pm *PeerManager) writePeerMessage(peer *Peer, messageType int, payload []byte) error {
 	if peer == nil || peer.Conn == nil {
 		return errors.New("federation: peer connection is not available")
@@ -586,18 +812,91 @@ func (pm *PeerManager) writePeerMessage(peer *Peer, messageType int, payload []b
 }
 
 func (pm *PeerManager) sendEnvelope(peer *Peer, frameType string, payload any) error {
+	debug := pm.peerDebugLogger(peer)
+
 	frame, err := gossipv1.EncodeEnvelope(frameType, payload)
 	if err != nil {
+		debug.Log("out", frameType, "encode_failed", "transport_ok", false, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
 	prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
 	if err != nil {
+		debug.Log("out", frameType, "prefix_failed", "transport_ok", false, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
-	return pm.writePeerMessage(peer, websocket.BinaryMessage, prefixed)
+
+	metadata := make([]any, 0, 10)
+	switch frameType {
+	case gossipv1.FrameTypeSummary:
+		have := summaryHaveFromPayload(payload)
+		if len(have) > 0 {
+			count, sample, hash := gossipv1.ItemIDSample(have, debugItemSampleLimit)
+			metadata = append(metadata,
+				"item_count", count,
+				"item_ids_sample", sample,
+				"item_ids_hash", hash,
+			)
+		}
+	case gossipv1.FrameTypeRequest:
+		if request, ok := payload.(gossipv1.RequestPayload); ok {
+			count, sample, hash := gossipv1.ItemIDSample(request.Want, debugItemSampleLimit)
+			metadata = append(metadata,
+				"requested_count", count,
+				"item_ids_sample", sample,
+				"item_ids_hash", hash,
+			)
+		}
+	case gossipv1.FrameTypeTransfer:
+		if transfer, ok := payload.(gossipv1.TransferPayload); ok {
+			ids := make([]string, 0, len(transfer.Objects))
+			for _, object := range transfer.Objects {
+				ids = append(ids, object.ID)
+			}
+			count, sample, hash := gossipv1.ItemIDSample(ids, debugItemSampleLimit)
+			metadata = append(metadata,
+				"object_count", count,
+				"accepted_item_ids_sample", sample,
+				"accepted_item_ids_hash", hash,
+			)
+		}
+	case gossipv1.FrameTypeReceipt:
+		if receipt, ok := payload.(gossipv1.ReceiptPayload); ok {
+			acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, debugItemSampleLimit)
+			rejectedIDs := make([]string, 0, len(receipt.Rejected))
+			for _, rejected := range receipt.Rejected {
+				rejectedIDs = append(rejectedIDs, rejected.ID)
+			}
+			rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
+			metadata = append(metadata,
+				"item_count", acceptedCount+rejectedCount,
+				"accepted_count", acceptedCount,
+				"accepted_item_ids_sample", acceptedSample,
+				"accepted_item_ids_hash", acceptedHash,
+				"rejected_count", rejectedCount,
+				"rejected_item_ids_sample", rejectedSample,
+				"rejected_item_ids_hash", rejectedHash,
+			)
+		}
+	}
+
+	if err := pm.writePeerMessage(peer, websocket.BinaryMessage, prefixed); err != nil {
+		logFields := make([]any, 0, len(metadata)+8)
+		logFields = append(logFields, metadata...)
+		logFields = append(logFields, "bytes_out", len(prefixed), "transport_ok", false, "protocol_ok", true, "store_ok", true, "err", err)
+		debug.Log("out", frameType, "send_failed", logFields...)
+		return err
+	}
+
+	logFields := make([]any, 0, len(metadata)+6)
+	logFields = append(logFields, metadata...)
+	logFields = append(logFields, "bytes_out", len(prefixed), "transport_ok", true, "protocol_ok", true, "store_ok", true)
+	debug.Log("out", frameType, "sent", logFields...)
+	return nil
 }
 
 func (pm *PeerManager) sendSummary(peer *Peer) error {
+	debug := pm.peerDebugLogger(peer)
+
 	if peer == nil {
 		return errors.New("federation: peer is required for summary")
 	}
@@ -613,41 +912,70 @@ func (pm *PeerManager) sendSummary(peer *Peer) error {
 
 	have, err := pm.listSummaryHaveIDs(context.Background())
 	if err != nil {
+		debug.Log("local", gossipv1.FrameTypeSummary, "summary_inventory_failed", "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
+	canonicalSummary := gossipv1.BuildSummaryPayload(have)
+	count, sample, hash := gossipv1.ItemIDSample(have, debugItemSampleLimit)
+	debug.Log(
+		"out",
+		gossipv1.FrameTypeSummary,
+		"summary_constructed",
+		"summary_path", "federation.sendSummary:listSummaryHaveIDs->legacy_have_frame",
+		"canonical_builder", "gossipv1.BuildSummaryPayload",
+		"source_inventory_count", len(have),
+		"item_count", canonicalSummary.ItemCount,
+		"bloom_bytes", len(canonicalSummary.BloomFilter),
+		"item_ids_sample", sample,
+		"item_ids_hash", hash,
+		"have_count", count,
+	)
 	if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, map[string]any{"have": have}); err != nil {
 		return err
 	}
+	debug.Log("local", gossipv1.FrameTypeSummary, "summary_state", "state", "sent_once")
 	peer.summarySent = true
 	return nil
 }
 
 func (pm *PeerManager) handleSummary(peer *Peer, event gossipv1.Event) error {
+	debug := pm.peerDebugLogger(peer)
+
 	if event.Summary == nil {
 		return errors.New("gossipv1: summary event missing payload")
 	}
 	want, err := pm.computeMissingWant(context.Background(), event.Summary.Have)
 	if err != nil {
+		debug.Log("in", gossipv1.FrameTypeSummary, "summary_compute_want_failed", "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
+	wantCount, wantSample, wantHash := gossipv1.ItemIDSample(want, debugItemSampleLimit)
+	debug.Log("local", gossipv1.FrameTypeSummary, "summary_computed_want", "requested_count", wantCount, "item_ids_sample", wantSample, "item_ids_hash", wantHash, "store_ok", true)
 	if len(want) == 0 {
+		debug.Log("local", gossipv1.FrameTypeSummary, "summary_no_request_needed", "requested_count", 0)
 		return nil
 	}
 	return pm.sendEnvelope(peer, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: want})
 }
 
 func (pm *PeerManager) handleRequest(peer *Peer, event gossipv1.Event) error {
+	debug := pm.peerDebugLogger(peer)
+
 	if event.Request == nil {
 		return errors.New("gossipv1: request event missing payload")
 	}
 	if len(event.Request.Want) == 0 {
+		debug.Log("in", gossipv1.FrameTypeRequest, "request_empty", "requested_count", 0, "protocol_ok", true)
 		return nil
 	}
 
-	objects, expectedReceiptIDs, err := pm.buildTransferObjects(context.Background(), event.Request.Want)
+	objects, expectedReceiptIDs, err := pm.buildTransferObjects(context.Background(), event.Request.Want, debug)
 	if err != nil {
+		debug.Log("local", gossipv1.FrameTypeTransfer, "request_build_transfer_failed", "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
+	transferCount, transferSample, transferHash := gossipv1.ItemIDSample(expectedReceiptIDs, debugItemSampleLimit)
+	debug.Log("out", gossipv1.FrameTypeTransfer, "request_serviced", "object_count", len(objects), "expected_receipt_count", transferCount, "item_ids_sample", transferSample, "item_ids_hash", transferHash, "store_ok", true)
 
 	peer.adapterMu.Lock()
 	if peer.adapter != nil {
@@ -659,6 +987,9 @@ func (pm *PeerManager) handleRequest(peer *Peer, event gossipv1.Event) error {
 }
 
 func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
+	debug := pm.peerDebugLogger(peer)
+	traceCtx := gossipv1.WithDebugTrace(context.Background(), peer.SessionID, peerDebugIdentity(peer))
+
 	if event.Transfer == nil {
 		return errors.New("gossipv1: transfer event missing payload")
 	}
@@ -674,6 +1005,7 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 	for _, indexed := range event.Transfer.Objects {
 		msg, err := transferObjectToMessage(indexed.Object)
 		if err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", err.Error(), "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
 				Index:  indexed.Index,
 				ID:     indexed.Object.ID,
@@ -682,8 +1014,9 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 			continue
 		}
 
-		result, err := pm.engine.AcceptRelayForward(context.Background(), peer.RemoteNodeID, msg, relayForwardMaxPayloadBytes)
+		result, err := pm.engine.AcceptRelayForward(traceCtx, peer.RemoteNodeID, msg, relayForwardMaxPayloadBytes)
 		if err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", relayForwardErrorReason(err), "store_ok", false, "err", err)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
 				Index:  indexed.Index,
 				ID:     indexed.Object.ID,
@@ -694,14 +1027,19 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 
 		switch result.Status {
 		case storeforward.RelayForwardAccepted, storeforward.RelayForwardDuplicate, storeforward.RelayForwardSeenLoop:
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_accepted", "decision", result.Status, "store_ok", true)
 			receipt.Accepted = append(receipt.Accepted, msg.ID)
 		case storeforward.RelayForwardExpired:
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "object already expired", "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "object already expired"})
 		case storeforward.RelayForwardTooLarge:
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "payload exceeds relay limit", "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "payload exceeds relay limit"})
 		case storeforward.RelayForwardInvalid:
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "invalid transfer object", "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "invalid transfer object"})
 		default:
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "relay forward rejected", "store_ok", false)
 			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "relay forward rejected"})
 		}
 	}
@@ -709,14 +1047,30 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 	if len(receipt.Accepted) > 1 {
 		sort.Strings(receipt.Accepted)
 	}
+	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, debugItemSampleLimit)
+	rejectedIDs := make([]string, 0, len(receipt.Rejected))
+	for _, rejected := range receipt.Rejected {
+		rejectedIDs = append(rejectedIDs, rejected.ID)
+	}
+	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
+	debug.Log("out", gossipv1.FrameTypeReceipt, "receipt_constructed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
 
 	return pm.sendEnvelope(peer, gossipv1.FrameTypeReceipt, receipt)
 }
 
-func (pm *PeerManager) handleReceipt(_ *Peer, event gossipv1.Event) error {
+func (pm *PeerManager) handleReceipt(peer *Peer, event gossipv1.Event) error {
+	debug := pm.peerDebugLogger(peer)
+
 	if event.Receipt == nil {
 		return errors.New("gossipv1: receipt event missing payload")
 	}
+	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, debugItemSampleLimit)
+	rejectedIDs := make([]string, 0, len(event.Receipt.Rejected))
+	for _, rejected := range event.Receipt.Rejected {
+		rejectedIDs = append(rejectedIDs, rejected.ID)
+	}
+	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
+	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash, "store_ok", true)
 	return nil
 }
 
@@ -795,7 +1149,7 @@ func (pm *PeerManager) computeMissingWant(ctx context.Context, have []string) ([
 	return want, nil
 }
 
-func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string) ([]gossipv1.TransferObject, []string, error) {
+func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string, debug gossipv1.DebugSessionLogger) ([]gossipv1.TransferObject, []string, error) {
 	if pm.store == nil {
 		return []gossipv1.TransferObject{}, []string{}, nil
 	}
@@ -805,20 +1159,29 @@ func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string) 
 
 	for _, id := range want {
 		if uint64(len(objects)) >= gossipv1.MaxTransferItems {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "max_transfer_limit_reached", "store_ok", true)
 			break
 		}
 		if id == "" {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "empty_item_id", "store_ok", true)
 			continue
 		}
 
 		msg, err := pm.store.GetMessageByID(ctx, id)
 		if err != nil {
 			if isNotFoundError(err) {
+				debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "missing", "reason", "not_found", "store_ok", true)
 				continue
 			}
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "lookup_failed", "store_ok", false, "err", err)
 			return nil, nil, err
 		}
-		if msg == nil || !msg.ExpiresAt.After(now) {
+		if msg == nil {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "missing", "reason", "nil_message", "store_ok", true)
+			continue
+		}
+		if !msg.ExpiresAt.After(now) {
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "expired", "store_ok", true)
 			continue
 		}
 
@@ -831,6 +1194,7 @@ func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string) 
 			ExpiresAt:  msg.ExpiresAt.UTC().Unix(),
 		})
 		ids = append(ids, msg.ID)
+		debug.LogItem("out", gossipv1.FrameTypeTransfer, msg.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
 	}
 
 	return objects, ids, nil
@@ -913,6 +1277,22 @@ func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) 
 		have = have[:gossipv1.MaxSummaryItems]
 	}
 
+	canonicalSummary := gossipv1.BuildSummaryPayload(have)
+	haveCount, haveSample, haveHash := gossipv1.ItemIDSample(have, debugItemSampleLimit)
+	gossipv1.NewDebugSessionLogger("federation-summary-forward", originNodeID).Log(
+		"out",
+		gossipv1.FrameTypeSummary,
+		"summary_constructed",
+		"summary_path", "federation.forwardSummaryToPeers:ids->legacy_have_frame",
+		"canonical_builder", "gossipv1.BuildSummaryPayload",
+		"source_inventory_count", len(have),
+		"item_count", canonicalSummary.ItemCount,
+		"bloom_bytes", len(canonicalSummary.BloomFilter),
+		"item_ids_sample", haveSample,
+		"item_ids_hash", haveHash,
+		"have_count", haveCount,
+	)
+
 	pm.peersMu.RLock()
 	peers := make([]*Peer, 0, len(pm.peers))
 	for _, peer := range pm.peers {
@@ -927,9 +1307,13 @@ func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) 
 	pm.peersMu.RUnlock()
 
 	for _, peer := range peers {
+		debug := pm.peerDebugLogger(peer)
 		if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, map[string]any{"have": have}); err != nil {
 			log.Printf("federation: failed forwarding summary to peer=%s err=%v", peer.ID, err)
+			debug.Log("out", gossipv1.FrameTypeSummary, "summary_forward_failed", "transport_ok", false, "protocol_ok", true, "store_ok", true, "err", err)
+			continue
 		}
+		debug.Log("out", gossipv1.FrameTypeSummary, "summary_forwarded", "transport_ok", true, "protocol_ok", true, "store_ok", true, "origin_node_id", originNodeID)
 	}
 
 	return nil

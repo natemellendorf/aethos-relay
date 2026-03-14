@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
@@ -60,7 +61,19 @@ func (e *Engine) AcceptClientSend(from, to, payloadB64 string, ttlSeconds int) (
 
 // PersistMessage stores a queued message.
 func (e *Engine) PersistMessage(ctx context.Context, msg *model.Message) error {
-	return e.store.PersistMessage(ctx, msg)
+	debug := gossipv1.DebugLoggerFromContext(ctx, "client")
+	if msg == nil {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, "", "store_ingest_rejected", "decision", "rejected", "reason", "nil_message", "store_ok", false)
+		return e.store.PersistMessage(ctx, msg)
+	}
+
+	if err := e.store.PersistMessage(ctx, msg); err != nil {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_failed", "decision", "rejected", "reason", "persist_failed", "store_ok", false, "err", err)
+		return err
+	}
+
+	debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_ok", "decision", "inserted", "store_ok", true)
+	return nil
 }
 
 // RemoveMessage deletes a queued message by ID.
