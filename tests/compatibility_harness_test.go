@@ -40,7 +40,7 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	assertFrameType(t, aSummary, gossipv1.FrameTypeSummary)
 	assertFrameType(t, bSummary, gossipv1.FrameTypeSummary)
 
-	writeEnvelope(t, a, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: []string{"msg-1"}})
+	writeEnvelope(t, a, gossipv1.FrameTypeSummary, map[string]any{"have": []string{"msg-1"}})
 	aRequest := readEnvelope(t, a)
 	assertFrameType(t, aRequest, gossipv1.FrameTypeRequest)
 	requestPayload, err := gossipv1.ParseRequestPayload(aRequest.Payload)

@@ -9,6 +9,7 @@ import (
 
 	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
+	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
 type wsStoreSpy struct {
@@ -131,6 +132,12 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 
 func decodeEnvelopePayloadMap(t *testing.T, payload []byte) map[string]any {
 	t.Helper()
+	decoded := decodeEnvelope(t, payload)
+	return decoded.Payload
+}
+
+func decodeEnvelope(t *testing.T, payload []byte) gossipv1.DecodedEnvelope {
+	t.Helper()
 	if len(payload) < 5 {
 		t.Fatalf("payload too short: %d", len(payload))
 	}
@@ -144,7 +151,7 @@ func decodeEnvelopePayloadMap(t *testing.T, payload []byte) map[string]any {
 	if err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
-	return decoded.Payload
+	return decoded
 }
 
 func TestComputeMissingWantReturnsUnknownIDs(t *testing.T) {
@@ -296,5 +303,52 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected receipt frame")
+	}
+}
+
+func TestHandleHelloValidatedEmitsCanonicalSummaryOnly(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	clientHello := gossipv1.BuildRelayHello("client-summary-canonical")
+	queueRecipient := storeforward.QueueRecipient(storeforward.DeliveryIdentity(clientHello.NodeID, clientHello.NodePubKey))
+	st.queuedByRecipient[queueRecipient] = []string{"msg-b", "", "msg-a", "msg-a"}
+
+	session := &clientSession{
+		client:  &model.Client{Send: make(chan []byte, 2)},
+		adapter: gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-test"), false),
+	}
+
+	err := h.handleHelloValidated(session, gossipv1.Event{Type: gossipv1.EventTypeHelloValidated, Hello: &clientHello})
+	if err != nil {
+		t.Fatalf("handleHelloValidated failed: %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeSummary {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		if len(decoded.Payload) != 2 {
+			t.Fatalf("summary payload must include only canonical keys, got %#v", decoded.Payload)
+		}
+		if _, hasLegacyHave := decoded.Payload["have"]; hasLegacyHave {
+			t.Fatalf("ws summary must not include legacy have key: %#v", decoded.Payload)
+		}
+
+		summary, parseErr := gossipv1.ParseSummaryPayload(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("summary payload must be parseable by client decoder: %v", parseErr)
+		}
+		if summary.ItemCount != 2 {
+			t.Fatalf("unexpected summary item_count: got=%d want=2", summary.ItemCount)
+		}
+		if !gossipv1.BloomFilterMightContain(summary.BloomFilter, "msg-a") {
+			t.Fatal("summary bloom filter must include msg-a")
+		}
+		if !gossipv1.BloomFilterMightContain(summary.BloomFilter, "msg-b") {
+			t.Fatal("summary bloom filter must include msg-b")
+		}
+	default:
+		t.Fatal("expected outbound SUMMARY frame")
 	}
 }

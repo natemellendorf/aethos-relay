@@ -268,7 +268,7 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 	}
 	session.lastSummaryHave = have
 
-	return h.sendEnvelope(session.client, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: have})
+	return h.sendEnvelope(session.client, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload(have))
 }
 
 func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) error {

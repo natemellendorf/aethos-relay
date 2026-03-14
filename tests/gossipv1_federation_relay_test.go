@@ -205,7 +205,7 @@ func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
 	initialSummary := readEnvelope(t, conn)
 	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
 
-	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: []string{"phase4-cross-role-msg-1"}})
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, map[string]any{"have": []string{"phase4-cross-role-msg-1"}})
 
 	request := readEnvelope(t, conn)
 	assertFrameType(t, request, gossipv1.FrameTypeRequest)
