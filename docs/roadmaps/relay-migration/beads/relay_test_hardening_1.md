@@ -1,6 +1,6 @@
 ---
 id: relay_test_hardening_1
-title: "Bead: aethos-relay — Test hardening 1 eliminate flaky sleeps"
+title: "aethos-relay — Test hardening 1 eliminate flaky sleeps"
 depends_on:
   - relay_phase_4
 external_dependencies: []

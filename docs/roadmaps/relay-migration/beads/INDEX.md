@@ -20,4 +20,4 @@ Agents must only start a phase when all depends_on are satisfied.
 
 ## Circular dependency verification
 
-No circular dependencies exist because each phase only depends on earlier phases in the strict forward order (1 → 2 → 3 → 4 → test hardening 1), and no phase points back to itself or to any later phase.
+No circular dependencies exist because each phase only depends on earlier phases in the strict forward order (1 → 2 → 3 → 4 → relay_test_hardening_1), and no phase points back to itself or to any later phase.
