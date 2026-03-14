@@ -24,18 +24,14 @@ func TestGossipV1HelloLoopbackBetweenRelays(t *testing.T) {
 	relayA.peerManager.AddPeerURL(relayB.fedURL)
 	relayB.peerManager.AddPeerURL(relayA.fedURL)
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if relayA.peerManager.GetPeerCount() > 0 &&
+	waitForCondition(t, 5*time.Second, func() bool {
+		return relayA.peerManager.GetPeerCount() > 0 &&
 			relayB.peerManager.GetPeerCount() > 0 &&
 			observer.countFor("relay-a") > 0 &&
 			observer.countFor("relay-b") > 0 &&
 			len(relayA.peerManager.GetHealthyPeers()) > 0 &&
-			len(relayB.peerManager.GetHealthyPeers()) > 0 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+			len(relayB.peerManager.GetHealthyPeers()) > 0
+	}, "relay hello loopback establishes healthy bidirectional sessions")
 
 	if relayA.peerManager.GetPeerCount() == 0 {
 		t.Fatal("relay-a never established a gossip session")
