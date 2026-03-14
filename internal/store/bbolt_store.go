@@ -10,6 +10,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/xerrors"
 
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
@@ -86,13 +87,40 @@ func (s *BBoltStore) Close() error {
 
 // PersistMessage stores a message and adds it to the recipient's queue atomically.
 func (s *BBoltStore) PersistMessage(ctx context.Context, msg *model.Message) error {
+	debug := gossipv1.DebugLoggerFromContext(ctx, "store")
+	if msg == nil {
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, "", "store_persist_rejected", "decision", "rejected", "reason", "nil_message", "store_ok", false)
+	}
+
 	return s.db.Update(func(tx *bolt.Tx) error {
+		if msg == nil {
+			return xerrors.New("failed to encode message: message is nil")
+		}
+
+		existingMsgBytes := tx.Bucket(BucketMessages).Get([]byte(msg.ID))
+		decision := "inserted"
+		if existingMsgBytes != nil {
+			existing, decodeErr := DecodeMessage(existingMsgBytes)
+			switch {
+			case decodeErr != nil:
+				decision = "updated"
+			case existing == nil:
+				decision = "updated"
+			case existing.ExpiresAt.Equal(msg.ExpiresAt) && existing.Payload == msg.Payload && existing.From == msg.From && existing.To == msg.To:
+				decision = "duplicate"
+			default:
+				decision = "updated"
+			}
+		}
+
 		// Store the message
 		msgBytes, err := EncodeMessage(msg)
 		if err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_persist_rejected", "decision", "rejected", "reason", "encode_failed", "store_ok", false, "err", err)
 			return xerrors.Errorf("failed to encode message: %w", err)
 		}
 		if err := tx.Bucket(BucketMessages).Put([]byte(msg.ID), msgBytes); err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_persist_rejected", "decision", "rejected", "reason", "messages_bucket_put_failed", "store_ok", false, "err", err)
 			return xerrors.Errorf("failed to store message: %w", err)
 		}
 
@@ -103,20 +131,25 @@ func (s *BBoltStore) PersistMessage(ctx context.Context, msg *model.Message) err
 			MsgID:     msg.ID,
 		})
 		if err := tx.Bucket(BucketQueueByRecipient).Put(queueKey, []byte(msg.ID)); err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_persist_rejected", "decision", "rejected", "reason", "queue_bucket_put_failed", "store_ok", false, "err", err)
 			return xerrors.Errorf("failed to add to queue: %w", err)
 		}
 
 		// Add to expiry index
 		expiryKey := EncodeExpiryKey(msg.ID, msg.ExpiresAt)
 		if err := tx.Bucket(BucketExpiryIndex).Put(expiryKey, []byte(msg.ID)); err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_persist_rejected", "decision", "rejected", "reason", "expiry_index_put_failed", "store_ok", false, "err", err)
 			return xerrors.Errorf("failed to add to expiry index: %w", err)
 		}
 
 		// Add msgid index for quick lookup
 		msgIDKey := EncodeMsgIDKey(msg.ID)
 		if err := tx.Bucket(BucketMsgIDIndex).Put(msgIDKey, []byte(msg.ID)); err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_persist_rejected", "decision", "rejected", "reason", "msgid_index_put_failed", "store_ok", false, "err", err)
 			return xerrors.Errorf("failed to add msgid index: %w", err)
 		}
+
+		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "store_persist_ok", "decision", decision, "store_ok", true)
 
 		return nil
 	})
