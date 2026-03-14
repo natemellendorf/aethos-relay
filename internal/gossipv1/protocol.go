@@ -15,6 +15,8 @@ import (
 const (
 	GossipVersion       uint64 = 1
 	MaxFrameBytes              = 1 << 20 // 1 MiB
+	BloomFilterBytes           = 2048
+	BloomHashCount             = 4
 	MaxSummaryItems     uint64 = 256
 	MaxWantItems        uint64 = 256
 	MaxTransferItems    uint64 = 32
@@ -64,7 +66,9 @@ type RelayIngestPayload struct {
 }
 
 type SummaryPayload struct {
-	Have []string `cbor:"have"`
+	BloomFilter []byte   `cbor:"bloom_filter"`
+	ItemCount   uint64   `cbor:"item_count"`
+	Have        []string `cbor:"-"`
 }
 
 type RequestPayload struct {
@@ -278,25 +282,108 @@ func ParseSummaryPayload(payload map[string]any) (SummaryPayload, error) {
 		return SummaryPayload{}, fmt.Errorf("gossipv1: summary payload is required")
 	}
 
-	allowed := map[string]struct{}{
-		"have": {},
+	_, hasBloomFilter := payload["bloom_filter"]
+	_, hasItemCount := payload["item_count"]
+	_, hasLegacyHave := payload["have"]
+
+	if hasBloomFilter || hasItemCount {
+		allowed := map[string]struct{}{
+			"bloom_filter": {},
+			"item_count":   {},
+		}
+		for key := range payload {
+			if _, ok := allowed[key]; !ok {
+				return SummaryPayload{}, fmt.Errorf("gossipv1: unknown summary payload field %q", key)
+			}
+		}
+
+		bloomFilter, err := parseBytes(payload, "bloom_filter")
+		if err != nil {
+			return SummaryPayload{}, err
+		}
+		if len(bloomFilter) != BloomFilterBytes {
+			return SummaryPayload{}, fmt.Errorf("gossipv1: summary bloom_filter must be %d bytes", BloomFilterBytes)
+		}
+
+		itemCount, err := parseUint(payload, "item_count")
+		if err != nil {
+			return SummaryPayload{}, err
+		}
+
+		return SummaryPayload{BloomFilter: bloomFilter, ItemCount: itemCount}, nil
 	}
-	for key := range payload {
-		if _, ok := allowed[key]; !ok {
-			return SummaryPayload{}, fmt.Errorf("gossipv1: unknown summary payload field %q", key)
+
+	if hasLegacyHave {
+		allowed := map[string]struct{}{
+			"have": {},
+		}
+		for key := range payload {
+			if _, ok := allowed[key]; !ok {
+				return SummaryPayload{}, fmt.Errorf("gossipv1: unknown summary payload field %q", key)
+			}
+		}
+
+		have, err := parseStringSlice(payload, "have")
+		if err != nil {
+			return SummaryPayload{}, err
+		}
+		have = dedupeStrings(have)
+		if uint64(len(have)) > MaxSummaryItems {
+			return SummaryPayload{}, fmt.Errorf("gossipv1: summary have exceeds limit: %d > %d", len(have), MaxSummaryItems)
+		}
+
+		summary := BuildSummaryPayload(have)
+		summary.Have = have
+		return summary, nil
+	}
+
+	return SummaryPayload{}, fmt.Errorf("gossipv1: summary payload is required")
+}
+
+func BuildSummaryPayload(itemIDs []string) SummaryPayload {
+	normalizedItemIDs := normalizeSummaryItemIDs(itemIDs)
+	bloomFilter := make([]byte, BloomFilterBytes)
+
+	for _, itemID := range normalizedItemIDs {
+		itemBytes := bloomFilterItemBytes(itemID)
+		for hashIndex := 0; hashIndex < BloomHashCount; hashIndex++ {
+			digest := sha256.Sum256(append(itemBytes, byte(hashIndex)))
+			hashValue := binary.BigEndian.Uint64(digest[:8])
+			bitIndex := hashValue % uint64(BloomFilterBytes*8)
+			byteIndex := int(bitIndex / 8)
+			bitOffset := uint(bitIndex % 8)
+			bloomFilter[byteIndex] |= byte(1 << bitOffset)
 		}
 	}
 
-	have, err := parseStringSlice(payload, "have")
-	if err != nil {
-		return SummaryPayload{}, err
+	return SummaryPayload{
+		BloomFilter: bloomFilter,
+		ItemCount:   uint64(len(normalizedItemIDs)),
+		Have:        normalizedItemIDs,
 	}
-	have = dedupeStrings(have)
-	if uint64(len(have)) > MaxSummaryItems {
-		return SummaryPayload{}, fmt.Errorf("gossipv1: summary have exceeds limit: %d > %d", len(have), MaxSummaryItems)
+}
+
+func BloomFilterMightContain(bloomFilter []byte, itemID string) bool {
+	if len(bloomFilter) != BloomFilterBytes {
+		return false
+	}
+	if itemID == "" {
+		return false
 	}
 
-	return SummaryPayload{Have: have}, nil
+	itemBytes := bloomFilterItemBytes(itemID)
+	for hashIndex := 0; hashIndex < BloomHashCount; hashIndex++ {
+		digest := sha256.Sum256(append(itemBytes, byte(hashIndex)))
+		hashValue := binary.BigEndian.Uint64(digest[:8])
+		bitIndex := hashValue % uint64(BloomFilterBytes*8)
+		byteIndex := int(bitIndex / 8)
+		bitOffset := uint(bitIndex % 8)
+		if bloomFilter[byteIndex]&(byte(1)<<bitOffset) == 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 func ParseRequestPayload(payload map[string]any) (RequestPayload, error) {
@@ -501,6 +588,36 @@ func parseStringSlice(payload map[string]any, key string) ([]string, error) {
 			return nil, fmt.Errorf("gossipv1: %s entries must be non-empty", key)
 		}
 		out = append(out, s)
+	}
+
+	return out, nil
+}
+
+func parseBytes(payload map[string]any, key string) ([]byte, error) {
+	value, ok := payload[key]
+	if !ok {
+		return nil, fmt.Errorf("gossipv1: missing %s", key)
+	}
+
+	switch typed := value.(type) {
+	case []byte:
+		out := make([]byte, len(typed))
+		copy(out, typed)
+		return out, nil
+	}
+
+	ref := reflect.ValueOf(value)
+	if ref.Kind() != reflect.Slice && ref.Kind() != reflect.Array {
+		return nil, fmt.Errorf("gossipv1: %s must be bytes", key)
+	}
+
+	out := make([]byte, ref.Len())
+	for index := 0; index < ref.Len(); index++ {
+		item := ref.Index(index)
+		if item.Kind() != reflect.Uint8 {
+			return nil, fmt.Errorf("gossipv1: %s must be bytes", key)
+		}
+		out[index] = uint8(item.Uint())
 	}
 
 	return out, nil
@@ -727,6 +844,35 @@ func dedupeStrings(input []string) []string {
 	}
 
 	return output
+}
+
+func normalizeSummaryItemIDs(itemIDs []string) []string {
+	if len(itemIDs) == 0 {
+		return []string{}
+	}
+
+	normalized := make([]string, 0, len(itemIDs))
+	seen := make(map[string]struct{}, len(itemIDs))
+	for _, itemID := range itemIDs {
+		if itemID == "" {
+			continue
+		}
+		if _, exists := seen[itemID]; exists {
+			continue
+		}
+		seen[itemID] = struct{}{}
+		normalized = append(normalized, itemID)
+	}
+
+	return normalized
+}
+
+func bloomFilterItemBytes(itemID string) []byte {
+	decoded, err := hex.DecodeString(itemID)
+	if err == nil {
+		return decoded
+	}
+	return []byte(itemID)
 }
 
 func hasDuplicateStrings(input []string) bool {

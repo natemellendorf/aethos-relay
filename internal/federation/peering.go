@@ -615,7 +615,7 @@ func (pm *PeerManager) sendSummary(peer *Peer) error {
 	if err != nil {
 		return err
 	}
-	if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: have}); err != nil {
+	if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, map[string]any{"have": have}); err != nil {
 		return err
 	}
 	peer.summarySent = true
@@ -927,7 +927,7 @@ func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) 
 	pm.peersMu.RUnlock()
 
 	for _, peer := range peers {
-		if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, gossipv1.SummaryPayload{Have: have}); err != nil {
+		if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, map[string]any{"have": have}); err != nil {
 			log.Printf("federation: failed forwarding summary to peer=%s err=%v", peer.ID, err)
 		}
 	}
