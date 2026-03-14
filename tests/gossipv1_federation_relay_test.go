@@ -185,10 +185,9 @@ func TestGossipV1RelayToRelayForwardToPeersSuppressesOriginNode(t *testing.T) {
 		t.Fatalf("forward summary with origin suppression: %v", err)
 	}
 
-	time.Sleep(400 * time.Millisecond)
-	if recorderA.hasSummaryID(sentinelID) {
-		t.Fatalf("origin relay should not receive forwarded summary for %s", sentinelID)
-	}
+	waitForConditionToStayFalse(t, 400*time.Millisecond, func() bool {
+		return recorderA.hasSummaryID(sentinelID)
+	}, "origin relay receives forwarded summary for suppressed origin node")
 }
 
 func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
@@ -337,20 +336,6 @@ func waitForMessage(t *testing.T, st interface {
 		_, err := st.GetMessageByID(context.Background(), msgID)
 		return err == nil
 	}, "message replicated: "+msgID)
-}
-
-func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, description string) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	t.Fatalf("condition did not become true before timeout: %s", description)
 }
 
 func hasExactlyQueuedIDs(relay *relayHarness, recipient string, expectedIDs ...string) bool {
