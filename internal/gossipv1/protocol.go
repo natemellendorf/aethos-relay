@@ -484,15 +484,14 @@ func ParseRequestPayload(payload map[string]any) (RequestPayload, error) {
 	if err != nil {
 		return RequestPayload{}, err
 	}
-	want, err = normalizeDigestHexIDs(want)
-	if err != nil {
-		return RequestPayload{}, err
-	}
 	if uint64(len(want)) > MaxWantItems {
 		return RequestPayload{}, fmt.Errorf("gossipv1: request want exceeds limit: %d > %d", len(want), MaxWantItems)
 	}
+	if err := validateSortedUniqueDigestIDsForField(want, "want"); err != nil {
+		return RequestPayload{}, err
+	}
 
-	return RequestPayload{Want: want}, nil
+	return RequestPayload{Want: append([]string(nil), want...)}, nil
 }
 
 func ParseTransferPayloadMixed(payload map[string]any) (ParsedTransferPayload, error) {
@@ -752,6 +751,10 @@ func normalizeDigestHexIDs(input []string) ([]string, error) {
 }
 
 func validateSortedUniqueDigestIDs(input []string) error {
+	return validateSortedUniqueDigestIDsForField(input, "preview_item_ids")
+}
+
+func validateSortedUniqueDigestIDsForField(input []string, fieldName string) error {
 	if len(input) == 0 {
 		return nil
 	}
@@ -763,7 +766,7 @@ func validateSortedUniqueDigestIDs(input []string) error {
 			return fmt.Errorf("gossipv1: item id must be 64 lowercase hex chars")
 		}
 		if _, exists := seen[itemID]; exists {
-			return fmt.Errorf("gossipv1: preview_item_ids entries must be unique")
+			return fmt.Errorf("gossipv1: %s entries must be unique", fieldName)
 		}
 		seen[itemID] = struct{}{}
 
@@ -772,7 +775,7 @@ func validateSortedUniqueDigestIDs(input []string) error {
 			continue
 		}
 		if compareDigestHex(previous, itemID) >= 0 {
-			return fmt.Errorf("gossipv1: preview_item_ids must be sorted by digest bytes")
+			return fmt.Errorf("gossipv1: %s must be sorted by digest bytes", fieldName)
 		}
 		previous = itemID
 	}

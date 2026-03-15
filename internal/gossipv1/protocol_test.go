@@ -1,7 +1,9 @@
 package gossipv1
 
 import (
+	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -252,5 +254,77 @@ func TestParseSummaryPayloadRejectsPreviewCursorWhenPreviewEmpty(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected parse error when preview_cursor present with empty preview")
+	}
+}
+
+func TestBuildSummaryPayloadMatchesSpecBloomDeterminismVector(t *testing.T) {
+	itemIDs := []string{
+		strings.Repeat("00", 32),
+		strings.Repeat("11", 32),
+		strings.Repeat("22", 32),
+	}
+
+	summary := BuildSummaryPayload(itemIDs)
+	if len(summary.BloomFilter) != BloomFilterBytes {
+		t.Fatalf("unexpected bloom length: got=%d want=%d", len(summary.BloomFilter), BloomFilterBytes)
+	}
+
+	if summary.BloomFilter[129] != 0x10 {
+		t.Fatalf("unexpected bloom byte[129]: got=0x%02x want=0x10", summary.BloomFilter[129])
+	}
+	if summary.BloomFilter[1317] != 0x02 {
+		t.Fatalf("unexpected bloom byte[1317]: got=0x%02x want=0x02", summary.BloomFilter[1317])
+	}
+	if summary.BloomFilter[1953] != 0x80 {
+		t.Fatalf("unexpected bloom byte[1953]: got=0x%02x want=0x80", summary.BloomFilter[1953])
+	}
+
+	expectedPrefix, err := hex.DecodeString("0000000000000000000000000000000000000000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("decode expected prefix: %v", err)
+	}
+	if !bytes.Equal(summary.BloomFilter[:len(expectedPrefix)], expectedPrefix) {
+		t.Fatalf("unexpected bloom prefix: got=%x want=%x", summary.BloomFilter[:len(expectedPrefix)], expectedPrefix)
+	}
+}
+
+func TestParseRequestPayloadRejectsUnsortedWant(t *testing.T) {
+	idA := strings.Repeat("01", 32)
+	idB := strings.Repeat("02", 32)
+
+	_, err := ParseRequestPayload(map[string]any{
+		"want": []string{idB, idA},
+	})
+	if err == nil {
+		t.Fatal("expected parse error for unsorted want")
+	}
+	if !strings.Contains(err.Error(), "want must be sorted by digest bytes") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseRequestPayloadRejectsDuplicateWant(t *testing.T) {
+	idA := strings.Repeat("0a", 32)
+
+	_, err := ParseRequestPayload(map[string]any{
+		"want": []string{idA, idA},
+	})
+	if err == nil {
+		t.Fatal("expected parse error for duplicate want entries")
+	}
+	if !strings.Contains(err.Error(), "want entries must be unique") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseRequestPayloadRejectsInvalidWantItemID(t *testing.T) {
+	_, err := ParseRequestPayload(map[string]any{
+		"want": []string{"not-a-digest"},
+	})
+	if err == nil {
+		t.Fatal("expected parse error for invalid want item id")
+	}
+	if !strings.Contains(err.Error(), "item id must be 64 lowercase hex chars") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
