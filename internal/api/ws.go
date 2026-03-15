@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -71,7 +70,8 @@ type clientSession struct {
 	peerLabel         string
 	handshakeComplete bool
 	queueRecipient    string
-	lastSummaryHave   []string
+	summaryCursor     string
+	peerMaxWant       uint64
 }
 
 const wsDebugItemSampleLimit = 4
@@ -79,6 +79,7 @@ const wsDebugItemSampleLimit = 4
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
 	store             store.Store
+	envelopeStore     store.EnvelopeStore
 	engine            *storeforward.Engine
 	clients           *model.ClientRegistry
 	relayID           string
@@ -122,6 +123,12 @@ func (h *WSHandler) SetFederationManager(mgr *federation.PeerManager) {
 	if h.federationManager != nil {
 		h.federationManager.SetAckDrivenSuppression(true)
 	}
+}
+
+// SetEnvelopeStore configures canonical gossip object inventory for summaries.
+func (h *WSHandler) SetEnvelopeStore(envelopeStore store.EnvelopeStore) {
+	h.envelopeStore = envelopeStore
+	h.engine.ConfigureFederation(h.relayID, envelopeStore)
 }
 
 // SetAutoDeliverQueued remains for backwards-compatible test wiring.
@@ -231,6 +238,7 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 		case gossipv1.EventTypeHelloValidated:
 			if event.Hello != nil {
 				debug.Log("in", gossipv1.FrameTypeHello, "hello_received", "transport_ok", true, "protocol_ok", true, "remote_node_id", event.Hello.NodeID)
+				session.peerMaxWant = event.Hello.MaxWant
 			}
 			if err := h.handleHelloValidated(session, event); err != nil {
 				debug.Log("in", gossipv1.FrameTypeHello, "hello_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
@@ -242,8 +250,8 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 				return fmt.Errorf("gossipv1: summary before hello")
 			}
 			if event.Summary != nil {
-				count, sample, hash := gossipv1.ItemIDSample(event.Summary.Have, wsDebugItemSampleLimit)
-				debug.Log("in", gossipv1.FrameTypeSummary, "summary_received", "transport_ok", true, "protocol_ok", true, "item_count", event.Summary.ItemCount, "bloom_bytes", len(event.Summary.BloomFilter), "have_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+				count, sample, hash := gossipv1.ItemIDSample(event.Summary.PreviewItemIDs, wsDebugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeSummary, "summary_received", "transport_ok", true, "protocol_ok", true, "item_count", event.Summary.ItemCount, "bloom_bytes", len(event.Summary.BloomFilter), "preview_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "preview_cursor", event.Summary.PreviewCursor)
 			}
 			if err := h.handleSummary(session, event); err != nil {
 				debug.Log("in", gossipv1.FrameTypeSummary, "summary_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
@@ -324,29 +332,28 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 	session.handshakeComplete = true
 	debug.Log("local", "SESSION", "session_state", "state", "handshake_complete", "queue_recipient", session.queueRecipient)
 
-	have, err := h.listQueuedMessageIDs(session.queueRecipient)
+	summary, nextCursor, err := h.buildRecipientSummary(session.queueRecipient, session.summaryCursor)
 	if err != nil {
 		debug.Log("local", gossipv1.FrameTypeSummary, "summary_inventory_failed", "store_ok", false, "err", err)
 		return err
 	}
-	session.lastSummaryHave = have
-	canonicalSummary := gossipv1.BuildSummaryPayload(have)
-	haveCount, haveSample, haveHash := gossipv1.ItemIDSample(have, wsDebugItemSampleLimit)
+	session.summaryCursor = nextCursor
+	previewCount, previewSample, previewHash := gossipv1.ItemIDSample(summary.PreviewItemIDs, wsDebugItemSampleLimit)
 	debug.Log(
 		"out",
 		gossipv1.FrameTypeSummary,
 		"summary_constructed",
-		"summary_path", "ws.handleHelloValidated:listQueuedMessageIDs->canonical_summary",
-		"canonical_builder", "gossipv1.BuildSummaryPayload",
-		"source_inventory_count", len(have),
-		"item_count", canonicalSummary.ItemCount,
-		"bloom_bytes", len(canonicalSummary.BloomFilter),
-		"item_ids_sample", haveSample,
-		"item_ids_hash", haveHash,
-		"have_count", haveCount,
+		"summary_path", "ws.handleHelloValidated:envelope_store_by_destination->summary_preview",
+		"item_count", summary.ItemCount,
+		"bloom_bytes", len(summary.BloomFilter),
+		"preview_count", previewCount,
+		"item_ids_sample", previewSample,
+		"item_ids_hash", previewHash,
+		"preview_cursor", summary.PreviewCursor,
+		"next_preview_cursor", nextCursor,
 	)
 
-	return h.sendEnvelope(session, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload(have))
+	return h.sendEnvelope(session, gossipv1.FrameTypeSummary, summary)
 }
 
 func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) error {
@@ -355,8 +362,11 @@ func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) 
 	if event.Summary == nil {
 		return fmt.Errorf("gossipv1: summary event missing payload")
 	}
+	if err := validateSummaryPreviewCursor(event.Summary.PreviewItemIDs, event.Summary.PreviewCursor); err != nil {
+		return err
+	}
 
-	want, err := h.computeMissingWant(event.Summary.Have)
+	want, err := h.computeMissingWant(event.Summary, nil, session.peerMaxWant)
 	if err != nil {
 		debug.Log("local", gossipv1.FrameTypeSummary, "summary_compute_want_failed", "store_ok", false, "err", err)
 		return err
@@ -388,38 +398,27 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 			break
 		}
 
-		message, err := h.store.GetMessageByID(context.Background(), requestedID)
+		object, found, err := h.loadTransferObjectByItemID(requestedID)
 		if err != nil {
-			if isNotFoundError(err) {
-				debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "missing", "reason", "not_found", "store_ok", true)
-				continue
-			}
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "lookup_failed", "store_ok", false, "err", err)
 			return err
 		}
-		if message == nil {
+		if !found {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "missing", "reason", "nil_message", "store_ok", true)
 			continue
 		}
-		if message.To != session.queueRecipient {
+		if object.To != session.queueRecipient {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "recipient_mismatch", "store_ok", true)
 			continue
 		}
-		if !message.ExpiresAt.After(now) {
+		if !time.Unix(object.ExpiresAt, 0).UTC().After(now) {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "expired", "store_ok", true)
 			continue
 		}
 
-		objects = append(objects, gossipv1.TransferObject{
-			ID:         message.ID,
-			From:       message.From,
-			To:         message.To,
-			PayloadB64: message.Payload,
-			CreatedAt:  message.CreatedAt.UTC().Unix(),
-			ExpiresAt:  message.ExpiresAt.UTC().Unix(),
-		})
-		expectedReceiptIDs = append(expectedReceiptIDs, message.ID)
-		debug.LogItem("out", gossipv1.FrameTypeTransfer, message.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
+		objects = append(objects, object)
+		expectedReceiptIDs = append(expectedReceiptIDs, object.ID)
+		debug.LogItem("out", gossipv1.FrameTypeTransfer, object.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
 	}
 	transferCount, transferSample, transferHash := gossipv1.ItemIDSample(expectedReceiptIDs, wsDebugItemSampleLimit)
 	debug.Log("out", gossipv1.FrameTypeTransfer, "request_serviced", "object_count", len(objects), "expected_receipt_count", transferCount, "item_ids_sample", transferSample, "item_ids_hash", transferHash, "store_ok", true)
@@ -522,7 +521,7 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 	}
 
 	if len(receipt.Accepted) > 1 {
-		sort.Strings(receipt.Accepted)
+		gossipv1.SortDigestHexIDs(receipt.Accepted)
 	}
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, wsDebugItemSampleLimit)
 	rejectedIDs := make([]string, 0, len(receipt.Rejected))
@@ -562,70 +561,127 @@ func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) 
 	return nil
 }
 
-func (h *WSHandler) listQueuedMessageIDs(queueRecipient string) ([]string, error) {
-	ids, err := h.store.GetAllQueuedMessageIDs(context.Background(), queueRecipient)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(ids) <= 1 {
-		return ids, nil
-	}
-
-	seen := make(map[string]struct{}, len(ids))
-	deduped := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		deduped = append(deduped, id)
-	}
-	sort.Strings(deduped)
-
-	return deduped, nil
-}
-
-func (h *WSHandler) computeMissingWant(summaryHave []string) ([]string, error) {
-	if len(summaryHave) == 0 {
+func (h *WSHandler) computeMissingWant(summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64) ([]string, error) {
+	if summary == nil {
 		return []string{}, nil
 	}
 
-	want := make([]string, 0, len(summaryHave))
-	for _, id := range summaryHave {
-		if id == "" {
+	previewIDs, err := gossipv1.NormalizeDigestHexIDs(summary.PreviewItemIDs)
+	if err != nil {
+		return nil, err
+	}
+	bloom := summary.BloomFilter
+
+	limit := int(gossipv1.MaxWantItems)
+	if peerMaxWant > 0 && peerMaxWant < uint64(limit) {
+		limit = int(peerMaxWant)
+	}
+	if limit <= 0 {
+		return []string{}, nil
+	}
+
+	want := make([]string, 0, limit)
+	seenWant := make(map[string]struct{}, limit)
+	for _, id := range previewIDs {
+		if _, duplicate := seenWant[id]; duplicate {
+			continue
+		}
+		if !gossipv1.BloomFilterMightContain(bloom, id) {
 			continue
 		}
 
-		message, err := h.store.GetMessageByID(context.Background(), id)
-		if err != nil {
-			if isNotFoundError(err) {
-				want = append(want, id)
-				continue
-			}
-			return nil, err
+		known, knownErr := h.hasObjectID(id)
+		if knownErr != nil {
+			return nil, knownErr
 		}
-		if message == nil {
-			want = append(want, id)
+		if known {
+			continue
+		}
+
+		seenWant[id] = struct{}{}
+		want = append(want, id)
+		if len(want) >= limit {
+			gossipv1.SortDigestHexIDs(want)
+			return want, nil
 		}
 	}
 
-	if len(want) > 1 {
-		sort.Strings(want)
+	normalizedCandidates, err := gossipv1.NormalizeDigestHexIDs(candidateIDs)
+	if err != nil {
+		return nil, err
 	}
-	if uint64(len(want)) > gossipv1.MaxWantItems {
-		want = want[:gossipv1.MaxWantItems]
+	for _, id := range normalizedCandidates {
+		if _, duplicate := seenWant[id]; duplicate {
+			continue
+		}
+		if !gossipv1.BloomFilterMightContain(bloom, id) {
+			continue
+		}
+
+		known, knownErr := h.hasObjectID(id)
+		if knownErr != nil {
+			return nil, knownErr
+		}
+		if known {
+			continue
+		}
+
+		seenWant[id] = struct{}{}
+		want = append(want, id)
+		if len(want) >= limit {
+			break
+		}
 	}
 
+	gossipv1.SortDigestHexIDs(want)
 	return want, nil
+}
+
+func (h *WSHandler) hasObjectID(id string) (bool, error) {
+	if h.envelopeStore != nil {
+		envelope, err := h.envelopeStore.GetEnvelopeByID(context.Background(), id)
+		if err != nil {
+			if !isNotFoundError(err) {
+				return false, err
+			}
+		} else if envelope != nil {
+			return true, nil
+		}
+	}
+
+	message, err := h.store.GetMessageByID(context.Background(), id)
+	if err != nil {
+		if isNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return message != nil, nil
+}
+
+func validateSummaryPreviewCursor(previewIDs []string, previewCursor string) error {
+	if len(previewIDs) == 0 {
+		if previewCursor != "" {
+			return fmt.Errorf("gossipv1: summary preview_cursor must be absent when preview_item_ids is empty")
+		}
+		return nil
+	}
+
+	if previewCursor == "" {
+		return fmt.Errorf("gossipv1: summary preview_cursor is required when preview_item_ids are present")
+	}
+	if previewCursor != previewIDs[len(previewIDs)-1] {
+		return fmt.Errorf("gossipv1: summary preview_cursor must equal last preview_item_ids element")
+	}
+	return nil
 }
 
 func validateTransferObject(object gossipv1.TransferObject) error {
 	if object.ID == "" {
 		return fmt.Errorf("id is required")
+	}
+	if !gossipv1.IsDigestHexID(object.ID) {
+		return fmt.Errorf("id must be 64 lowercase hex chars")
 	}
 	if object.From == "" {
 		return fmt.Errorf("from is required")
@@ -641,6 +697,10 @@ func validateTransferObject(object gossipv1.TransferObject) error {
 	}
 	if object.ExpiresAt <= object.CreatedAt {
 		return fmt.Errorf("expires_at must be greater than created_at")
+	}
+	expectedID := gossipv1.ComputeTransferObjectItemID(object)
+	if object.ID != expectedID {
+		return fmt.Errorf("id must equal sha256(canonical envelope bytes)")
 	}
 	return nil
 }
@@ -691,10 +751,10 @@ func (h *WSHandler) writePump(session *clientSession) {
 	}
 }
 
-func summaryHaveFromPayload(payload any) []string {
+func summaryPreviewFromPayload(payload any) []string {
 	switch typed := payload.(type) {
 	case map[string]any:
-		raw, ok := typed["have"]
+		raw, ok := typed["preview_item_ids"]
 		if !ok {
 			return nil
 		}
@@ -718,6 +778,81 @@ func summaryHaveFromPayload(payload any) []string {
 	default:
 		return nil
 	}
+}
+
+func (h *WSHandler) buildRecipientSummary(queueRecipient string, afterCursor string) (gossipv1.SummaryPayload, string, error) {
+	if queueRecipient == "" {
+		return gossipv1.BuildSummaryPreviewPayload(nil, nil, ""), "", nil
+	}
+	if h.envelopeStore == nil {
+		return gossipv1.BuildSummaryPreviewPayload(nil, nil, ""), "", nil
+	}
+
+	previewIDs, nextCursor, totalCount, eligibleIDs, err := h.envelopeStore.GetEnvelopeIDsByDestinationPage(context.Background(), queueRecipient, afterCursor, int(gossipv1.MaxSummaryPreviewItems))
+	if err != nil {
+		return gossipv1.SummaryPayload{}, "", err
+	}
+
+	normalizedPreview, err := gossipv1.NormalizeDigestHexIDs(previewIDs)
+	if err != nil {
+		return gossipv1.SummaryPayload{}, "", err
+	}
+	if uint64(len(normalizedPreview)) > gossipv1.MaxSummaryPreviewItems {
+		normalizedPreview = normalizedPreview[:gossipv1.MaxSummaryPreviewItems]
+	}
+
+	summary := gossipv1.BuildSummaryPreviewPayload(eligibleIDs, normalizedPreview, "")
+	summary.ItemCount = uint64(totalCount)
+	return summary, nextCursor, nil
+}
+
+func canonicalTransferObjectFromMessage(message *model.Message) (gossipv1.TransferObject, bool) {
+	if message == nil {
+		return gossipv1.TransferObject{}, false
+	}
+	if !gossipv1.IsDigestHexID(message.ID) {
+		return gossipv1.TransferObject{}, false
+	}
+
+	createdAt := message.CreatedAt.UTC().Unix()
+	expiresAt := message.ExpiresAt.UTC().Unix()
+	expectedID := gossipv1.ComputeItemID(message.From, message.To, message.Payload, createdAt, expiresAt)
+	if message.ID != expectedID {
+		return gossipv1.TransferObject{}, false
+	}
+
+	return gossipv1.TransferObject{
+		ID:         message.ID,
+		From:       message.From,
+		To:         message.To,
+		PayloadB64: message.Payload,
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
+	}, true
+}
+
+func (h *WSHandler) loadTransferObjectByItemID(itemID string) (gossipv1.TransferObject, bool, error) {
+	if !gossipv1.IsDigestHexID(itemID) {
+		return gossipv1.TransferObject{}, false, nil
+	}
+
+	message, err := h.store.GetMessageByID(context.Background(), itemID)
+	if err != nil {
+		if isNotFoundError(err) {
+			return gossipv1.TransferObject{}, false, nil
+		}
+		return gossipv1.TransferObject{}, false, err
+	}
+	if message == nil {
+		return gossipv1.TransferObject{}, false, nil
+	}
+
+	object, ok := canonicalTransferObjectFromMessage(message)
+	if !ok {
+		return gossipv1.TransferObject{}, false, nil
+	}
+
+	return object, true, nil
 }
 
 func (h *WSHandler) sendLocalHello(session *clientSession, adapter *gossipv1.SessionAdapter) error {
@@ -755,20 +890,21 @@ func (h *WSHandler) sendEnvelope(session *clientSession, frameType string, paylo
 	switch frameType {
 	case gossipv1.FrameTypeSummary:
 		if summary, ok := payload.(gossipv1.SummaryPayload); ok {
-			count, sample, hash := gossipv1.ItemIDSample(summary.Have, wsDebugItemSampleLimit)
+			count, sample, hash := gossipv1.ItemIDSample(summary.PreviewItemIDs, wsDebugItemSampleLimit)
 			metadata = append(metadata,
 				"item_count", summary.ItemCount,
 				"bloom_bytes", len(summary.BloomFilter),
-				"have_count", count,
+				"preview_count", count,
 				"item_ids_sample", sample,
 				"item_ids_hash", hash,
+				"preview_cursor", summary.PreviewCursor,
 			)
 		} else {
-			have := summaryHaveFromPayload(payload)
+			have := summaryPreviewFromPayload(payload)
 			count, sample, hash := gossipv1.ItemIDSample(have, wsDebugItemSampleLimit)
 			metadata = append(metadata,
 				"item_count", count,
-				"have_count", count,
+				"preview_count", count,
 				"item_ids_sample", sample,
 				"item_ids_hash", hash,
 			)

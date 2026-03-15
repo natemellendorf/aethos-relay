@@ -2,8 +2,10 @@ package federation
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -317,13 +319,85 @@ func TestForwardToPeersRequiresMessage(t *testing.T) {
 func TestHandleSummarySkipsRequestWhenComputedWantEmpty(t *testing.T) {
 	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
 	peer := &Peer{ID: "peer-1"}
+	id := strings.Repeat("aa", 32)
+	bloom := gossipv1.BuildSummaryPayload([]string{id}).BloomFilter
 
 	err := pm.handleSummary(peer, gossipv1.Event{
 		Type:    gossipv1.EventTypeSummary,
-		Summary: &gossipv1.SummaryPayload{Have: []string{"msg-1"}},
+		Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{id}, PreviewCursor: id},
 	})
+	if err == nil {
+		t.Fatal("expected summary with unresolved unknown digest to fail due to missing connection")
+	}
+}
+
+func TestHandleSummaryRejectsInvalidPreviewCursor(t *testing.T) {
+	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+	peer := &Peer{ID: "peer-1"}
+	idA := strings.Repeat("ab", 32)
+	idB := strings.Repeat("ac", 32)
+	bloom := gossipv1.BuildSummaryPayload([]string{idA, idB}).BloomFilter
+
+	err := pm.handleSummary(peer, gossipv1.Event{
+		Type: gossipv1.EventTypeSummary,
+		Summary: &gossipv1.SummaryPayload{
+			BloomFilter:    bloom,
+			PreviewItemIDs: []string{idA, idB},
+			PreviewCursor:  idA,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid preview_cursor to be rejected")
+	}
+}
+
+func TestComputeMissingWantAppliesPreviewPriorityCapAndFinalSort(t *testing.T) {
+	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+	candidateOnly := strings.Repeat("01", 32)
+	previewOnly := strings.Repeat("ff", 32)
+	bloomIDs := []string{candidateOnly, previewOnly}
+	summary := gossipv1.BuildSummaryPreviewPayload(bloomIDs, []string{previewOnly}, "")
+
+	want, err := pm.computeMissingWant(context.Background(), &summary, []string{candidateOnly}, 1)
 	if err != nil {
-		t.Fatalf("expected summary with empty want to be no-op, got %v", err)
+		t.Fatalf("computeMissingWant cap=1 failed: %v", err)
+	}
+	if len(want) != 1 || want[0] != previewOnly {
+		t.Fatalf("unexpected preview-priority want set: %#v", want)
+	}
+
+	want, err = pm.computeMissingWant(context.Background(), &summary, []string{candidateOnly}, 2)
+	if err != nil {
+		t.Fatalf("computeMissingWant cap=2 failed: %v", err)
+	}
+	if len(want) != 2 || want[0] != candidateOnly || want[1] != previewOnly {
+		t.Fatalf("unexpected final sorted want set: %#v", want)
+	}
+}
+
+func TestTransferObjectToMessageRejectsItemIDHashMismatch(t *testing.T) {
+	now := time.Now().UTC()
+	createdAt := now.Add(-time.Minute).Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	validID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	mismatchedID := strings.Repeat("de", 32)
+	if mismatchedID == validID {
+		mismatchedID = strings.Repeat("df", 32)
+	}
+
+	_, err := transferObjectToMessage(gossipv1.TransferObject{
+		ID:         mismatchedID,
+		From:       "sender-a",
+		To:         "recipient-a",
+		PayloadB64: "QQ",
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
+	})
+	if err == nil {
+		t.Fatal("expected item_id mismatch to be rejected")
+	}
+	if err.Error() != "id must equal sha256(canonical envelope bytes)" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

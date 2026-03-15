@@ -40,34 +40,39 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	assertFrameType(t, aSummary, gossipv1.FrameTypeSummary)
 	assertFrameType(t, bSummary, gossipv1.FrameTypeSummary)
 
-	writeEnvelope(t, a, gossipv1.FrameTypeSummary, map[string]any{"have": []string{"msg-1"}})
+	now := time.Now().UTC()
+	createdAt := now.Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	itemID := testItemID("sender-a", "client-a", "QQ", createdAt, expiresAt)
+	invalidItemID := testItemID("sender-a", "client-a", "invalid", createdAt, expiresAt)
+	summary := gossipv1.BuildSummaryPayload([]string{itemID})
+	writeEnvelope(t, a, gossipv1.FrameTypeSummary, summary)
 	aRequest := readEnvelope(t, a)
 	assertFrameType(t, aRequest, gossipv1.FrameTypeRequest)
 	requestPayload, err := gossipv1.ParseRequestPayload(aRequest.Payload)
 	if err != nil {
 		t.Fatalf("parse request payload: %v", err)
 	}
-	if len(requestPayload.Want) != 1 || requestPayload.Want[0] != "msg-1" {
+	if len(requestPayload.Want) != 1 || requestPayload.Want[0] != itemID {
 		t.Fatalf("unexpected want set: %#v", requestPayload.Want)
 	}
 
-	now := time.Now().UTC()
 	writeEnvelope(t, a, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
 		{
-			ID:         "msg-1",
+			ID:         itemID,
 			From:       "sender-a",
 			To:         "client-a",
 			PayloadB64: "QQ",
-			CreatedAt:  now.Unix(),
-			ExpiresAt:  now.Add(time.Hour).Unix(),
+			CreatedAt:  createdAt,
+			ExpiresAt:  expiresAt,
 		},
 		{
-			ID:         "msg-invalid",
+			ID:         invalidItemID,
 			From:       "sender-a",
 			To:         "client-a",
 			PayloadB64: "invalid",
-			CreatedAt:  now.Unix(),
-			ExpiresAt:  now.Add(time.Hour).Unix(),
+			CreatedAt:  createdAt,
+			ExpiresAt:  expiresAt,
 		},
 	}})
 
@@ -77,17 +82,17 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse receipt payload: %v", err)
 	}
-	if len(receiptPayload.Accepted) != 1 || receiptPayload.Accepted[0] != "msg-1" {
+	if len(receiptPayload.Accepted) != 1 || receiptPayload.Accepted[0] != itemID {
 		t.Fatalf("unexpected accepted ids: %#v", receiptPayload.Accepted)
 	}
-	if len(receiptPayload.Rejected) != 1 || receiptPayload.Rejected[0].ID != "msg-invalid" {
+	if len(receiptPayload.Rejected) != 1 || receiptPayload.Rejected[0].ID != invalidItemID {
 		t.Fatalf("unexpected rejected list: %#v", receiptPayload.Rejected)
 	}
 
-	if _, err := relay.store.GetMessageByID(context.Background(), "msg-1"); err != nil {
+	if _, err := relay.store.GetMessageByID(context.Background(), itemID); err != nil {
 		t.Fatalf("expected accepted message persisted: %v", err)
 	}
-	if _, err := relay.store.GetMessageByID(context.Background(), "msg-invalid"); err == nil {
+	if _, err := relay.store.GetMessageByID(context.Background(), invalidItemID); err == nil {
 		t.Fatal("expected rejected message to remain unpersisted")
 	}
 }
@@ -152,6 +157,7 @@ func startRelayForTest(t *testing.T, relayID string, federationEnabled bool, pee
 		if err := envelopeStore.Open(); err != nil {
 			t.Fatalf("open envelope store: %v", err)
 		}
+		wsHandler.SetEnvelopeStore(envelopeStore)
 
 		pm = federation.NewPeerManager(relayID, st, clients, 24*time.Hour)
 		pm.SetEnvelopeStore(envelopeStore)

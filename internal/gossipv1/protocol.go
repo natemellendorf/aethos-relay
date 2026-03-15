@@ -1,27 +1,32 @@
 package gossipv1
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/fxamacker/cbor/v2"
 )
 
 const (
-	GossipVersion       uint64 = 1
-	MaxFrameBytes              = 1 << 20 // 1 MiB
-	BloomFilterBytes           = 2048
-	BloomHashCount             = 4
-	MaxSummaryItems     uint64 = 256
-	MaxWantItems        uint64 = 256
-	MaxTransferItems    uint64 = 32
-	MaxReceiptItems     uint64 = MaxTransferItems
-	MaxRelayIngestItems int    = 256
+	GossipVersion          uint64 = 1
+	MaxFrameBytes                 = 1 << 20 // 1 MiB
+	BloomFilterBytes              = 2048
+	BloomHashCount                = 4
+	MaxSummaryItems        uint64 = 256
+	MaxSummaryPreviewItems uint64 = 64
+	MaxWantItems           uint64 = 256
+	MaxTransferItems       uint64 = 32
+	MaxReceiptItems        uint64 = MaxTransferItems
+	MaxRelayIngestItems    int    = 256
+	DigestHexBytes                = 32
+	DigestHexLen                  = DigestHexBytes * 2
 
 	FrameTypeHello       = "HELLO"
 	FrameTypeSummary     = "SUMMARY"
@@ -66,9 +71,11 @@ type RelayIngestPayload struct {
 }
 
 type SummaryPayload struct {
-	BloomFilter []byte   `cbor:"bloom_filter"`
-	ItemCount   uint64   `cbor:"item_count"`
-	Have        []string `cbor:"-"`
+	BloomFilter    []byte   `cbor:"bloom_filter"`
+	ItemCount      uint64   `cbor:"item_count"`
+	PreviewItemIDs []string `cbor:"preview_item_ids,omitempty"`
+	PreviewCursor  string   `cbor:"preview_cursor,omitempty"`
+	Have           []string `cbor:"-"`
 }
 
 type RequestPayload struct {
@@ -108,6 +115,64 @@ type IndexedTransferObject struct {
 type ReceiptPayload struct {
 	Accepted []string                  `cbor:"accepted"`
 	Rejected []TransferObjectRejection `cbor:"rejected,omitempty"`
+}
+
+type canonicalItemEnvelope struct {
+	From       string `cbor:"from"`
+	To         string `cbor:"to"`
+	PayloadB64 string `cbor:"payload_b64"`
+	CreatedAt  int64  `cbor:"created_at"`
+	ExpiresAt  int64  `cbor:"expires_at"`
+}
+
+// IsDigestHexID reports whether value is a lowercase 64-hex digest ID.
+func IsDigestHexID(value string) bool {
+	return isDigestHex(value)
+}
+
+// NormalizeDigestHexIDs validates, dedupes, and bytewise-sorts digest IDs.
+func NormalizeDigestHexIDs(input []string) ([]string, error) {
+	return normalizeDigestHexIDs(input)
+}
+
+// SortDigestHexIDs bytewise-sorts digest IDs in place.
+func SortDigestHexIDs(ids []string) {
+	sortDigestHexIDs(ids)
+}
+
+// CompareDigestHexIDs compares lowercase digest hex IDs by decoded bytes.
+// Returns -1 when left < right, 0 when equal, 1 when left > right.
+func CompareDigestHexIDs(left string, right string) int {
+	return compareDigestHex(left, right)
+}
+
+// ComputeItemID computes item_id as lowercase sha256(canonical envelope bytes).
+func ComputeItemID(from string, to string, payloadB64 string, createdAt int64, expiresAt int64) string {
+	envelopeBytes := mustCanonicalItemEnvelopeBytes(from, to, payloadB64, createdAt, expiresAt)
+	digest := sha256.Sum256(envelopeBytes)
+	return hex.EncodeToString(digest[:])
+}
+
+// ComputeTransferObjectItemID computes the content-address item_id for transfer object fields.
+func ComputeTransferObjectItemID(object TransferObject) string {
+	return ComputeItemID(object.From, object.To, object.PayloadB64, object.CreatedAt, object.ExpiresAt)
+}
+
+func mustCanonicalItemEnvelopeBytes(from string, to string, payloadB64 string, createdAt int64, expiresAt int64) []byte {
+	envelope := canonicalItemEnvelope{
+		From:       from,
+		To:         to,
+		PayloadB64: payloadB64,
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
+	}
+
+	encoded, err := canonicalEncMode.Marshal(envelope)
+	if err != nil {
+		panic(fmt.Sprintf("gossipv1: canonical item envelope: %v", err))
+	}
+
+	return encoded
 }
 
 func BuildRelayHello(relayID string) HelloPayload {
@@ -282,66 +347,73 @@ func ParseSummaryPayload(payload map[string]any) (SummaryPayload, error) {
 		return SummaryPayload{}, fmt.Errorf("gossipv1: summary payload is required")
 	}
 
-	_, hasBloomFilter := payload["bloom_filter"]
-	_, hasItemCount := payload["item_count"]
-	_, hasLegacyHave := payload["have"]
-
-	if hasBloomFilter || hasItemCount {
-		allowed := map[string]struct{}{
-			"bloom_filter": {},
-			"item_count":   {},
-		}
-		for key := range payload {
-			if _, ok := allowed[key]; !ok {
-				return SummaryPayload{}, fmt.Errorf("gossipv1: unknown summary payload field %q", key)
-			}
-		}
-
-		bloomFilter, err := parseBytes(payload, "bloom_filter")
-		if err != nil {
-			return SummaryPayload{}, err
-		}
-		if len(bloomFilter) != BloomFilterBytes {
-			return SummaryPayload{}, fmt.Errorf("gossipv1: summary bloom_filter must be %d bytes", BloomFilterBytes)
-		}
-
-		itemCount, err := parseUint(payload, "item_count")
-		if err != nil {
-			return SummaryPayload{}, err
-		}
-
-		return SummaryPayload{BloomFilter: bloomFilter, ItemCount: itemCount}, nil
+	bloomFilter, err := parseBytes(payload, "bloom_filter")
+	if err != nil {
+		return SummaryPayload{}, err
+	}
+	if len(bloomFilter) != BloomFilterBytes {
+		return SummaryPayload{}, fmt.Errorf("gossipv1: summary bloom_filter must be %d bytes", BloomFilterBytes)
 	}
 
-	if hasLegacyHave {
-		allowed := map[string]struct{}{
-			"have": {},
-		}
-		for key := range payload {
-			if _, ok := allowed[key]; !ok {
-				return SummaryPayload{}, fmt.Errorf("gossipv1: unknown summary payload field %q", key)
-			}
-		}
+	itemCount, err := parseUint(payload, "item_count")
+	if err != nil {
+		return SummaryPayload{}, err
+	}
 
-		have, err := parseStringSlice(payload, "have")
+	previewItemIDs := []string{}
+	if rawPreview, ok := payload["preview_item_ids"]; ok {
+		previewItemIDs, err = parseStringSliceFromRaw(rawPreview, "preview_item_ids")
 		if err != nil {
 			return SummaryPayload{}, err
 		}
-		have = dedupeStrings(have)
-		if uint64(len(have)) > MaxSummaryItems {
-			return SummaryPayload{}, fmt.Errorf("gossipv1: summary have exceeds limit: %d > %d", len(have), MaxSummaryItems)
+		if uint64(len(previewItemIDs)) > MaxSummaryPreviewItems {
+			return SummaryPayload{}, fmt.Errorf("gossipv1: summary preview_item_ids exceeds limit: %d > %d", len(previewItemIDs), MaxSummaryPreviewItems)
 		}
-
-		summary := BuildSummaryPayload(have)
-		summary.Have = have
-		return summary, nil
+		if err := validateSortedUniqueDigestIDs(previewItemIDs); err != nil {
+			return SummaryPayload{}, err
+		}
 	}
 
-	return SummaryPayload{}, fmt.Errorf("gossipv1: summary payload is required")
+	previewCursor, err := parseOptionalString(payload, "preview_cursor")
+	if err != nil {
+		return SummaryPayload{}, err
+	}
+
+	if len(previewItemIDs) == 0 {
+		if previewCursor != "" {
+			return SummaryPayload{}, fmt.Errorf("gossipv1: summary preview_cursor must be absent when preview_item_ids is empty")
+		}
+	} else {
+		if previewCursor == "" {
+			return SummaryPayload{}, fmt.Errorf("gossipv1: summary preview_cursor is required when preview_item_ids is present")
+		}
+		if !isDigestHex(previewCursor) {
+			return SummaryPayload{}, fmt.Errorf("gossipv1: summary preview_cursor must be 64 lowercase hex chars")
+		}
+		if previewCursor != previewItemIDs[len(previewItemIDs)-1] {
+			return SummaryPayload{}, fmt.Errorf("gossipv1: summary preview_cursor must equal last preview_item_ids element")
+		}
+	}
+
+	return SummaryPayload{
+		BloomFilter:    bloomFilter,
+		ItemCount:      itemCount,
+		PreviewItemIDs: previewItemIDs,
+		PreviewCursor:  previewCursor,
+		Have:           append([]string(nil), previewItemIDs...),
+	}, nil
 }
 
 func BuildSummaryPayload(itemIDs []string) SummaryPayload {
-	normalizedItemIDs := normalizeSummaryItemIDs(itemIDs)
+	return BuildSummaryPreviewPayload(itemIDs, itemIDs, "")
+}
+
+func BuildSummaryPreviewPayload(itemIDs []string, previewItemIDs []string, previewCursor string) SummaryPayload {
+	normalizedItemIDs := normalizeDigestHexIDsDropInvalid(itemIDs)
+	normalizedPreviewItemIDs := normalizeDigestHexIDsDropInvalid(previewItemIDs)
+	if uint64(len(normalizedPreviewItemIDs)) > MaxSummaryPreviewItems {
+		normalizedPreviewItemIDs = normalizedPreviewItemIDs[:MaxSummaryPreviewItems]
+	}
 	bloomFilter := make([]byte, BloomFilterBytes)
 
 	for _, itemID := range normalizedItemIDs {
@@ -356,10 +428,18 @@ func BuildSummaryPayload(itemIDs []string) SummaryPayload {
 		}
 	}
 
+	if len(normalizedPreviewItemIDs) == 0 {
+		previewCursor = ""
+	} else if previewCursor == "" || previewCursor != normalizedPreviewItemIDs[len(normalizedPreviewItemIDs)-1] {
+		previewCursor = normalizedPreviewItemIDs[len(normalizedPreviewItemIDs)-1]
+	}
+
 	return SummaryPayload{
-		BloomFilter: bloomFilter,
-		ItemCount:   uint64(len(normalizedItemIDs)),
-		Have:        normalizedItemIDs,
+		BloomFilter:    bloomFilter,
+		ItemCount:      uint64(len(normalizedItemIDs)),
+		PreviewItemIDs: normalizedPreviewItemIDs,
+		PreviewCursor:  previewCursor,
+		Have:           append([]string(nil), normalizedPreviewItemIDs...),
 	}
 }
 
@@ -367,11 +447,11 @@ func BloomFilterMightContain(bloomFilter []byte, itemID string) bool {
 	if len(bloomFilter) != BloomFilterBytes {
 		return false
 	}
-	if itemID == "" {
+	itemBytes, ok := digestBytes(itemID)
+	if !ok {
 		return false
 	}
 
-	itemBytes := bloomFilterItemBytes(itemID)
 	for hashIndex := 0; hashIndex < BloomHashCount; hashIndex++ {
 		digest := sha256.Sum256(append(itemBytes, byte(hashIndex)))
 		hashValue := binary.BigEndian.Uint64(digest[:8])
@@ -404,12 +484,14 @@ func ParseRequestPayload(payload map[string]any) (RequestPayload, error) {
 	if err != nil {
 		return RequestPayload{}, err
 	}
-	want = dedupeStrings(want)
 	if uint64(len(want)) > MaxWantItems {
 		return RequestPayload{}, fmt.Errorf("gossipv1: request want exceeds limit: %d > %d", len(want), MaxWantItems)
 	}
+	if err := validateSortedUniqueDigestIDsForField(want, "want"); err != nil {
+		return RequestPayload{}, err
+	}
 
-	return RequestPayload{Want: want}, nil
+	return RequestPayload{Want: append([]string(nil), want...)}, nil
 }
 
 func ParseTransferPayloadMixed(payload map[string]any) (ParsedTransferPayload, error) {
@@ -567,9 +649,28 @@ func parseString(payload map[string]any, key string) (string, error) {
 	return parsed, nil
 }
 
+func parseOptionalString(payload map[string]any, key string) (string, error) {
+	value, ok := payload[key]
+	if !ok {
+		return "", nil
+	}
+	parsed, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("gossipv1: %s must be string", key)
+	}
+	return parsed, nil
+}
+
 func parseStringSlice(payload map[string]any, key string) ([]string, error) {
 	value, ok := payload[key]
 	if !ok {
+		return nil, fmt.Errorf("gossipv1: missing %s", key)
+	}
+	return parseStringSliceFromRaw(value, key)
+}
+
+func parseStringSliceFromRaw(value any, key string) ([]string, error) {
+	if value == nil {
 		return nil, fmt.Errorf("gossipv1: missing %s", key)
 	}
 
@@ -591,6 +692,130 @@ func parseStringSlice(payload map[string]any, key string) ([]string, error) {
 	}
 
 	return out, nil
+}
+
+func isDigestHex(value string) bool {
+	_, ok := digestBytes(value)
+	return ok
+}
+
+func digestHexLess(left string, right string) bool {
+	return compareDigestHex(left, right) < 0
+}
+
+func compareDigestHex(left string, right string) int {
+	leftBytes, leftOK := digestBytes(left)
+	rightBytes, rightOK := digestBytes(right)
+	if !leftOK || !rightOK {
+		switch {
+		case left < right:
+			return -1
+		case left > right:
+			return 1
+		default:
+			return 0
+		}
+	}
+	return bytes.Compare(leftBytes, rightBytes)
+}
+
+func sortDigestHexIDs(ids []string) {
+	if len(ids) <= 1 {
+		return
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return digestHexLess(ids[i], ids[j])
+	})
+}
+
+func normalizeDigestHexIDs(input []string) ([]string, error) {
+	if len(input) == 0 {
+		return []string{}, nil
+	}
+
+	seen := make(map[string]struct{}, len(input))
+	ids := make([]string, 0, len(input))
+	for _, candidate := range input {
+		if !isDigestHex(candidate) {
+			return nil, fmt.Errorf("gossipv1: item id must be 64 lowercase hex chars")
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		ids = append(ids, candidate)
+	}
+
+	sortDigestHexIDs(ids)
+	return ids, nil
+}
+
+func validateSortedUniqueDigestIDs(input []string) error {
+	return validateSortedUniqueDigestIDsForField(input, "preview_item_ids")
+}
+
+func validateSortedUniqueDigestIDsForField(input []string, fieldName string) error {
+	if len(input) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(input))
+	previous := ""
+	for index, itemID := range input {
+		if !isDigestHex(itemID) {
+			return fmt.Errorf("gossipv1: item id must be 64 lowercase hex chars")
+		}
+		if _, exists := seen[itemID]; exists {
+			return fmt.Errorf("gossipv1: %s entries must be unique", fieldName)
+		}
+		seen[itemID] = struct{}{}
+
+		if index == 0 {
+			previous = itemID
+			continue
+		}
+		if compareDigestHex(previous, itemID) >= 0 {
+			return fmt.Errorf("gossipv1: %s must be sorted by digest bytes", fieldName)
+		}
+		previous = itemID
+	}
+
+	return nil
+}
+
+func normalizeDigestHexIDsLossy(input []string) []string {
+	normalized, err := normalizeDigestHexIDs(input)
+	if err == nil {
+		return normalized
+	}
+
+	fallback := dedupeStrings(input)
+	if len(fallback) > 1 {
+		sort.Strings(fallback)
+	}
+	return fallback
+}
+
+func normalizeDigestHexIDsDropInvalid(input []string) []string {
+	if len(input) == 0 {
+		return []string{}
+	}
+
+	seen := make(map[string]struct{}, len(input))
+	ids := make([]string, 0, len(input))
+	for _, candidate := range input {
+		if !isDigestHex(candidate) {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		ids = append(ids, candidate)
+	}
+
+	sortDigestHexIDs(ids)
+	return ids
 }
 
 func parseBytes(payload map[string]any, key string) ([]byte, error) {
@@ -868,11 +1093,25 @@ func normalizeSummaryItemIDs(itemIDs []string) []string {
 }
 
 func bloomFilterItemBytes(itemID string) []byte {
-	decoded, err := hex.DecodeString(itemID)
-	if err == nil {
-		return decoded
+	decoded, ok := digestBytes(itemID)
+	if !ok {
+		return nil
 	}
-	return []byte(itemID)
+	return decoded
+}
+
+func digestBytes(value string) ([]byte, bool) {
+	if len(value) != DigestHexLen {
+		return nil, false
+	}
+	if value != strings.ToLower(value) {
+		return nil, false
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != DigestHexBytes {
+		return nil, false
+	}
+	return decoded, true
 }
 
 func hasDuplicateStrings(input []string) bool {

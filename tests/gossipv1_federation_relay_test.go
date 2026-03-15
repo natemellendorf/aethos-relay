@@ -24,17 +24,16 @@ func TestGossipV1RelayToRelayFullEncounterReplicatesMessage(t *testing.T) {
 	relayB.peerManager.SetEventObserver(recorderB.observe)
 
 	now := time.Now().UTC()
+	msgPayload := "QQ"
 	msg := &model.Message{
-		ID:        "phase4-r2r-flow-msg-1",
+		ID:        testItemID("sender-a", "wayfarer-flow", msgPayload, now.Unix(), now.Add(30*time.Minute).Unix()),
 		From:      "sender-a",
 		To:        "wayfarer-flow",
-		Payload:   "QQ",
+		Payload:   msgPayload,
 		CreatedAt: now,
 		ExpiresAt: now.Add(30 * time.Minute),
 	}
-	if err := relayA.store.PersistMessage(context.Background(), msg); err != nil {
-		t.Fatalf("persist source message: %v", err)
-	}
+	persistRelayMessageWithEnvelope(t, relayA, msg)
 
 	relayA.peerManager.AddPeerURL(relayB.fedURL)
 
@@ -72,17 +71,16 @@ func TestGossipV1RelayToRelayDuplicatesAndRepeatedEncountersConverge(t *testing.
 	defer relayB.close()
 
 	now := time.Now().UTC()
+	msgPayload := "QQ"
 	msg := &model.Message{
-		ID:        "phase4-converge-msg-1",
+		ID:        testItemID("sender-a", "wayfarer-converge", msgPayload, now.Unix(), now.Add(30*time.Minute).Unix()),
 		From:      "sender-a",
 		To:        "wayfarer-converge",
-		Payload:   "QQ",
+		Payload:   msgPayload,
 		CreatedAt: now,
 		ExpiresAt: now.Add(30 * time.Minute),
 	}
-	if err := relayA.store.PersistMessage(context.Background(), msg); err != nil {
-		t.Fatalf("persist source message: %v", err)
-	}
+	persistRelayMessageWithEnvelope(t, relayA, msg)
 
 	relayA.peerManager.AddPeerURL(relayB.fedURL)
 
@@ -113,28 +111,26 @@ func TestGossipV1RelayToRelayInvalidObjectDoesNotPoisonValidState(t *testing.T) 
 	relayA.peerManager.SetEventObserver(recorderA.observe)
 
 	now := time.Now().UTC()
+	validPayload := "QQ"
 	valid := &model.Message{
-		ID:        "phase4-invalid-valid-1",
+		ID:        testItemID("sender-a", "wayfarer-invalid", validPayload, now.Unix(), now.Add(30*time.Minute).Unix()),
 		From:      "sender-a",
 		To:        "wayfarer-invalid",
-		Payload:   "QQ",
+		Payload:   validPayload,
 		CreatedAt: now,
 		ExpiresAt: now.Add(30 * time.Minute),
 	}
+	invalidPayload := "%%%not-base64%%%"
 	invalid := &model.Message{
-		ID:        "phase4-invalid-bad-1",
+		ID:        testItemID("sender-a", "wayfarer-invalid", invalidPayload, now.Unix(), now.Add(30*time.Minute).Unix()),
 		From:      "sender-a",
 		To:        "wayfarer-invalid",
-		Payload:   "%%%not-base64%%%",
+		Payload:   invalidPayload,
 		CreatedAt: now,
 		ExpiresAt: now.Add(30 * time.Minute),
 	}
-	if err := relayA.store.PersistMessage(context.Background(), valid); err != nil {
-		t.Fatalf("persist valid source message: %v", err)
-	}
-	if err := relayA.store.PersistMessage(context.Background(), invalid); err != nil {
-		t.Fatalf("persist invalid source message: %v", err)
-	}
+	persistRelayMessageWithEnvelope(t, relayA, valid)
+	persistRelayMessageWithEnvelope(t, relayA, invalid)
 
 	relayA.peerManager.AddPeerURL(relayB.fedURL)
 
@@ -143,17 +139,16 @@ func TestGossipV1RelayToRelayInvalidObjectDoesNotPoisonValidState(t *testing.T) 
 		t.Fatalf("expected invalid payload message %s to be rejected", invalid.ID)
 	}
 
+	secondPayload := "Qg"
 	validAfterInvalid := &model.Message{
-		ID:        "phase4-invalid-valid-2",
+		ID:        testItemID("sender-a", "wayfarer-invalid", secondPayload, now.Add(time.Second).Unix(), now.Add(30*time.Minute).Unix()),
 		From:      "sender-a",
 		To:        "wayfarer-invalid",
-		Payload:   "Qg",
+		Payload:   secondPayload,
 		CreatedAt: now.Add(time.Second),
 		ExpiresAt: now.Add(30 * time.Minute),
 	}
-	if err := relayA.store.PersistMessage(context.Background(), validAfterInvalid); err != nil {
-		t.Fatalf("persist second valid message: %v", err)
-	}
+	persistRelayMessageWithEnvelope(t, relayA, validAfterInvalid)
 	if err := relayA.peerManager.AnnounceMessage(validAfterInvalid); err != nil {
 		t.Fatalf("announce second valid message: %v", err)
 	}
@@ -180,7 +175,7 @@ func TestGossipV1RelayToRelayForwardToPeersSuppressesOriginNode(t *testing.T) {
 	}, "peer managers establish sessions")
 
 	originNodeID := gossipv1.BuildRelayHello("relay-phase4-origin-a").NodeID
-	sentinelID := "phase4-origin-suppression-msg-1"
+	sentinelID := testItemID("sender-origin", "wayfarer-origin", "QQ", time.Now().UTC().Unix(), time.Now().UTC().Add(time.Hour).Unix())
 	if err := relayB.peerManager.ForwardToPeers(&model.Message{ID: sentinelID}, originNodeID); err != nil {
 		t.Fatalf("forward summary with origin suppression: %v", err)
 	}
@@ -205,19 +200,22 @@ func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
 	initialSummary := readEnvelope(t, conn)
 	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
 
-	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, map[string]any{"have": []string{"phase4-cross-role-msg-1"}})
+	now := time.Now().UTC()
+	createdAt := now.Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	itemID := testItemID("sender-cross-role", "wayfarer-cross-role", "QQ", createdAt, expiresAt)
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{itemID}))
 
 	request := readEnvelope(t, conn)
 	assertFrameType(t, request, gossipv1.FrameTypeRequest)
 
-	now := time.Now().UTC()
 	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{{
-		ID:         "phase4-cross-role-msg-1",
+		ID:         itemID,
 		From:       "sender-cross-role",
 		To:         "wayfarer-cross-role",
 		PayloadB64: "QQ",
-		CreatedAt:  now.Unix(),
-		ExpiresAt:  now.Add(time.Hour).Unix(),
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
 	}}})
 
 	receipt := readEnvelope(t, conn)
@@ -226,11 +224,11 @@ func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse receipt: %v", err)
 	}
-	if len(parsedReceipt.Accepted) != 1 || parsedReceipt.Accepted[0] != "phase4-cross-role-msg-1" {
+	if len(parsedReceipt.Accepted) != 1 || parsedReceipt.Accepted[0] != itemID {
 		t.Fatalf("unexpected receipt payload: %#v", parsedReceipt)
 	}
 
-	if _, err := relay.store.GetMessageByID(context.Background(), "phase4-cross-role-msg-1"); err != nil {
+	if _, err := relay.store.GetMessageByID(context.Background(), itemID); err != nil {
 		t.Fatalf("expected persisted cross-role message: %v", err)
 	}
 }
@@ -307,7 +305,7 @@ func (r *federationEventRecorder) hasSummaryID(id string) bool {
 	defer r.mu.Unlock()
 
 	for _, summary := range r.summaries {
-		for _, haveID := range summary.Have {
+		for _, haveID := range summary.PreviewItemIDs {
 			if haveID == id {
 				return true
 			}
@@ -371,4 +369,25 @@ func uniqueSorted(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func persistRelayMessageWithEnvelope(t *testing.T, relay *relayHarness, msg *model.Message) {
+	t.Helper()
+
+	if err := relay.store.PersistMessage(context.Background(), msg); err != nil {
+		t.Fatalf("persist relay message: %v", err)
+	}
+	if relay.envelope == nil || msg == nil {
+		return
+	}
+	if err := relay.envelope.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            msg.ID,
+		DestinationID: msg.To,
+		OpaquePayload: []byte(msg.Payload),
+		OriginRelayID: "",
+		CreatedAt:     msg.CreatedAt,
+		ExpiresAt:     msg.ExpiresAt,
+	}); err != nil {
+		t.Fatalf("persist relay envelope: %v", err)
+	}
 }

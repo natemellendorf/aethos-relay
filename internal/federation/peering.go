@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +37,7 @@ type Peer struct {
 	SessionID      string
 	URL            string
 	RemoteNodeID   string
+	RemoteMaxWant  uint64
 	Outbound       bool
 	Conn           *websocket.Conn
 	writeMu        sync.Mutex
@@ -420,6 +420,7 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 			if event.Hello == nil {
 				return errors.New("gossipv1: hello event missing payload")
 			}
+			peer.RemoteMaxWant = event.Hello.MaxWant
 			if peer.RemoteNodeID == "" {
 				peer.RemoteNodeID = event.Hello.NodeID
 				debug = pm.peerDebugLogger(peer)
@@ -444,8 +445,8 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 				return errors.New("gossipv1: summary before hello")
 			}
 			if event.Summary != nil {
-				count, sample, hash := gossipv1.ItemIDSample(event.Summary.Have, debugItemSampleLimit)
-				debug.Log("in", gossipv1.FrameTypeSummary, "summary_received", "transport_ok", true, "protocol_ok", true, "item_count", event.Summary.ItemCount, "bloom_bytes", len(event.Summary.BloomFilter), "have_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
+				count, sample, hash := gossipv1.ItemIDSample(event.Summary.PreviewItemIDs, debugItemSampleLimit)
+				debug.Log("in", gossipv1.FrameTypeSummary, "summary_received", "transport_ok", true, "protocol_ok", true, "item_count", event.Summary.ItemCount, "bloom_bytes", len(event.Summary.BloomFilter), "preview_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "preview_cursor", event.Summary.PreviewCursor)
 			}
 			if err := pm.handleSummary(peer, event); err != nil {
 				debug.Log("in", gossipv1.FrameTypeSummary, "summary_handle_failed", "protocol_ok", false, "err", err)
@@ -772,10 +773,10 @@ func firstFatal(events []gossipv1.Event) error {
 	return nil
 }
 
-func summaryHaveFromPayload(payload any) []string {
+func summaryPreviewFromPayload(payload any) []string {
 	switch typed := payload.(type) {
 	case map[string]any:
-		raw, ok := typed["have"]
+		raw, ok := typed["preview_item_ids"]
 		if !ok {
 			return nil
 		}
@@ -828,11 +829,12 @@ func (pm *PeerManager) sendEnvelope(peer *Peer, frameType string, payload any) e
 	metadata := make([]any, 0, 10)
 	switch frameType {
 	case gossipv1.FrameTypeSummary:
-		have := summaryHaveFromPayload(payload)
-		if len(have) > 0 {
-			count, sample, hash := gossipv1.ItemIDSample(have, debugItemSampleLimit)
+		preview := summaryPreviewFromPayload(payload)
+		if len(preview) > 0 {
+			count, sample, hash := gossipv1.ItemIDSample(preview, debugItemSampleLimit)
 			metadata = append(metadata,
 				"item_count", count,
+				"preview_count", count,
 				"item_ids_sample", sample,
 				"item_ids_hash", hash,
 			)
@@ -910,27 +912,31 @@ func (pm *PeerManager) sendSummary(peer *Peer) error {
 		return nil
 	}
 
-	have, err := pm.listSummaryHaveIDs(context.Background())
+	eligibleIDs, err := pm.listSummaryEligibleIDs(context.Background())
 	if err != nil {
 		debug.Log("local", gossipv1.FrameTypeSummary, "summary_inventory_failed", "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
-	canonicalSummary := gossipv1.BuildSummaryPayload(have)
-	count, sample, hash := gossipv1.ItemIDSample(have, debugItemSampleLimit)
+	preview := append([]string(nil), eligibleIDs...)
+	if uint64(len(preview)) > gossipv1.MaxSummaryPreviewItems {
+		preview = preview[:gossipv1.MaxSummaryPreviewItems]
+	}
+	canonicalSummary := gossipv1.BuildSummaryPreviewPayload(eligibleIDs, preview, "")
+	canonicalSummary.ItemCount = uint64(len(eligibleIDs))
+	count, sample, hash := gossipv1.ItemIDSample(canonicalSummary.PreviewItemIDs, debugItemSampleLimit)
 	debug.Log(
 		"out",
 		gossipv1.FrameTypeSummary,
 		"summary_constructed",
-		"summary_path", "federation.sendSummary:listSummaryHaveIDs->legacy_have_frame",
-		"canonical_builder", "gossipv1.BuildSummaryPayload",
-		"source_inventory_count", len(have),
+		"summary_path", "federation.sendSummary:envelope_store->summary_preview",
+		"source_inventory_count", len(canonicalSummary.PreviewItemIDs),
 		"item_count", canonicalSummary.ItemCount,
 		"bloom_bytes", len(canonicalSummary.BloomFilter),
 		"item_ids_sample", sample,
 		"item_ids_hash", hash,
-		"have_count", count,
+		"preview_count", count,
 	)
-	if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, map[string]any{"have": have}); err != nil {
+	if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, canonicalSummary); err != nil {
 		return err
 	}
 	debug.Log("local", gossipv1.FrameTypeSummary, "summary_state", "state", "sent_once")
@@ -944,7 +950,10 @@ func (pm *PeerManager) handleSummary(peer *Peer, event gossipv1.Event) error {
 	if event.Summary == nil {
 		return errors.New("gossipv1: summary event missing payload")
 	}
-	want, err := pm.computeMissingWant(context.Background(), event.Summary.Have)
+	if err := validateSummaryPreviewCursor(event.Summary.PreviewItemIDs, event.Summary.PreviewCursor); err != nil {
+		return err
+	}
+	want, err := pm.computeMissingWant(context.Background(), event.Summary, nil, peer.RemoteMaxWant)
 	if err != nil {
 		debug.Log("in", gossipv1.FrameTypeSummary, "summary_compute_want_failed", "protocol_ok", false, "store_ok", false, "err", err)
 		return err
@@ -1045,7 +1054,7 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 	}
 
 	if len(receipt.Accepted) > 1 {
-		sort.Strings(receipt.Accepted)
+		gossipv1.SortDigestHexIDs(receipt.Accepted)
 	}
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, debugItemSampleLimit)
 	rejectedIDs := make([]string, 0, len(receipt.Rejected))
@@ -1074,79 +1083,130 @@ func (pm *PeerManager) handleReceipt(peer *Peer, event gossipv1.Event) error {
 	return nil
 }
 
-func (pm *PeerManager) listSummaryHaveIDs(ctx context.Context) ([]string, error) {
-	if pm.store == nil {
+func (pm *PeerManager) listSummaryEligibleIDs(ctx context.Context) ([]string, error) {
+	if pm.envelopeStore == nil {
+		return nil, errors.New("federation: envelope store is required for summary preview inventory")
+	}
+
+	return pm.envelopeStore.GetAllEnvelopeIDs(ctx)
+}
+
+func (pm *PeerManager) computeMissingWant(ctx context.Context, summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64) ([]string, error) {
+	if summary == nil {
 		return []string{}, nil
 	}
 
-	recipients, err := pm.store.GetAllRecipientIDs(ctx)
+	previewIDs, err := gossipv1.NormalizeDigestHexIDs(summary.PreviewItemIDs)
 	if err != nil {
 		return nil, err
 	}
+	bloom := summary.BloomFilter
 
-	seen := make(map[string]struct{})
-	have := make([]string, 0)
-	for _, recipientID := range recipients {
-		ids, err := pm.store.GetAllQueuedMessageIDs(ctx, recipientID)
-		if err != nil {
-			return nil, err
-		}
-		for _, id := range ids {
-			if id == "" {
-				continue
-			}
-			if _, exists := seen[id]; exists {
-				continue
-			}
-			seen[id] = struct{}{}
-			have = append(have, id)
-		}
+	limit := int(gossipv1.MaxWantItems)
+	if peerMaxWant > 0 && peerMaxWant < uint64(limit) {
+		limit = int(peerMaxWant)
 	}
-
-	if len(have) > 1 {
-		sort.Strings(have)
-	}
-	if uint64(len(have)) > gossipv1.MaxSummaryItems {
-		have = have[:gossipv1.MaxSummaryItems]
-	}
-
-	return have, nil
-}
-
-func (pm *PeerManager) computeMissingWant(ctx context.Context, have []string) ([]string, error) {
-	if pm.store == nil {
-		return []string{}, nil
-	}
-	if len(have) == 0 {
+	if limit <= 0 {
 		return []string{}, nil
 	}
 
-	want := make([]string, 0, len(have))
-	for _, id := range have {
-		if id == "" {
+	want := make([]string, 0, limit)
+	seenWant := make(map[string]struct{}, limit)
+	for _, id := range previewIDs {
+		if _, duplicate := seenWant[id]; duplicate {
 			continue
 		}
-		msg, err := pm.store.GetMessageByID(ctx, id)
-		if err != nil {
-			if isNotFoundError(err) {
-				want = append(want, id)
-				continue
-			}
-			return nil, err
+		if !gossipv1.BloomFilterMightContain(bloom, id) {
+			continue
 		}
-		if msg == nil {
-			want = append(want, id)
+
+		known, knownErr := pm.hasObjectID(ctx, id)
+		if knownErr != nil {
+			return nil, knownErr
+		}
+		if known {
+			continue
+		}
+
+		seenWant[id] = struct{}{}
+		want = append(want, id)
+		if len(want) >= limit {
+			gossipv1.SortDigestHexIDs(want)
+			return want, nil
 		}
 	}
 
-	if len(want) > 1 {
-		sort.Strings(want)
+	normalizedCandidates, err := gossipv1.NormalizeDigestHexIDs(candidateIDs)
+	if err != nil {
+		return nil, err
 	}
-	if uint64(len(want)) > gossipv1.MaxWantItems {
-		want = want[:gossipv1.MaxWantItems]
+	for _, id := range normalizedCandidates {
+		if _, duplicate := seenWant[id]; duplicate {
+			continue
+		}
+		if !gossipv1.BloomFilterMightContain(bloom, id) {
+			continue
+		}
+
+		known, knownErr := pm.hasObjectID(ctx, id)
+		if knownErr != nil {
+			return nil, knownErr
+		}
+		if known {
+			continue
+		}
+
+		seenWant[id] = struct{}{}
+		want = append(want, id)
+		if len(want) >= limit {
+			break
+		}
 	}
 
+	gossipv1.SortDigestHexIDs(want)
 	return want, nil
+}
+
+func (pm *PeerManager) hasObjectID(ctx context.Context, id string) (bool, error) {
+	if pm.envelopeStore != nil {
+		envelope, err := pm.envelopeStore.GetEnvelopeByID(ctx, id)
+		if err != nil {
+			if !isNotFoundError(err) {
+				return false, err
+			}
+		} else if envelope != nil {
+			return true, nil
+		}
+	}
+	if pm.store == nil {
+		return false, nil
+	}
+
+	msg, err := pm.store.GetMessageByID(ctx, id)
+	if err != nil {
+		if isNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return msg != nil, nil
+}
+
+func validateSummaryPreviewCursor(previewIDs []string, previewCursor string) error {
+	if len(previewIDs) == 0 {
+		if previewCursor != "" {
+			return errors.New("gossipv1: summary preview_cursor must be absent when preview_item_ids is empty")
+		}
+		return nil
+	}
+
+	if previewCursor == "" {
+		return errors.New("gossipv1: summary preview_cursor is required when preview_item_ids are present")
+	}
+	if previewCursor != previewIDs[len(previewIDs)-1] {
+		return errors.New("gossipv1: summary preview_cursor must equal last preview_item_ids element")
+	}
+	return nil
 }
 
 func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string, debug gossipv1.DebugSessionLogger) ([]gossipv1.TransferObject, []string, error) {
@@ -1162,39 +1222,24 @@ func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string, 
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "max_transfer_limit_reached", "store_ok", true)
 			break
 		}
-		if id == "" {
-			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "empty_item_id", "store_ok", true)
-			continue
-		}
 
-		msg, err := pm.store.GetMessageByID(ctx, id)
+		object, found, err := pm.loadTransferObjectByItemID(ctx, id)
 		if err != nil {
-			if isNotFoundError(err) {
-				debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "missing", "reason", "not_found", "store_ok", true)
-				continue
-			}
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "lookup_failed", "store_ok", false, "err", err)
 			return nil, nil, err
 		}
-		if msg == nil {
+		if !found {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "missing", "reason", "nil_message", "store_ok", true)
 			continue
 		}
-		if !msg.ExpiresAt.After(now) {
+		if !time.Unix(object.ExpiresAt, 0).UTC().After(now) {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "expired", "store_ok", true)
 			continue
 		}
 
-		objects = append(objects, gossipv1.TransferObject{
-			ID:         msg.ID,
-			From:       msg.From,
-			To:         msg.To,
-			PayloadB64: msg.Payload,
-			CreatedAt:  msg.CreatedAt.UTC().Unix(),
-			ExpiresAt:  msg.ExpiresAt.UTC().Unix(),
-		})
-		ids = append(ids, msg.ID)
-		debug.LogItem("out", gossipv1.FrameTypeTransfer, msg.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
+		objects = append(objects, object)
+		ids = append(ids, object.ID)
+		debug.LogItem("out", gossipv1.FrameTypeTransfer, object.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
 	}
 
 	return objects, ids, nil
@@ -1203,6 +1248,9 @@ func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string, 
 func transferObjectToMessage(object gossipv1.TransferObject) (*model.Message, error) {
 	if object.ID == "" {
 		return nil, errors.New("id is required")
+	}
+	if !gossipv1.IsDigestHexID(object.ID) {
+		return nil, errors.New("id must be 64 lowercase hex chars")
 	}
 	if object.From == "" {
 		return nil, errors.New("from is required")
@@ -1221,6 +1269,9 @@ func transferObjectToMessage(object gossipv1.TransferObject) (*model.Message, er
 	}
 	if object.ExpiresAt <= object.CreatedAt {
 		return nil, errors.New("expires_at must be greater than created_at")
+	}
+	if object.ID != gossipv1.ComputeTransferObjectItemID(object) {
+		return nil, errors.New("id must equal sha256(canonical envelope bytes)")
 	}
 
 	createdAt := time.Unix(object.CreatedAt, 0).UTC()
@@ -1250,6 +1301,54 @@ func relayForwardErrorReason(err error) string {
 	}
 }
 
+func canonicalTransferObjectFromMessage(msg *model.Message) (gossipv1.TransferObject, bool) {
+	if msg == nil {
+		return gossipv1.TransferObject{}, false
+	}
+	if !gossipv1.IsDigestHexID(msg.ID) {
+		return gossipv1.TransferObject{}, false
+	}
+
+	createdAt := msg.CreatedAt.UTC().Unix()
+	expiresAt := msg.ExpiresAt.UTC().Unix()
+	if msg.ID != gossipv1.ComputeItemID(msg.From, msg.To, msg.Payload, createdAt, expiresAt) {
+		return gossipv1.TransferObject{}, false
+	}
+
+	return gossipv1.TransferObject{
+		ID:         msg.ID,
+		From:       msg.From,
+		To:         msg.To,
+		PayloadB64: msg.Payload,
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
+	}, true
+}
+
+func (pm *PeerManager) loadTransferObjectByItemID(ctx context.Context, itemID string) (gossipv1.TransferObject, bool, error) {
+	if !gossipv1.IsDigestHexID(itemID) {
+		return gossipv1.TransferObject{}, false, nil
+	}
+
+	msg, err := pm.store.GetMessageByID(ctx, itemID)
+	if err != nil {
+		if isNotFoundError(err) {
+			return gossipv1.TransferObject{}, false, nil
+		}
+		return gossipv1.TransferObject{}, false, err
+	}
+	if msg == nil {
+		return gossipv1.TransferObject{}, false, nil
+	}
+
+	object, ok := canonicalTransferObjectFromMessage(msg)
+	if !ok {
+		return gossipv1.TransferObject{}, false, nil
+	}
+
+	return object, true, nil
+}
+
 func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) error {
 	if len(ids) == 0 {
 		return nil
@@ -1261,6 +1360,9 @@ func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) 
 		if id == "" {
 			continue
 		}
+		if !gossipv1.IsDigestHexID(id) {
+			continue
+		}
 		if _, ok := seen[id]; ok {
 			continue
 		}
@@ -1270,27 +1372,24 @@ func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) 
 	if len(have) == 0 {
 		return nil
 	}
-	if len(have) > 1 {
-		sort.Strings(have)
-	}
-	if uint64(len(have)) > gossipv1.MaxSummaryItems {
-		have = have[:gossipv1.MaxSummaryItems]
+	have, _ = gossipv1.NormalizeDigestHexIDs(have)
+	if uint64(len(have)) > gossipv1.MaxSummaryPreviewItems {
+		have = have[:gossipv1.MaxSummaryPreviewItems]
 	}
 
-	canonicalSummary := gossipv1.BuildSummaryPayload(have)
-	haveCount, haveSample, haveHash := gossipv1.ItemIDSample(have, debugItemSampleLimit)
+	canonicalSummary := gossipv1.BuildSummaryPreviewPayload(have, have, "")
+	haveCount, haveSample, haveHash := gossipv1.ItemIDSample(canonicalSummary.PreviewItemIDs, debugItemSampleLimit)
 	gossipv1.NewDebugSessionLogger("federation-summary-forward", originNodeID).Log(
 		"out",
 		gossipv1.FrameTypeSummary,
 		"summary_constructed",
-		"summary_path", "federation.forwardSummaryToPeers:ids->legacy_have_frame",
-		"canonical_builder", "gossipv1.BuildSummaryPayload",
-		"source_inventory_count", len(have),
+		"summary_path", "federation.forwardSummaryToPeers:ids->summary_preview",
+		"source_inventory_count", len(canonicalSummary.PreviewItemIDs),
 		"item_count", canonicalSummary.ItemCount,
 		"bloom_bytes", len(canonicalSummary.BloomFilter),
 		"item_ids_sample", haveSample,
 		"item_ids_hash", haveHash,
-		"have_count", haveCount,
+		"preview_count", haveCount,
 	)
 
 	pm.peersMu.RLock()
@@ -1308,7 +1407,7 @@ func (pm *PeerManager) forwardSummaryToPeers(ids []string, originNodeID string) 
 
 	for _, peer := range peers {
 		debug := pm.peerDebugLogger(peer)
-		if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, map[string]any{"have": have}); err != nil {
+		if err := pm.sendEnvelope(peer, gossipv1.FrameTypeSummary, canonicalSummary); err != nil {
 			log.Printf("federation: failed forwarding summary to peer=%s err=%v", peer.ID, err)
 			debug.Log("out", gossipv1.FrameTypeSummary, "summary_forward_failed", "transport_ok", false, "protocol_ok", true, "store_ok", true, "err", err)
 			continue

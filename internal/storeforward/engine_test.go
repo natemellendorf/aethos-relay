@@ -138,6 +138,14 @@ func (s *ingestEnvelopeStoreSpy) GetEnvelopesByDestination(ctx context.Context, 
 	return nil, nil
 }
 
+func (s *ingestEnvelopeStoreSpy) GetEnvelopeIDsByDestinationPage(ctx context.Context, destID string, afterCursor string, limit int) ([]string, string, int, []string, error) {
+	return nil, "", 0, nil, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) GetAllEnvelopeIDs(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+
 func (s *ingestEnvelopeStoreSpy) RemoveEnvelope(ctx context.Context, envID string) error {
 	delete(s.envelopes, envID)
 	delete(s.seenByEnvelopeRelay, envID)
@@ -649,15 +657,21 @@ func TestCurrentExpiryBehaviorForPullAndEnvelopeSweep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep envelopes: %v", err)
 	}
-	if removed != 1 {
-		t.Fatalf("expected exactly one expired envelope removed, got %d", removed)
+	if removed != 2 {
+		t.Fatalf("expected exactly two expired envelopes removed, got %d", removed)
 	}
 
 	if _, err := h.envelopeStore.GetEnvelopeByID(context.Background(), "env-expired"); err == nil {
 		t.Fatal("expired envelope should be removed after sweep")
 	}
+	if _, err := h.envelopeStore.GetEnvelopeByID(context.Background(), "expired-msg"); err == nil {
+		t.Fatal("expired message-derived envelope should be removed after sweep")
+	}
 	if _, err := h.envelopeStore.GetEnvelopeByID(context.Background(), "env-active"); err != nil {
 		t.Fatalf("active envelope should remain after sweep: %v", err)
+	}
+	if _, err := h.envelopeStore.GetEnvelopeByID(context.Background(), "active-msg"); err != nil {
+		t.Fatalf("active message-derived envelope should remain after sweep: %v", err)
 	}
 }
 
