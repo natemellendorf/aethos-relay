@@ -471,7 +471,7 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 			if event.Transfer != nil {
 				transferIDs := make([]string, 0, len(event.Transfer.Objects))
 				for _, indexed := range event.Transfer.Objects {
-					transferIDs = append(transferIDs, indexed.Object.ID)
+					transferIDs = append(transferIDs, indexed.Object.ItemID)
 				}
 				count, sample, hash := gossipv1.ItemIDSample(transferIDs, debugItemSampleLimit)
 				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_received", "transport_ok", true, "protocol_ok", true, "object_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "parse_rejected_count", len(event.Transfer.Rejected))
@@ -486,12 +486,7 @@ func (pm *PeerManager) processEvents(peer *Peer, adapter *gossipv1.SessionAdapte
 			}
 			if event.Receipt != nil {
 				acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, debugItemSampleLimit)
-				rejectedIDs := make([]string, 0, len(event.Receipt.Rejected))
-				for _, rejected := range event.Receipt.Rejected {
-					rejectedIDs = append(rejectedIDs, rejected.ID)
-				}
-				rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
-				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_received", "transport_ok", true, "protocol_ok", true, "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
+				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_received", "transport_ok", true, "protocol_ok", true, "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
 			}
 			if err := pm.handleReceipt(peer, event); err != nil {
 				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
@@ -852,7 +847,7 @@ func (pm *PeerManager) sendEnvelope(peer *Peer, frameType string, payload any) e
 		if transfer, ok := payload.(gossipv1.TransferPayload); ok {
 			ids := make([]string, 0, len(transfer.Objects))
 			for _, object := range transfer.Objects {
-				ids = append(ids, object.ID)
+				ids = append(ids, object.ItemID)
 			}
 			count, sample, hash := gossipv1.ItemIDSample(ids, debugItemSampleLimit)
 			metadata = append(metadata,
@@ -864,19 +859,11 @@ func (pm *PeerManager) sendEnvelope(peer *Peer, frameType string, payload any) e
 	case gossipv1.FrameTypeReceipt:
 		if receipt, ok := payload.(gossipv1.ReceiptPayload); ok {
 			acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, debugItemSampleLimit)
-			rejectedIDs := make([]string, 0, len(receipt.Rejected))
-			for _, rejected := range receipt.Rejected {
-				rejectedIDs = append(rejectedIDs, rejected.ID)
-			}
-			rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
 			metadata = append(metadata,
-				"item_count", acceptedCount+rejectedCount,
+				"item_count", acceptedCount,
 				"accepted_count", acceptedCount,
 				"accepted_item_ids_sample", acceptedSample,
 				"accepted_item_ids_hash", acceptedHash,
-				"rejected_count", rejectedCount,
-				"rejected_item_ids_sample", rejectedSample,
-				"rejected_item_ids_hash", rejectedHash,
 			)
 		}
 	}
@@ -953,7 +940,7 @@ func (pm *PeerManager) handleSummary(peer *Peer, event gossipv1.Event) error {
 	if err := validateSummaryPreviewCursor(event.Summary.PreviewItemIDs, event.Summary.PreviewCursor); err != nil {
 		return err
 	}
-	want, err := pm.computeMissingWant(context.Background(), event.Summary, nil, peer.RemoteMaxWant)
+	want, err := pm.computeMissingWant(context.Background(), event.Summary, nil, peer.RemoteMaxWant, debug)
 	if err != nil {
 		debug.Log("in", gossipv1.FrameTypeSummary, "summary_compute_want_failed", "protocol_ok", false, "store_ok", false, "err", err)
 		return err
@@ -1008,48 +995,51 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 
 	receipt := gossipv1.ReceiptPayload{
 		Accepted: make([]string, 0, len(event.Transfer.Objects)),
-		Rejected: append([]gossipv1.TransferObjectRejection(nil), event.Transfer.Rejected...),
+	}
+
+	for _, rejected := range event.Transfer.Rejected {
+		fields := []any{"object_index", rejected.Index, "item_id", rejected.ID, "reason", rejected.Reason, "detail", rejected.Detail}
+		fields = append(fields, gossipv1.TransferObjectDiagnosticLogKV(rejected.Diagnostic)...)
+		fields = append(fields, "store_ok", false)
+		debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", fields...)
+	}
+
+	rejectedIDs := make([]string, 0, len(event.Transfer.Rejected))
+	for _, rejected := range event.Transfer.Rejected {
+		rejectedIDs = append(rejectedIDs, rejected.ID)
 	}
 
 	for _, indexed := range event.Transfer.Objects {
 		msg, err := transferObjectToMessage(indexed.Object)
 		if err != nil {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", err.Error(), "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
-				Index:  indexed.Index,
-				ID:     indexed.Object.ID,
-				Reason: err.Error(),
-			})
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "reason", "policy_reject", "detail", err.Error(), "store_ok", false)
+			rejectedIDs = append(rejectedIDs, indexed.Object.ItemID)
 			continue
 		}
 
 		result, err := pm.engine.AcceptRelayForward(traceCtx, peer.RemoteNodeID, msg, relayForwardMaxPayloadBytes)
 		if err != nil {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", relayForwardErrorReason(err), "store_ok", false, "err", err)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
-				Index:  indexed.Index,
-				ID:     indexed.Object.ID,
-				Reason: relayForwardErrorReason(err),
-			})
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "reason", "ingest_failed", "detail", relayForwardErrorReason(err), "store_ok", false, "err", err)
+			rejectedIDs = append(rejectedIDs, indexed.Object.ItemID)
 			continue
 		}
 
 		switch result.Status {
 		case storeforward.RelayForwardAccepted, storeforward.RelayForwardDuplicate, storeforward.RelayForwardSeenLoop:
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_accepted", "decision", result.Status, "store_ok", true)
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", msg.ID, "store_ok", true)
 			receipt.Accepted = append(receipt.Accepted, msg.ID)
 		case storeforward.RelayForwardExpired:
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "object already expired", "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "object already expired"})
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", msg.ID, "reason", "policy_reject", "detail", "object already expired", "store_ok", false)
+			rejectedIDs = append(rejectedIDs, msg.ID)
 		case storeforward.RelayForwardTooLarge:
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "payload exceeds relay limit", "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "payload exceeds relay limit"})
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", msg.ID, "reason", "policy_reject", "detail", "payload exceeds relay limit", "store_ok", false)
+			rejectedIDs = append(rejectedIDs, msg.ID)
 		case storeforward.RelayForwardInvalid:
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "invalid transfer object", "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "invalid transfer object"})
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", msg.ID, "reason", "policy_reject", "detail", "invalid transfer object", "store_ok", false)
+			rejectedIDs = append(rejectedIDs, msg.ID)
 		default:
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "transfer_object_rejected", "decision", "rejected", "reason", "relay forward rejected", "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{Index: indexed.Index, ID: msg.ID, Reason: "relay forward rejected"})
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", msg.ID, "reason", "ingest_failed", "detail", "relay forward rejected", "store_ok", false)
+			rejectedIDs = append(rejectedIDs, msg.ID)
 		}
 	}
 
@@ -1057,10 +1047,6 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 		gossipv1.SortDigestHexIDs(receipt.Accepted)
 	}
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, debugItemSampleLimit)
-	rejectedIDs := make([]string, 0, len(receipt.Rejected))
-	for _, rejected := range receipt.Rejected {
-		rejectedIDs = append(rejectedIDs, rejected.ID)
-	}
 	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
 	debug.Log("out", gossipv1.FrameTypeReceipt, "receipt_constructed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
 
@@ -1074,12 +1060,7 @@ func (pm *PeerManager) handleReceipt(peer *Peer, event gossipv1.Event) error {
 		return errors.New("gossipv1: receipt event missing payload")
 	}
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, debugItemSampleLimit)
-	rejectedIDs := make([]string, 0, len(event.Receipt.Rejected))
-	for _, rejected := range event.Receipt.Rejected {
-		rejectedIDs = append(rejectedIDs, rejected.ID)
-	}
-	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, debugItemSampleLimit)
-	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash, "store_ok", true)
+	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "store_ok", true)
 	return nil
 }
 
@@ -1091,9 +1072,21 @@ func (pm *PeerManager) listSummaryEligibleIDs(ctx context.Context) ([]string, er
 	return pm.envelopeStore.GetAllEnvelopeIDs(ctx)
 }
 
-func (pm *PeerManager) computeMissingWant(ctx context.Context, summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64) ([]string, error) {
+func (pm *PeerManager) computeMissingWant(ctx context.Context, summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64, debugLoggers ...gossipv1.DebugSessionLogger) ([]string, error) {
 	if summary == nil {
 		return []string{}, nil
+	}
+
+	debugEnabled := gossipv1.DebugLoggingEnabled() && len(debugLoggers) > 0
+	var debug gossipv1.DebugSessionLogger
+	if debugEnabled {
+		debug = debugLoggers[0]
+	}
+	logDecision := func(source string, itemID string, reason string) {
+		if !debugEnabled {
+			return
+		}
+		debug.LogItem("local", gossipv1.FrameTypeRequest, itemID, "want_decision", "source", source, "reason", reason)
 	}
 
 	previewIDs, err := gossipv1.NormalizeDigestHexIDs(summary.PreviewItemIDs)
@@ -1114,23 +1107,29 @@ func (pm *PeerManager) computeMissingWant(ctx context.Context, summary *gossipv1
 	seenWant := make(map[string]struct{}, limit)
 	for _, id := range previewIDs {
 		if _, duplicate := seenWant[id]; duplicate {
+			logDecision("preview", id, "duplicate_selected")
 			continue
 		}
 		if !gossipv1.BloomFilterMightContain(bloom, id) {
+			logDecision("preview", id, "bloom_miss")
 			continue
 		}
 
 		known, knownErr := pm.hasObjectID(ctx, id)
 		if knownErr != nil {
+			logDecision("preview", id, "known_lookup_error")
 			return nil, knownErr
 		}
 		if known {
+			logDecision("preview", id, "already_have")
 			continue
 		}
+		logDecision("preview", id, "selected")
 
 		seenWant[id] = struct{}{}
 		want = append(want, id)
 		if len(want) >= limit {
+			logDecision("preview", id, "limit_reached")
 			gossipv1.SortDigestHexIDs(want)
 			return want, nil
 		}
@@ -1142,23 +1141,29 @@ func (pm *PeerManager) computeMissingWant(ctx context.Context, summary *gossipv1
 	}
 	for _, id := range normalizedCandidates {
 		if _, duplicate := seenWant[id]; duplicate {
+			logDecision("candidate", id, "duplicate_selected")
 			continue
 		}
 		if !gossipv1.BloomFilterMightContain(bloom, id) {
+			logDecision("candidate", id, "bloom_miss")
 			continue
 		}
 
 		known, knownErr := pm.hasObjectID(ctx, id)
 		if knownErr != nil {
+			logDecision("candidate", id, "known_lookup_error")
 			return nil, knownErr
 		}
 		if known {
+			logDecision("candidate", id, "already_have")
 			continue
 		}
+		logDecision("candidate", id, "selected")
 
 		seenWant[id] = struct{}{}
 		want = append(want, id)
 		if len(want) >= limit {
+			logDecision("candidate", id, "limit_reached")
 			break
 		}
 	}
@@ -1232,59 +1237,75 @@ func (pm *PeerManager) buildTransferObjects(ctx context.Context, want []string, 
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "missing", "reason", "nil_message", "store_ok", true)
 			continue
 		}
-		if !time.Unix(object.ExpiresAt, 0).UTC().After(now) {
+		if object.ExpiryUnixMS <= uint64(now.UnixMilli()) {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, id, "request_service_decision", "decision", "skipped", "reason", "expired", "store_ok", true)
 			continue
 		}
 
 		objects = append(objects, object)
-		ids = append(ids, object.ID)
-		debug.LogItem("out", gossipv1.FrameTypeTransfer, object.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
+		ids = append(ids, object.ItemID)
+		debug.LogItem("out", gossipv1.FrameTypeTransfer, object.ItemID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
 	}
 
 	return objects, ids, nil
 }
 
 func transferObjectToMessage(object gossipv1.TransferObject) (*model.Message, error) {
-	if object.ID == "" {
-		return nil, errors.New("id is required")
+	if object.ItemID == "" {
+		return nil, errors.New("item_id is required")
 	}
-	if !gossipv1.IsDigestHexID(object.ID) {
-		return nil, errors.New("id must be 64 lowercase hex chars")
+	if !gossipv1.IsDigestHexID(object.ItemID) {
+		return nil, errors.New("item_id must be 64 lowercase hex chars")
 	}
-	if object.From == "" {
-		return nil, errors.New("from is required")
+	if object.HopCount > 65535 {
+		return nil, errors.New("hop_count must be <= 65535")
 	}
-	if object.To == "" {
-		return nil, errors.New("to is required")
+	envelope, err := gossipv1.DecodeItemEnvelopeB64(object.EnvelopeB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode envelope_b64: %w", err)
 	}
-	if object.PayloadB64 == "" {
-		return nil, errors.New("payload_b64 is required")
+	if envelope.To == "" {
+		return nil, errors.New("envelope destination is required")
 	}
-	if _, err := model.DecodePayloadB64(object.PayloadB64); err != nil {
+	if envelope.From == "" {
+		return nil, errors.New("envelope manifest/source is required")
+	}
+	if _, err := model.DecodePayloadB64(envelope.PayloadB64); err != nil {
 		return nil, errors.New("invalid payload_b64")
 	}
-	if object.CreatedAt <= 0 {
-		return nil, errors.New("created_at must be > 0")
+	if envelope.ExpiresAt <= envelope.CreatedAt {
+		if envelope.ExpiresAt > 0 {
+			return nil, errors.New("expires_at must be greater than created_at")
+		}
 	}
-	if object.ExpiresAt <= object.CreatedAt {
-		return nil, errors.New("expires_at must be greater than created_at")
+	if envelope.ExpiresAt > 0 && object.ExpiryUnixMS != uint64(envelope.ExpiresAt)*1000 {
+		return nil, errors.New("expiry_unix_ms must equal envelope expiry")
 	}
-	if object.ID != gossipv1.ComputeTransferObjectItemID(object) {
-		return nil, errors.New("id must equal sha256(canonical envelope bytes)")
+	if object.ItemID != gossipv1.ComputeTransferObjectItemID(object) {
+		return nil, errors.New("item_id must equal sha256(envelope bytes)")
 	}
 
-	createdAt := time.Unix(object.CreatedAt, 0).UTC()
-	expiresAt := time.Unix(object.ExpiresAt, 0).UTC()
+	now := time.Now().UTC()
+	createdAt := now
+	if envelope.CreatedAt > 0 {
+		createdAt = time.Unix(envelope.CreatedAt, 0).UTC()
+	}
+	expiresAt := time.UnixMilli(int64(object.ExpiryUnixMS)).UTC()
+	if envelope.ExpiresAt > 0 {
+		expiresAt = time.Unix(envelope.ExpiresAt, 0).UTC()
+	}
 	if !expiresAt.After(createdAt) {
-		return nil, errors.New("expires_at must be greater than created_at")
+		if !expiresAt.After(now) {
+			return nil, errors.New("object already expired")
+		}
+		createdAt = expiresAt.Add(-time.Second)
 	}
 
 	return &model.Message{
-		ID:        object.ID,
-		From:      object.From,
-		To:        object.To,
-		Payload:   object.PayloadB64,
+		ID:        object.ItemID,
+		From:      envelope.From,
+		To:        envelope.To,
+		Payload:   envelope.PayloadB64,
 		CreatedAt: createdAt,
 		ExpiresAt: expiresAt,
 	}, nil
@@ -1311,17 +1332,45 @@ func canonicalTransferObjectFromMessage(msg *model.Message) (gossipv1.TransferOb
 
 	createdAt := msg.CreatedAt.UTC().Unix()
 	expiresAt := msg.ExpiresAt.UTC().Unix()
+	if envelopeB64, err := gossipv1.EncodeTransferEnvelopeB64(msg.To, msg.From, msg.Payload); err == nil {
+		candidate := gossipv1.TransferObject{
+			ItemID:       msg.ID,
+			EnvelopeB64:  envelopeB64,
+			ExpiryUnixMS: uint64(msg.ExpiresAt.UTC().UnixMilli()),
+			HopCount:     0,
+			Envelope: gossipv1.ItemEnvelope{
+				From:       msg.From,
+				To:         msg.To,
+				PayloadB64: msg.Payload,
+				CreatedAt:  createdAt,
+				ExpiresAt:  expiresAt,
+			},
+		}
+		if gossipv1.ComputeTransferObjectItemID(candidate) == msg.ID {
+			return candidate, true
+		}
+	}
+
 	if msg.ID != gossipv1.ComputeItemID(msg.From, msg.To, msg.Payload, createdAt, expiresAt) {
+		return gossipv1.TransferObject{}, false
+	}
+	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(msg.From, msg.To, msg.Payload, createdAt, expiresAt)
+	if err != nil {
 		return gossipv1.TransferObject{}, false
 	}
 
 	return gossipv1.TransferObject{
-		ID:         msg.ID,
-		From:       msg.From,
-		To:         msg.To,
-		PayloadB64: msg.Payload,
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
+		ItemID:       msg.ID,
+		EnvelopeB64:  envelopeB64,
+		ExpiryUnixMS: uint64(msg.ExpiresAt.UTC().UnixMilli()),
+		HopCount:     0,
+		Envelope: gossipv1.ItemEnvelope{
+			From:       msg.From,
+			To:         msg.To,
+			PayloadB64: msg.Payload,
+			CreatedAt:  createdAt,
+			ExpiresAt:  expiresAt,
+		},
 	}, true
 }
 

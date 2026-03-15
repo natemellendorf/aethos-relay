@@ -2,42 +2,40 @@ package gossipv1
 
 import "testing"
 
-func TestSessionAdapterReceiptValidationEmptyReceiptWithPendingTransferFails(t *testing.T) {
+func TestSessionAdapterReceiptValidationEmptyReceiptWithPendingTransferPasses(t *testing.T) {
 	adapter := NewSessionAdapter(BuildRelayHello("relay-a"), true)
 	adapter.SetExpectedReceipt([]string{"msg-1"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
 		"received": []string{},
 	}))
-	if len(events) != 1 || events[0].Type != EventTypeFatal {
-		t.Fatalf("expected fatal empty receipt coverage event, got %#v", events)
+	if len(events) != 1 || events[0].Type != EventTypeReceipt {
+		t.Fatalf("expected receipt event for empty subset acknowledgement, got %#v", events)
 	}
 }
 
-func TestSessionAdapterReceiptValidationPartialReceiptWithPendingTransferFails(t *testing.T) {
+func TestSessionAdapterReceiptValidationPartialReceiptWithPendingTransferPasses(t *testing.T) {
 	adapter := NewSessionAdapter(BuildRelayHello("relay-a"), true)
 	adapter.SetExpectedReceipt([]string{"msg-1", "msg-2"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
 		"received": []string{"msg-1"},
 	}))
-	if len(events) != 1 || events[0].Type != EventTypeFatal {
-		t.Fatalf("expected fatal partial receipt coverage event, got %#v", events)
+	if len(events) != 1 || events[0].Type != EventTypeReceipt {
+		t.Fatalf("expected receipt event for partial subset acknowledgement, got %#v", events)
 	}
 }
 
-func TestSessionAdapterReceiptValidationRejectedEntryMissingIDAndIndexFails(t *testing.T) {
+func TestSessionAdapterReceiptValidationLegacyRejectedKeyFails(t *testing.T) {
 	adapter := NewSessionAdapter(BuildRelayHello("relay-a"), true)
 	adapter.SetExpectedReceipt([]string{"msg-1"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
 		"received": []string{},
-		"rejected": []map[string]any{{
-			"reason": "invalid transfer object",
-		}},
+		"rejected": []string{"legacy"},
 	}))
 	if len(events) != 1 || events[0].Type != EventTypeFatal {
-		t.Fatalf("expected fatal rejected coverage event, got %#v", events)
+		t.Fatalf("expected fatal legacy rejected payload event, got %#v", events)
 	}
 }
 
@@ -65,35 +63,12 @@ func TestSessionAdapterReceiptValidationUnknownAcceptedIDFails(t *testing.T) {
 	}
 }
 
-func TestSessionAdapterReceiptValidationRejectedIndexResolvesCoveragePasses(t *testing.T) {
-	adapter := NewSessionAdapter(BuildRelayHello("relay-a"), true)
-	adapter.SetExpectedReceipt([]string{"msg-1", "msg-2"})
-
-	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"received": []string{"msg-1"},
-		"rejected": []map[string]any{{
-			"index":  uint64(1),
-			"reason": "invalid transfer object",
-		}},
-	}))
-	if len(events) != 1 || events[0].Type != EventTypeReceipt {
-		t.Fatalf("expected receipt event with accepted+rejected full coverage, got %#v", events)
-	}
-}
-
 func TestSessionAdapterReceiptValidationDuplicateAcknowledgementFails(t *testing.T) {
 	adapter := NewSessionAdapter(BuildRelayHello("relay-a"), true)
 	adapter.SetExpectedReceipt([]string{"msg-1", "msg-2"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"received": []string{"msg-1"},
-		"rejected": []map[string]any{{
-			"id":     "msg-1",
-			"reason": "duplicate ack",
-		}, {
-			"id":     "msg-2",
-			"reason": "invalid transfer object",
-		}},
+		"received": []string{"msg-1", "msg-1"},
 	}))
 	if len(events) != 1 || events[0].Type != EventTypeFatal {
 		t.Fatalf("expected fatal duplicate ack event, got %#v", events)

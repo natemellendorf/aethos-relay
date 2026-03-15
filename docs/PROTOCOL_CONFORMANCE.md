@@ -47,6 +47,7 @@ These are implementation limits and defaults in `aethos-relay`. They are not the
 
 - CLI defaults and descriptions: run `go run ./cmd/relay/main.go -h`
 - Runtime startup values: inspect relay startup logs from `cmd/relay/main.go`
+- Runtime persisted-state visibility: inspect `store: startup inventory summary queue_recipients=<n> queued_items=<n> envelopes=<n>` in startup logs
 - Constant/fallback behavior: review `internal/federation/tar.go`, `internal/federation/peering.go`, and `internal/model/envelope.go`
 
 Environment variables are not currently used for these protocol constraint values.

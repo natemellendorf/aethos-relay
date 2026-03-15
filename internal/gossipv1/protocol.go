@@ -23,6 +23,7 @@ const (
 	MaxSummaryPreviewItems uint64 = 64
 	MaxWantItems           uint64 = 256
 	MaxTransferItems       uint64 = 32
+	MaxTransferBytes       uint64 = 524288
 	MaxReceiptItems        uint64 = MaxTransferItems
 	MaxRelayIngestItems    int    = 256
 	DigestHexBytes                = 32
@@ -83,12 +84,11 @@ type RequestPayload struct {
 }
 
 type TransferObject struct {
-	ID         string `cbor:"id"`
-	From       string `cbor:"from"`
-	To         string `cbor:"to"`
-	PayloadB64 string `cbor:"payload_b64"`
-	CreatedAt  int64  `cbor:"created_at"`
-	ExpiresAt  int64  `cbor:"expires_at"`
+	ItemID       string       `cbor:"item_id"`
+	EnvelopeB64  string       `cbor:"envelope_b64"`
+	ExpiryUnixMS uint64       `cbor:"expiry_unix_ms"`
+	HopCount     uint64       `cbor:"hop_count"`
+	Envelope     ItemEnvelope `cbor:"-"`
 }
 
 type TransferPayload struct {
@@ -96,10 +96,22 @@ type TransferPayload struct {
 }
 
 type TransferObjectRejection struct {
-	Index    uint64 `cbor:"index"`
-	ID       string `cbor:"id,omitempty"`
-	Reason   string `cbor:"reason"`
-	HasIndex bool   `cbor:"-"`
+	Index      uint64
+	ID         string
+	Reason     string
+	Detail     string
+	Diagnostic *TransferObjectDiagnostics
+}
+
+type TransferObjectDiagnostics struct {
+	Base64URLDecodeOK         bool
+	DecodedByteLen            int
+	DecodedFirstByteHex       string
+	DecodedBytesDigest        string
+	CBORDecodeOK              bool
+	CanonicalReencodeMatch    bool
+	CanonicalReencodeDigest   string
+	ItemIDMatchesDecodedBytes bool
 }
 
 type ParsedTransferPayload struct {
@@ -113,8 +125,7 @@ type IndexedTransferObject struct {
 }
 
 type ReceiptPayload struct {
-	Accepted []string                  `cbor:"received"`
-	Rejected []TransferObjectRejection `cbor:"rejected,omitempty"`
+	Accepted []string `cbor:"received"`
 }
 
 type canonicalItemEnvelope struct {
@@ -123,6 +134,20 @@ type canonicalItemEnvelope struct {
 	PayloadB64 string `cbor:"payload_b64"`
 	CreatedAt  int64  `cbor:"created_at"`
 	ExpiresAt  int64  `cbor:"expires_at"`
+}
+
+type canonicalTransferEnvelope struct {
+	ToWayfarerID []byte `cbor:"to_wayfarer_id"`
+	ManifestID   []byte `cbor:"manifest_id"`
+	Body         []byte `cbor:"body"`
+}
+
+type ItemEnvelope struct {
+	From       string
+	To         string
+	PayloadB64 string
+	CreatedAt  int64
+	ExpiresAt  int64
 }
 
 // IsDigestHexID reports whether value is a lowercase 64-hex digest ID.
@@ -155,7 +180,59 @@ func ComputeItemID(from string, to string, payloadB64 string, createdAt int64, e
 
 // ComputeTransferObjectItemID computes the content-address item_id for transfer object fields.
 func ComputeTransferObjectItemID(object TransferObject) string {
-	return ComputeItemID(object.From, object.To, object.PayloadB64, object.CreatedAt, object.ExpiresAt)
+	envelopeBytes, err := decodeBase64URLRaw(object.EnvelopeB64)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(envelopeBytes)
+	return hex.EncodeToString(digest[:])
+}
+
+func EncodeItemEnvelopeB64(from string, to string, payloadB64 string, createdAt int64, expiresAt int64) (string, error) {
+	envelope := canonicalItemEnvelope{From: from, To: to, PayloadB64: payloadB64, CreatedAt: createdAt, ExpiresAt: expiresAt}
+	encoded, err := canonicalEncMode.Marshal(envelope)
+	if err != nil {
+		return "", fmt.Errorf("gossipv1: encode item envelope: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded), nil
+}
+
+func DecodeItemEnvelopeB64(envelopeB64 string) (ItemEnvelope, error) {
+	envelopeBytes, err := decodeBase64URLRaw(envelopeB64)
+	if err != nil {
+		return ItemEnvelope{}, err
+	}
+	envelope, err := parseCanonicalItemEnvelope(envelopeBytes)
+	if err != nil {
+		return ItemEnvelope{}, err
+	}
+	return envelope, nil
+}
+
+func EncodeTransferEnvelopeB64(toWayfarerIDHex string, manifestIDHex string, bodyB64 string) (string, error) {
+	toBytes, err := decodeDigestHexBytes(toWayfarerIDHex)
+	if err != nil {
+		return "", fmt.Errorf("gossipv1: invalid to_wayfarer_id: %w", err)
+	}
+	manifestBytes, err := decodeDigestHexBytes(manifestIDHex)
+	if err != nil {
+		return "", fmt.Errorf("gossipv1: invalid manifest_id: %w", err)
+	}
+	body, err := decodeBase64URLRaw(bodyB64)
+	if err != nil {
+		return "", fmt.Errorf("gossipv1: invalid envelope body: %w", err)
+	}
+
+	envelope := canonicalTransferEnvelope{
+		ToWayfarerID: toBytes,
+		ManifestID:   manifestBytes,
+		Body:         body,
+	}
+	encoded, err := canonicalEncMode.Marshal(envelope)
+	if err != nil {
+		return "", fmt.Errorf("gossipv1: encode transfer envelope: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded), nil
 }
 
 func mustCanonicalItemEnvelopeBytes(from string, to string, payloadB64 string, createdAt int64, expiresAt int64) []byte {
@@ -527,38 +604,64 @@ func ParseTransferPayloadMixed(payload map[string]any) (ParsedTransferPayload, e
 	}
 
 	seenIDs := make(map[string]struct{}, len(objectsAny))
+	var transferBytes uint64
 	for idx, candidate := range objectsAny {
 		objMap, ok := coerceStringMap(candidate)
 		if !ok {
+			detail := "object must be map"
+			if keys := mapKeys(candidate); len(keys) > 0 {
+				detail = fmt.Sprintf("object must be map (keys=%s)", strings.Join(keys, ","))
+			}
 			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
-				Index:    uint64(idx),
-				Reason:   "object must be map",
-				HasIndex: true,
+				Index:  uint64(idx),
+				Reason: "unknown_parse_error",
+				Detail: detail,
 			})
 			continue
 		}
 
 		obj, err := parseTransferObject(objMap)
 		if err != nil {
+			reason := "unknown_parse_error"
+			detail := err.Error()
+			var diagnostic *TransferObjectDiagnostics
+			if parseErr, ok := err.(*transferParseError); ok {
+				reason = parseErr.reason
+				detail = parseErr.detail
+				diagnostic = parseErr.diagnostic
+			}
 			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
-				Index:    uint64(idx),
-				Reason:   err.Error(),
-				HasIndex: true,
+				Index:      uint64(idx),
+				ID:         transferObjectItemIDFromMap(objMap),
+				Reason:     reason,
+				Detail:     detail,
+				Diagnostic: diagnostic,
 			})
 			continue
 		}
 
-		if _, exists := seenIDs[obj.ID]; exists {
+		transferBytes += uint64(len(obj.EnvelopeB64))
+		if transferBytes > MaxTransferBytes {
 			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
-				Index:    uint64(idx),
-				ID:       obj.ID,
-				Reason:   "duplicate id in transfer frame",
-				HasIndex: true,
+				Index:  uint64(idx),
+				ID:     obj.ItemID,
+				Reason: "policy_reject",
+				Detail: fmt.Sprintf("transfer envelope bytes exceeds limit: %d > %d", transferBytes, MaxTransferBytes),
 			})
 			continue
 		}
 
-		seenIDs[obj.ID] = struct{}{}
+		if _, exists := seenIDs[obj.ItemID]; exists {
+			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
+				Index:  uint64(idx),
+				ID:     obj.ItemID,
+				Reason: "duplicate_item",
+				Detail: "duplicate item_id in transfer frame",
+			})
+			continue
+		}
+
+		seenIDs[obj.ItemID] = struct{}{}
 		parsed.Objects = append(parsed.Objects, IndexedTransferObject{Index: uint64(idx), Object: obj})
 	}
 
@@ -572,7 +675,6 @@ func ParseReceiptPayload(payload map[string]any) (ReceiptPayload, error) {
 
 	allowed := map[string]struct{}{
 		"received": {},
-		"rejected": {},
 	}
 	for key := range payload {
 		if _, ok := allowed[key]; !ok {
@@ -591,15 +693,7 @@ func ParseReceiptPayload(payload map[string]any) (ReceiptPayload, error) {
 		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt received exceeds limit: %d > %d", len(received), MaxReceiptItems)
 	}
 
-	rejected, err := parseReceiptRejected(payload)
-	if err != nil {
-		return ReceiptPayload{}, err
-	}
-	if uint64(len(rejected)) > MaxReceiptItems {
-		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt rejected exceeds limit: %d > %d", len(rejected), MaxReceiptItems)
-	}
-
-	return ReceiptPayload{Accepted: received, Rejected: rejected}, nil
+	return ReceiptPayload{Accepted: received}, nil
 }
 
 func ValidateHello(hello HelloPayload) error {
@@ -934,54 +1028,256 @@ func parseInt64(payload map[string]any, key string) (int64, error) {
 }
 
 func parseTransferObject(payload map[string]any) (TransferObject, error) {
+	diagnostic := &TransferObjectDiagnostics{}
+
 	allowed := map[string]struct{}{
-		"id":          {},
-		"from":        {},
-		"to":          {},
-		"payload_b64": {},
-		"created_at":  {},
-		"expires_at":  {},
+		"item_id":        {},
+		"envelope_b64":   {},
+		"expiry_unix_ms": {},
+		"hop_count":      {},
 	}
 	for key := range payload {
 		if _, ok := allowed[key]; !ok {
-			return TransferObject{}, fmt.Errorf("unknown transfer object field %q", key)
+			return TransferObject{}, newTransferParseError("unknown_parse_error", fmt.Sprintf("unknown transfer object field %q", key))
 		}
 	}
 
-	id, err := parseString(payload, "id")
+	itemID, err := parseString(payload, "item_id")
 	if err != nil {
-		return TransferObject{}, err
+		return TransferObject{}, classifyTransferFieldError("item_id", err)
 	}
-	from, err := parseString(payload, "from")
-	if err != nil {
-		return TransferObject{}, err
-	}
-	to, err := parseString(payload, "to")
-	if err != nil {
-		return TransferObject{}, err
-	}
-	payloadB64, err := parseString(payload, "payload_b64")
-	if err != nil {
-		return TransferObject{}, err
-	}
-	createdAt, err := parseInt64(payload, "created_at")
-	if err != nil {
-		return TransferObject{}, err
-	}
-	expiresAt, err := parseInt64(payload, "expires_at")
-	if err != nil {
-		return TransferObject{}, err
+	if !isDigestHex(itemID) {
+		return TransferObject{}, newTransferParseError("invalid_item_id", "item_id must be 64 lowercase hex chars")
 	}
 
-	if createdAt <= 0 {
-		return TransferObject{}, fmt.Errorf("created_at must be > 0")
+	envelopeB64, err := parseString(payload, "envelope_b64")
+	if err != nil {
+		return TransferObject{}, classifyTransferFieldError("envelope_b64", err)
 	}
-	if expiresAt <= createdAt {
-		return TransferObject{}, fmt.Errorf("expires_at must be greater than created_at")
+	envelopeBytes, err := decodeBase64URLRaw(envelopeB64)
+	if err != nil {
+		return TransferObject{}, newTransferParseError("invalid_envelope_encoding", err.Error(), diagnostic)
+	}
+	diagnostic.Base64URLDecodeOK = true
+	diagnostic.DecodedByteLen = len(envelopeBytes)
+	if len(envelopeBytes) > 0 {
+		diagnostic.DecodedFirstByteHex = fmt.Sprintf("%02x", envelopeBytes[0])
+	}
+	diagnostic.DecodedBytesDigest = shortDigestHex(envelopeBytes)
+
+	decodedDigest := sha256.Sum256(envelopeBytes)
+	if isDigestHex(itemID) {
+		diagnostic.ItemIDMatchesDecodedBytes = itemID == hex.EncodeToString(decodedDigest[:])
+	}
+
+	var decodedEnvelope any
+	if err := cbor.Unmarshal(envelopeBytes, &decodedEnvelope); err != nil {
+		return TransferObject{}, newTransferParseError("invalid_envelope_encoding", fmt.Sprintf("envelope_b64 cbor decode failed: %v", err), diagnostic)
+	}
+	diagnostic.CBORDecodeOK = true
+	reencodedEnvelope, err := canonicalEncMode.Marshal(decodedEnvelope)
+	if err != nil {
+		return TransferObject{}, newTransferParseError("invalid_envelope_encoding", fmt.Sprintf("envelope canonical re-encode failed: %v", err), diagnostic)
+	}
+	diagnostic.CanonicalReencodeMatch = bytes.Equal(envelopeBytes, reencodedEnvelope)
+	if !diagnostic.CanonicalReencodeMatch {
+		diagnostic.CanonicalReencodeDigest = shortDigestHex(reencodedEnvelope)
+		return TransferObject{}, newTransferParseError("invalid_envelope_encoding", "envelope_b64 must decode to canonical CBOR bytes", diagnostic)
+	}
+	envelope, err := parseCanonicalItemEnvelope(envelopeBytes)
+	if err != nil {
+		return TransferObject{}, newTransferParseError("policy_reject", err.Error(), diagnostic)
+	}
+
+	expiryUnixMS, err := parseUint(payload, "expiry_unix_ms")
+	if err != nil {
+		return TransferObject{}, classifyTransferFieldError("expiry_unix_ms", err)
+	}
+	if envelope.ExpiresAt > 0 {
+		expected := uint64(envelope.ExpiresAt) * 1000
+		if expiryUnixMS != expected {
+			return TransferObject{}, newTransferParseError("invalid_expiry_unix_ms", "expiry_unix_ms must equal envelope expiry")
+		}
+	}
+
+	hopCount, err := parseUint(payload, "hop_count")
+	if err != nil {
+		return TransferObject{}, classifyTransferFieldError("hop_count", err)
+	}
+	if hopCount > 65535 {
+		return TransferObject{}, newTransferParseError("invalid_hop_count", "hop_count must be <= 65535")
+	}
+
+	digest := sha256.Sum256(envelopeBytes)
+	computedID := hex.EncodeToString(digest[:])
+	if computedID != itemID {
+		return TransferObject{}, newTransferParseError("invalid_item_id", "item_id must equal sha256(envelope bytes)", diagnostic)
 	}
 
 	return TransferObject{
-		ID:         id,
+		ItemID:       itemID,
+		EnvelopeB64:  envelopeB64,
+		ExpiryUnixMS: expiryUnixMS,
+		HopCount:     hopCount,
+		Envelope: ItemEnvelope{
+			From:       envelope.From,
+			To:         envelope.To,
+			PayloadB64: envelope.PayloadB64,
+			CreatedAt:  envelope.CreatedAt,
+			ExpiresAt:  envelope.ExpiresAt,
+		},
+	}, nil
+}
+
+func shortDigestHex(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:6])
+}
+
+func transferObjectItemIDFromMap(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	raw, ok := payload["item_id"]
+	if !ok {
+		return ""
+	}
+	itemID, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	return itemID
+}
+
+func mapKeys(value any) []string {
+	ref := reflect.ValueOf(value)
+	if !ref.IsValid() || ref.Kind() != reflect.Map {
+		return nil
+	}
+	keys := make([]string, 0, ref.Len())
+	iter := ref.MapRange()
+	for iter.Next() {
+		key, ok := iter.Key().Interface().(string)
+		if !ok {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func decodeBase64URLRaw(value string) ([]byte, error) {
+	if value == "" {
+		return nil, fmt.Errorf("envelope_b64 must be non-empty")
+	}
+	if strings.Contains(value, "=") {
+		return nil, fmt.Errorf("envelope_b64 must be unpadded base64url")
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
+	if err != nil {
+		return nil, fmt.Errorf("envelope_b64 must be unpadded base64url: %w", err)
+	}
+	if len(decoded) == 0 {
+		return nil, fmt.Errorf("envelope_b64 must decode to non-empty bytes")
+	}
+	return decoded, nil
+}
+
+func isCanonicalCBOR(encoded []byte) bool {
+	var decoded any
+	if err := cbor.Unmarshal(encoded, &decoded); err != nil {
+		return false
+	}
+	reencoded, err := canonicalEncMode.Marshal(decoded)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(encoded, reencoded)
+}
+
+func parseCanonicalItemEnvelope(encoded []byte) (ItemEnvelope, error) {
+	var payload map[string]any
+	if err := cbor.Unmarshal(encoded, &payload); err != nil {
+		return ItemEnvelope{}, fmt.Errorf("decode envelope bytes: %w", err)
+	}
+
+	if _, hasToWayfarer := payload["to_wayfarer_id"]; hasToWayfarer {
+		toWayfarerID, err := parseBytes(payload, "to_wayfarer_id")
+		if err != nil {
+			return ItemEnvelope{}, err
+		}
+		if len(toWayfarerID) != DigestHexBytes {
+			return ItemEnvelope{}, fmt.Errorf("to_wayfarer_id must be 32 bytes")
+		}
+		manifestID, err := parseBytes(payload, "manifest_id")
+		if err != nil {
+			return ItemEnvelope{}, err
+		}
+		if len(manifestID) != DigestHexBytes {
+			return ItemEnvelope{}, fmt.Errorf("manifest_id must be 32 bytes")
+		}
+		body, err := parseBytes(payload, "body")
+		if err != nil {
+			return ItemEnvelope{}, err
+		}
+
+		return ItemEnvelope{
+			From:       hex.EncodeToString(manifestID),
+			To:         hex.EncodeToString(toWayfarerID),
+			PayloadB64: base64.RawURLEncoding.EncodeToString(body),
+		}, nil
+	}
+
+	from, err := parseString(payload, "from")
+	if err != nil {
+		return ItemEnvelope{}, err
+	}
+	to, err := parseString(payload, "to")
+	if err != nil {
+		return ItemEnvelope{}, err
+	}
+	payloadB64, err := parseString(payload, "payload_b64")
+	if err != nil {
+		return ItemEnvelope{}, err
+	}
+	createdAt, err := parseInt64(payload, "created_at")
+	if err != nil {
+		return ItemEnvelope{}, err
+	}
+	expiresAt, err := parseInt64(payload, "expires_at")
+	if err != nil {
+		return ItemEnvelope{}, err
+	}
+	if createdAt <= 0 {
+		return ItemEnvelope{}, fmt.Errorf("created_at must be > 0")
+	}
+	if expiresAt <= createdAt {
+		return ItemEnvelope{}, fmt.Errorf("expires_at must be greater than created_at")
+	}
+	if _, err := decodeBase64URLRaw(payloadB64); err != nil {
+		return ItemEnvelope{}, fmt.Errorf("invalid payload_b64 in envelope: %w", err)
+	}
+
+	envelope := canonicalItemEnvelope{
+		From:       from,
+		To:         to,
+		PayloadB64: payloadB64,
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
+	}
+	reencoded, err := canonicalEncMode.Marshal(envelope)
+	if err != nil {
+		return ItemEnvelope{}, fmt.Errorf("encode canonical envelope: %w", err)
+	}
+	if !bytes.Equal(encoded, reencoded) {
+		return ItemEnvelope{}, fmt.Errorf("envelope bytes are not canonical deterministic CBOR")
+	}
+
+	return ItemEnvelope{
 		From:       from,
 		To:         to,
 		PayloadB64: payloadB64,
@@ -990,67 +1286,76 @@ func parseTransferObject(payload map[string]any) (TransferObject, error) {
 	}, nil
 }
 
-func parseReceiptRejected(payload map[string]any) ([]TransferObjectRejection, error) {
-	raw, ok := payload["rejected"]
-	if !ok {
-		return nil, nil
+func decodeDigestHexBytes(value string) ([]byte, error) {
+	if !isDigestHex(value) {
+		return nil, fmt.Errorf("digest must be lowercase 64-hex chars")
 	}
-
-	items, ok := coerceAnySlice(raw)
-	if !ok {
-		return nil, fmt.Errorf("gossipv1: rejected must be array")
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return nil, err
 	}
+	return decoded, nil
+}
 
-	rejected := make([]TransferObjectRejection, 0, len(items))
-	for idx, item := range items {
-		mapped, ok := coerceStringMap(item)
-		if !ok {
-			return nil, fmt.Errorf("gossipv1: rejected[%d] must be map", idx)
-		}
+type transferParseError struct {
+	reason     string
+	detail     string
+	diagnostic *TransferObjectDiagnostics
+}
 
-		allowed := map[string]struct{}{
-			"index":  {},
-			"id":     {},
-			"reason": {},
-		}
-		for key := range mapped {
-			if _, ok := allowed[key]; !ok {
-				return nil, fmt.Errorf("gossipv1: unknown rejected field %q", key)
-			}
-		}
+func (e *transferParseError) Error() string {
+	return e.detail
+}
 
-		reason, err := parseString(mapped, "reason")
-		if err != nil {
-			return nil, err
-		}
-
-		entry := TransferObjectRejection{Reason: reason}
-		_, hasID := mapped["id"]
-		if hasID {
-			id, err := parseString(mapped, "id")
-			if err != nil {
-				return nil, err
-			}
-			entry.ID = id
-		}
-		_, hasIndex := mapped["index"]
-		if hasIndex {
-			parsedIdx, err := parseUint(mapped, "index")
-			if err != nil {
-				return nil, err
-			}
-			entry.Index = parsedIdx
-			entry.HasIndex = true
-		}
-
-		if !hasID && !hasIndex {
-			return nil, fmt.Errorf("gossipv1: rejected[%d] must include id or index", idx)
-		}
-
-		rejected = append(rejected, entry)
+func newTransferParseError(reason string, detail string, diagnostic ...*TransferObjectDiagnostics) *transferParseError {
+	var diag *TransferObjectDiagnostics
+	if len(diagnostic) > 0 {
+		diag = diagnostic[0]
 	}
+	return &transferParseError{reason: reason, detail: detail, diagnostic: diag}
+}
 
-	return rejected, nil
+func TransferObjectDiagnosticLogKV(diagnostic *TransferObjectDiagnostics) []any {
+	if diagnostic == nil {
+		diagnostic = &TransferObjectDiagnostics{}
+	}
+	return []any{
+		"diag_base64url_decode_ok", diagnostic.Base64URLDecodeOK,
+		"diag_decoded_byte_len", diagnostic.DecodedByteLen,
+		"diag_decoded_first_byte_hex", diagnostic.DecodedFirstByteHex,
+		"diag_decoded_bytes_digest", diagnostic.DecodedBytesDigest,
+		"diag_cbor_decode_ok", diagnostic.CBORDecodeOK,
+		"diag_canonical_reencode_match", diagnostic.CanonicalReencodeMatch,
+		"diag_canonical_reencode_digest", diagnostic.CanonicalReencodeDigest,
+		"diag_item_id_matches_decoded", diagnostic.ItemIDMatchesDecodedBytes,
+	}
+}
+
+func classifyTransferFieldError(field string, err error) error {
+	if strings.Contains(err.Error(), "missing") {
+		switch field {
+		case "item_id":
+			return newTransferParseError("missing_item_id", err.Error())
+		case "envelope_b64":
+			return newTransferParseError("missing_envelope_b64", err.Error())
+		case "expiry_unix_ms":
+			return newTransferParseError("invalid_expiry_unix_ms", err.Error())
+		case "hop_count":
+			return newTransferParseError("invalid_hop_count", err.Error())
+		}
+	}
+	switch field {
+	case "item_id":
+		return newTransferParseError("invalid_item_id", err.Error())
+	case "envelope_b64":
+		return newTransferParseError("invalid_envelope_encoding", err.Error())
+	case "expiry_unix_ms":
+		return newTransferParseError("invalid_expiry_unix_ms", err.Error())
+	case "hop_count":
+		return newTransferParseError("invalid_hop_count", err.Error())
+	default:
+		return newTransferParseError("unknown_parse_error", err.Error())
+	}
 }
 
 func dedupeStrings(input []string) []string {

@@ -2,23 +2,22 @@ package gossipv1
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"strings"
 	"testing"
 )
 
-func TestParseReceiptPayloadRejectsRejectedEntryMissingIDAndIndex(t *testing.T) {
+func TestParseReceiptPayloadRejectsUnknownRejectedKey(t *testing.T) {
 	_, err := ParseReceiptPayload(map[string]any{
 		"received": []string{},
-		"rejected": []map[string]any{{
-			"reason": "invalid transfer object",
-		}},
+		"rejected": []string{"legacy"},
 	})
 	if err == nil {
-		t.Fatal("expected parse error for rejected entry missing id/index")
+		t.Fatal("expected parse error for unknown receipt payload key")
 	}
-	if !strings.Contains(err.Error(), "must include id or index") {
+	if !strings.Contains(err.Error(), "unknown receipt payload field \"rejected\"") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -69,6 +68,246 @@ func TestParseReceiptPayloadRejectsLegacyAcceptedKey(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown receipt payload field \"accepted\"") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseTransferPayloadMixedAcceptsValidObject(t *testing.T) {
+	createdAt := int64(1710000000)
+	expiresAt := int64(1710003600)
+	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"envelope_b64":   envelopeB64,
+			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 0 {
+		t.Fatalf("expected no rejected objects, got %#v", parsed.Rejected)
+	}
+	if len(parsed.Objects) != 1 || parsed.Objects[0].Object.ItemID != itemID {
+		t.Fatalf("unexpected parsed objects: %#v", parsed.Objects)
+	}
+}
+
+func TestParseTransferPayloadMixedRejectsMissingItemID(t *testing.T) {
+	createdAt := int64(1710000000)
+	expiresAt := int64(1710003600)
+	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"envelope_b64":   envelopeB64,
+			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 1 || parsed.Rejected[0].Reason != "missing_item_id" {
+		t.Fatalf("unexpected rejection: %#v", parsed.Rejected)
+	}
+}
+
+func TestParseTransferPayloadMixedRejectsMissingEnvelopeB64(t *testing.T) {
+	itemID := strings.Repeat("11", 32)
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"expiry_unix_ms": uint64(1710003600000),
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 1 || parsed.Rejected[0].Reason != "missing_envelope_b64" {
+		t.Fatalf("unexpected rejection: %#v", parsed.Rejected)
+	}
+}
+
+func TestParseTransferPayloadMixedRejectsInvalidEnvelopeEncoding(t *testing.T) {
+	itemID := strings.Repeat("22", 32)
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"envelope_b64":   "%%%",
+			"expiry_unix_ms": uint64(1710003600000),
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 1 || parsed.Rejected[0].Reason != "invalid_envelope_encoding" {
+		t.Fatalf("unexpected rejection: %#v", parsed.Rejected)
+	}
+	if parsed.Rejected[0].Diagnostic == nil {
+		t.Fatal("expected rejection diagnostics")
+	}
+	if parsed.Rejected[0].Diagnostic.Base64URLDecodeOK {
+		t.Fatalf("expected base64url decode failure diagnostics, got %#v", parsed.Rejected[0].Diagnostic)
+	}
+}
+
+func TestParseTransferPayloadMixedRejectsInvalidExpiryUnixMS(t *testing.T) {
+	createdAt := int64(1710000000)
+	expiresAt := int64(1710003600)
+	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"envelope_b64":   envelopeB64,
+			"expiry_unix_ms": uint64(expiresAt)*1000 + 1,
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 1 || parsed.Rejected[0].Reason != "invalid_expiry_unix_ms" {
+		t.Fatalf("unexpected rejection: %#v", parsed.Rejected)
+	}
+}
+
+func TestParseTransferPayloadMixedRejectsInvalidHopCount(t *testing.T) {
+	createdAt := int64(1710000000)
+	expiresAt := int64(1710003600)
+	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"envelope_b64":   envelopeB64,
+			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"hop_count":      uint64(65536),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 1 || parsed.Rejected[0].Reason != "invalid_hop_count" {
+		t.Fatalf("unexpected rejection: %#v", parsed.Rejected)
+	}
+}
+
+func TestParseTransferPayloadMixedMixedBatchKeepsValidObjects(t *testing.T) {
+	createdAt := int64(1710000000)
+	expiresAt := int64(1710003600)
+	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"envelope_b64":   envelopeB64,
+			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"hop_count":      uint64(0),
+		}, {
+			"item_id":        strings.Repeat("ab", 32),
+			"envelope_b64":   "%%%",
+			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Objects) != 1 || parsed.Objects[0].Object.ItemID != itemID {
+		t.Fatalf("unexpected accepted objects: %#v", parsed.Objects)
+	}
+	if len(parsed.Rejected) != 1 || parsed.Rejected[0].Reason != "invalid_envelope_encoding" {
+		t.Fatalf("unexpected rejection: %#v", parsed.Rejected)
+	}
+}
+
+func TestParseTransferPayloadMixedAcceptsCanonicalTransferEnvelopeSchema(t *testing.T) {
+	toWayfarerID := strings.Repeat("aa", 32)
+	manifestID := strings.Repeat("bb", 32)
+	envelopeB64, err := EncodeTransferEnvelopeB64(toWayfarerID, manifestID, "QQ")
+	if err != nil {
+		t.Fatalf("encode transfer envelope: %v", err)
+	}
+	itemID := ComputeTransferObjectItemID(TransferObject{EnvelopeB64: envelopeB64})
+
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"envelope_b64":   envelopeB64,
+			"expiry_unix_ms": uint64(1710003600000),
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 0 {
+		t.Fatalf("expected no rejected objects, got %#v", parsed.Rejected)
+	}
+	if len(parsed.Objects) != 1 {
+		t.Fatalf("expected one accepted object, got %#v", parsed.Objects)
+	}
+	if parsed.Objects[0].Object.Envelope.To != toWayfarerID {
+		t.Fatalf("unexpected envelope destination: %q", parsed.Objects[0].Object.Envelope.To)
+	}
+}
+
+func TestParseTransferPayloadMixedIgnoresUnknownEnvelopeKeys(t *testing.T) {
+	toBytes := bytes.Repeat([]byte{0xaa}, DigestHexBytes)
+	manifestBytes := bytes.Repeat([]byte{0xbb}, DigestHexBytes)
+	envelopeMap := map[string]any{
+		"to_wayfarer_id": toBytes,
+		"manifest_id":    manifestBytes,
+		"body":           []byte("hello"),
+		"x_ext":          []byte("ignored"),
+	}
+	envelopeBytes, err := canonicalEncMode.Marshal(envelopeMap)
+	if err != nil {
+		t.Fatalf("encode envelope map: %v", err)
+	}
+	envelopeB64 := base64.RawURLEncoding.EncodeToString(envelopeBytes)
+	itemID := ComputeTransferObjectItemID(TransferObject{EnvelopeB64: envelopeB64})
+
+	parsed, err := ParseTransferPayloadMixed(map[string]any{
+		"objects": []map[string]any{{
+			"item_id":        itemID,
+			"envelope_b64":   envelopeB64,
+			"expiry_unix_ms": uint64(1710003600000),
+			"hop_count":      uint64(0),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("parse transfer payload: %v", err)
+	}
+	if len(parsed.Rejected) != 0 {
+		t.Fatalf("expected unknown envelope keys to be ignored, got %#v", parsed.Rejected)
+	}
+}
+
+func TestEncodeReceiptPayloadContainsOnlyReceivedKey(t *testing.T) {
+	frame, err := EncodeEnvelope(FrameTypeReceipt, ReceiptPayload{Accepted: []string{strings.Repeat("33", 32)}})
+	if err != nil {
+		t.Fatalf("encode receipt envelope: %v", err)
+	}
+	decoded, err := DecodeEnvelope(frame)
+	if err != nil {
+		t.Fatalf("decode receipt envelope: %v", err)
+	}
+	if len(decoded.Payload) != 1 {
+		t.Fatalf("receipt payload must include exactly one key, got %#v", decoded.Payload)
+	}
+	if _, ok := decoded.Payload["received"]; !ok {
+		t.Fatalf("receipt payload must include received key, got %#v", decoded.Payload)
 	}
 }
 
@@ -271,11 +510,7 @@ func TestComputeItemIDMatchesTransferObjectComputation(t *testing.T) {
 	}
 
 	transferID := ComputeTransferObjectItemID(TransferObject{
-		From:       from,
-		To:         to,
-		PayloadB64: payloadB64,
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
+		EnvelopeB64: base64.RawURLEncoding.EncodeToString(mustCanonicalItemEnvelopeBytes(from, to, payloadB64, createdAt, expiresAt)),
 	})
 	if id != transferID {
 		t.Fatalf("expected matching item ids, got direct=%q transfer=%q", id, transferID)
@@ -364,4 +599,13 @@ func TestParseRequestPayloadRejectsInvalidWantItemID(t *testing.T) {
 	if !strings.Contains(err.Error(), "item id must be 64 lowercase hex chars") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func mustEnvelopeB64(t *testing.T, from string, to string, payloadB64 string, createdAt int64, expiresAt int64) string {
+	t.Helper()
+	envelopeB64, err := EncodeItemEnvelopeB64(from, to, payloadB64, createdAt, expiresAt)
+	if err != nil {
+		t.Fatalf("encode envelope b64: %v", err)
+	}
+	return envelopeB64
 }

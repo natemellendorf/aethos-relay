@@ -81,14 +81,9 @@ func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
 	request := readEnvelope(t, conn)
 	assertFrameType(t, request, gossipv1.FrameTypeRequest)
 
-	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{{
-		ID:         loopMsgID,
-		From:       "sender-1",
-		To:         clientHello.NodeID,
-		PayloadB64: "QQ",
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
-	}}})
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
+		mustTransferObject(t, loopMsgID, "sender-1", clientHello.NodeID, "QQ", createdAt, expiresAt),
+	}})
 
 	receipt := readEnvelope(t, conn)
 	assertFrameType(t, receipt, gossipv1.FrameTypeReceipt)
@@ -108,7 +103,7 @@ func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse transfer: %v", err)
 	}
-	if len(parsedTransfer.Objects) != 1 || parsedTransfer.Objects[0].Object.ID != loopMsgID {
+	if len(parsedTransfer.Objects) != 1 || parsedTransfer.Objects[0].Object.ItemID != loopMsgID {
 		t.Fatalf("unexpected transfer payload: %#v", parsedTransfer)
 	}
 

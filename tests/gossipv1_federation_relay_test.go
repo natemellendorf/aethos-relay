@@ -155,8 +155,13 @@ func TestGossipV1RelayToRelayInvalidObjectDoesNotPoisonValidState(t *testing.T) 
 
 	waitForMessage(t, relayB.store, validAfterInvalid.ID)
 	waitForCondition(t, 5*time.Second, func() bool {
-		return recorderA.hasRejectedID(invalid.ID)
-	}, "source relay observes receipt rejection for invalid object")
+		for peerID := range relayA.peerManager.GetPeers() {
+			if relayA.peerManager.PeerLastObserverError(peerID) != nil {
+				return false
+			}
+		}
+		return true
+	}, "source relay remains healthy after invalid object rejection")
 }
 
 func TestGossipV1RelayToRelayForwardToPeersSuppressesOriginNode(t *testing.T) {
@@ -209,14 +214,9 @@ func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
 	request := readEnvelope(t, conn)
 	assertFrameType(t, request, gossipv1.FrameTypeRequest)
 
-	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{{
-		ID:         itemID,
-		From:       "sender-cross-role",
-		To:         "wayfarer-cross-role",
-		PayloadB64: "QQ",
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
-	}}})
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
+		mustTransferObject(t, itemID, "sender-cross-role", "wayfarer-cross-role", "QQ", createdAt, expiresAt),
+	}})
 
 	receipt := readEnvelope(t, conn)
 	assertFrameType(t, receipt, gossipv1.FrameTypeReceipt)
@@ -268,21 +268,6 @@ func (r *federationEventRecorder) snapshotCounts() map[gossipv1.EventType]int {
 		out[k] = v
 	}
 	return out
-}
-
-func (r *federationEventRecorder) hasRejectedID(id string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for _, receipt := range r.receipts {
-		for _, rejected := range receipt.Rejected {
-			if rejected.ID == id {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 func (r *federationEventRecorder) hasAcceptedID(id string) bool {

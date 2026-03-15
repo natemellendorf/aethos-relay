@@ -169,6 +169,8 @@ func main() {
 	defer bbstore.Close()
 
 	log.Println("Store opened successfully")
+	queueRecipients := 0
+	queuedItems := 0
 	if *scrubInvalidPayloadsStartup {
 		report, err := store.ScrubInvalidPayloadMessages(context.Background(), bbstore)
 		if err != nil {
@@ -182,6 +184,16 @@ func main() {
 			report.LookupErrors,
 			report.RemoveErrors,
 		)
+		queueRecipients = report.RecipientsScanned
+		queuedItems = report.QueuedScanned
+	} else {
+		recipients, queued, err := startupQueueInventory(context.Background(), bbstore)
+		if err != nil {
+			log.Printf("WARNING: startup queue inventory incomplete: %v", err)
+		} else {
+			queueRecipients = recipients
+			queuedItems = queued
+		}
 	}
 
 	// Initialize envelope store for federation
@@ -192,6 +204,12 @@ func main() {
 	defer envelopeStore.Close()
 
 	log.Println("Envelope store opened successfully")
+	envelopeIDs, err := envelopeStore.GetAllEnvelopeIDs(context.Background())
+	if err != nil {
+		log.Printf("WARNING: startup envelope inventory unavailable: %v", err)
+	} else {
+		log.Printf("store: startup inventory summary queue_recipients=%d queued_items=%d envelopes=%d", queueRecipients, queuedItems, len(envelopeIDs))
+	}
 
 	// Initialize TTL sweeper (needed for descriptor store)
 	maxTTL := time.Duration(*maxTTLSecs) * time.Second
@@ -429,4 +447,27 @@ func normalizeBoolFlagArgs(args []string, boolFlags map[string]struct{}) []strin
 	}
 
 	return normalized
+}
+
+func startupQueueInventory(ctx context.Context, st store.Store) (int, int, error) {
+	recipients, err := st.GetAllRecipientIDs(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	seen := make(map[string]struct{})
+	for _, recipientID := range recipients {
+		msgIDs, err := st.GetAllQueuedMessageIDs(ctx, recipientID)
+		if err != nil {
+			return len(recipients), len(seen), err
+		}
+		for _, msgID := range msgIDs {
+			if msgID == "" {
+				continue
+			}
+			seen[msgID] = struct{}{}
+		}
+	}
+
+	return len(recipients), len(seen), nil
 }

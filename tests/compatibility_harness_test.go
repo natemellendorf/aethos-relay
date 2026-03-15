@@ -58,22 +58,8 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	}
 
 	writeEnvelope(t, a, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
-		{
-			ID:         itemID,
-			From:       "sender-a",
-			To:         "client-a",
-			PayloadB64: "QQ",
-			CreatedAt:  createdAt,
-			ExpiresAt:  expiresAt,
-		},
-		{
-			ID:         invalidItemID,
-			From:       "sender-a",
-			To:         "client-a",
-			PayloadB64: "invalid",
-			CreatedAt:  createdAt,
-			ExpiresAt:  expiresAt,
-		},
+		mustTransferObject(t, itemID, "sender-a", "client-a", "QQ", createdAt, expiresAt),
+		mustTransferObject(t, invalidItemID, "sender-a", "client-a", "invalid", createdAt, expiresAt),
 	}})
 
 	aReceipt := readEnvelope(t, a)
@@ -85,8 +71,8 @@ func TestCompatibilityHarnessCanonicalClientRelayPath(t *testing.T) {
 	if len(receiptPayload.Accepted) != 1 || receiptPayload.Accepted[0] != itemID {
 		t.Fatalf("unexpected accepted ids: %#v", receiptPayload.Accepted)
 	}
-	if len(receiptPayload.Rejected) != 1 || receiptPayload.Rejected[0].ID != invalidItemID {
-		t.Fatalf("unexpected rejected list: %#v", receiptPayload.Rejected)
+	if _, hasRejected := aReceipt.Payload["rejected"]; hasRejected {
+		t.Fatalf("receipt payload must not include rejected field: %#v", aReceipt.Payload)
 	}
 
 	if _, err := relay.store.GetMessageByID(context.Background(), itemID); err != nil {

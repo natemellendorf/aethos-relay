@@ -21,10 +21,57 @@ WebSocket relay server for Aethos with message queuing, TTL persistence, and rel
 ### Run a Single Relay
 
 ```bash
-go run ./cmd/relay/main.go -http-addr :8081
+go run ./cmd/relay/main.go -ws-addr :8080 -http-addr :8081
 ```
 
-This starts a relay on port 8081 with default settings.
+This starts a relay with WebSocket on `:8080` and HTTP on `:8081`.
+
+List all runtime flags and defaults:
+
+```bash
+go run ./cmd/relay/main.go -h
+```
+
+### Common Launch Profiles
+
+Development with verbose Gossip V1 diagnostics:
+
+```bash
+go run ./cmd/relay/main.go \
+  -dev-mode \
+  -gossipv1-debug \
+  -ws-addr :8002 \
+  -http-addr :8001
+```
+
+Production-style origin allowlist:
+
+```bash
+go run ./cmd/relay/main.go \
+  -allowed-origins "https://app.aethos.io,https://aethos.app" \
+  -ws-addr :8080 \
+  -http-addr :8081
+```
+
+Persistent local paths (explicit store files):
+
+```bash
+go run ./cmd/relay/main.go \
+  -store-path ./relay.db \
+  -envelope-store-path ./relay.db.envelopes \
+  -descriptor-store-path ./relay.db.descriptors
+```
+
+Federation-enabled relay:
+
+```bash
+go run ./cmd/relay/main.go \
+  -relay-id relay-us-east \
+  -peer "ws://relay-1.example.com:8081/federation/ws,ws://relay-2.example.com:8081/federation/ws" \
+  -max-federation-conns 200 \
+  -max-federation-peers 100 \
+  -rate-limit-per-peer 200
+```
 
 ### Run with Docker
 
@@ -103,6 +150,8 @@ See [aethos/docs/spec](https://github.com/natemellendorf/aethos/tree/main/docs/s
 
 ## Flags
 
+Boolean flags can be passed as either `-flag` or `-flag=true|false`.
+
 ### Server Flags
 
 | Flag | Default | Description |
@@ -115,6 +164,9 @@ See [aethos/docs/spec](https://github.com/natemellendorf/aethos/tree/main/docs/s
 | `-log-json` | `false` | JSON logging output |
 | `-allowed-origins` | (empty) | Comma-separated list of allowed WebSocket origins |
 | `-dev-mode` | `false` | Enable development mode (allows all origins) |
+| `-ack-driven-suppression` | `false` | Use canonical ack-driven delivery suppression (legacy mark-on-push when false) |
+| `-scrub-invalid-payloads-startup` | `true` | Remove queued records with invalid `payload_b64` during startup scrub |
+| `-gossipv1-debug` | `false` | Enable verbose structured Gossip V1 debug logs |
 
 ### Federation Flags
 
@@ -162,6 +214,22 @@ go run ./cmd/relay/main.go \
   -federation-pad-buckets "1024,4096,16384,65536" \
   -federation-cover-enabled true
 ```
+
+## Startup Inventory Logs
+
+On startup, relay logs an inventory summary to make persisted state visible:
+
+- `queue_recipients`: recipients currently represented in queue indexes
+- `queued_items`: unique queued message IDs currently tracked
+- `envelopes`: non-expired envelope IDs in envelope store
+
+Example:
+
+```text
+store: startup inventory summary queue_recipients=4 queued_items=69 envelopes=2
+```
+
+This is informational for operational visibility after restart and helps explain request decisions like `want_decision reason=already_have`.
 
 ## TTL Behavior
 

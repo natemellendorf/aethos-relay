@@ -276,7 +276,7 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 			if event.Transfer != nil {
 				transferIDs := make([]string, 0, len(event.Transfer.Objects))
 				for _, indexed := range event.Transfer.Objects {
-					transferIDs = append(transferIDs, indexed.Object.ID)
+					transferIDs = append(transferIDs, indexed.Object.ItemID)
 				}
 				count, sample, hash := gossipv1.ItemIDSample(transferIDs, wsDebugItemSampleLimit)
 				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_received", "transport_ok", true, "protocol_ok", true, "object_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "parse_rejected_count", len(event.Transfer.Rejected))
@@ -291,12 +291,7 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 			}
 			if event.Receipt != nil {
 				acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, wsDebugItemSampleLimit)
-				rejectedIDs := make([]string, 0, len(event.Receipt.Rejected))
-				for _, rejected := range event.Receipt.Rejected {
-					rejectedIDs = append(rejectedIDs, rejected.ID)
-				}
-				rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
-				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_received", "transport_ok", true, "protocol_ok", true, "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
+				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_received", "transport_ok", true, "protocol_ok", true, "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
 			}
 			if err := h.handleReceipt(session, event); err != nil {
 				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
@@ -366,7 +361,7 @@ func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) 
 		return err
 	}
 
-	want, err := h.computeMissingWant(event.Summary, nil, session.peerMaxWant)
+	want, err := h.computeMissingWant(event.Summary, nil, session.peerMaxWant, debug)
 	if err != nil {
 		debug.Log("local", gossipv1.FrameTypeSummary, "summary_compute_want_failed", "store_ok", false, "err", err)
 		return err
@@ -407,18 +402,18 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "missing", "reason", "nil_message", "store_ok", true)
 			continue
 		}
-		if object.To != session.queueRecipient {
+		if object.Envelope.To != session.queueRecipient {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "recipient_mismatch", "store_ok", true)
 			continue
 		}
-		if !time.Unix(object.ExpiresAt, 0).UTC().After(now) {
+		if object.ExpiryUnixMS <= uint64(now.UnixMilli()) {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "expired", "store_ok", true)
 			continue
 		}
 
 		objects = append(objects, object)
-		expectedReceiptIDs = append(expectedReceiptIDs, object.ID)
-		debug.LogItem("out", gossipv1.FrameTypeTransfer, object.ID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
+		expectedReceiptIDs = append(expectedReceiptIDs, object.ItemID)
+		debug.LogItem("out", gossipv1.FrameTypeTransfer, object.ItemID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
 	}
 	transferCount, transferSample, transferHash := gossipv1.ItemIDSample(expectedReceiptIDs, wsDebugItemSampleLimit)
 	debug.Log("out", gossipv1.FrameTypeTransfer, "request_serviced", "object_count", len(objects), "expected_receipt_count", transferCount, "item_ids_sample", transferSample, "item_ids_hash", transferHash, "store_ok", true)
@@ -437,97 +432,54 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 
 	receipt := gossipv1.ReceiptPayload{
 		Accepted: make([]string, 0, len(event.Transfer.Objects)),
-		Rejected: append([]gossipv1.TransferObjectRejection(nil), event.Transfer.Rejected...),
+	}
+
+	for _, rejected := range event.Transfer.Rejected {
+		fields := []any{"object_index", rejected.Index, "item_id", rejected.ID, "reason", rejected.Reason, "detail", rejected.Detail}
+		fields = append(fields, gossipv1.TransferObjectDiagnosticLogKV(rejected.Diagnostic)...)
+		fields = append(fields, "store_ok", false)
+		debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", fields...)
+	}
+	rejectedIDs := make([]string, 0, len(event.Transfer.Rejected))
+	for _, rejected := range event.Transfer.Rejected {
+		rejectedIDs = append(rejectedIDs, rejected.ID)
 	}
 
 	for _, indexed := range event.Transfer.Objects {
-		validationErr := validateTransferObject(indexed.Object)
-		if validationErr != nil {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", validationErr.Error(), "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
-				Index:  indexed.Index,
-				ID:     indexed.Object.ID,
-				Reason: validationErr.Error(),
-			})
+		msg, err := transferObjectToMessage(indexed.Object)
+		if err != nil {
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "reason", "policy_reject", "detail", err.Error(), "store_ok", false)
+			rejectedIDs = append(rejectedIDs, indexed.Object.ItemID)
 			continue
 		}
 
-		existing, err := h.store.GetMessageByID(context.Background(), indexed.Object.ID)
+		existing, err := h.store.GetMessageByID(context.Background(), indexed.Object.ItemID)
 		if err != nil && !isNotFoundError(err) {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_store_lookup_failed", "store_ok", false, "err", err)
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ItemID, "transfer_object_store_lookup_failed", "store_ok", false, "err", err)
 			return err
 		}
 		if err == nil && existing != nil {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_accepted", "decision", "duplicate", "store_ok", true)
-			receipt.Accepted = append(receipt.Accepted, indexed.Object.ID)
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "store_ok", true)
+			receipt.Accepted = append(receipt.Accepted, indexed.Object.ItemID)
 			continue
 		}
 
-		decodedPayload, err := model.DecodePayloadB64(indexed.Object.PayloadB64)
-		if err != nil {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "invalid payload_b64", "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
-				Index:  indexed.Index,
-				ID:     indexed.Object.ID,
-				Reason: "invalid payload_b64",
-			})
-			continue
-		}
-
-		createdAt := time.Unix(indexed.Object.CreatedAt, 0).UTC()
-		expiresAt := time.Unix(indexed.Object.ExpiresAt, 0).UTC()
-		if !expiresAt.After(createdAt) {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "expires_at must be greater than created_at", "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
-				Index:  indexed.Index,
-				ID:     indexed.Object.ID,
-				Reason: "expires_at must be greater than created_at",
-			})
-			continue
-		}
-		if !expiresAt.After(time.Now().UTC()) {
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "object already expired", "store_ok", false)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
-				Index:  indexed.Index,
-				ID:     indexed.Object.ID,
-				Reason: "object already expired",
-			})
-			continue
-		}
-
-		message := &model.Message{
-			ID:        indexed.Object.ID,
-			From:      indexed.Object.From,
-			To:        indexed.Object.To,
-			Payload:   model.EncodePayloadB64(decodedPayload, model.PayloadEncodingPrefBase64URL),
-			CreatedAt: createdAt,
-			ExpiresAt: expiresAt,
-		}
-
-		if err := h.engine.PersistMessage(traceCtx, message); err != nil {
+		if err := h.engine.PersistMessage(traceCtx, msg); err != nil {
 			metrics.IncrementStoreErrors()
-			debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_rejected", "decision", "rejected", "reason", "persist failed", "store_ok", false, "err", err)
-			receipt.Rejected = append(receipt.Rejected, gossipv1.TransferObjectRejection{
-				Index:  indexed.Index,
-				ID:     indexed.Object.ID,
-				Reason: "persist failed",
-			})
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "reason", "ingest_failed", "detail", "persist failed", "store_ok", false, "err", err)
+			rejectedIDs = append(rejectedIDs, indexed.Object.ItemID)
 			continue
 		}
 
 		metrics.IncrementPersisted()
-		debug.LogItem("in", gossipv1.FrameTypeTransfer, indexed.Object.ID, "transfer_object_accepted", "decision", "inserted", "store_ok", true)
-		receipt.Accepted = append(receipt.Accepted, indexed.Object.ID)
+		debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "store_ok", true)
+		receipt.Accepted = append(receipt.Accepted, indexed.Object.ItemID)
 	}
 
 	if len(receipt.Accepted) > 1 {
 		gossipv1.SortDigestHexIDs(receipt.Accepted)
 	}
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, wsDebugItemSampleLimit)
-	rejectedIDs := make([]string, 0, len(receipt.Rejected))
-	for _, rejected := range receipt.Rejected {
-		rejectedIDs = append(rejectedIDs, rejected.ID)
-	}
 	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
 	debug.Log("out", gossipv1.FrameTypeReceipt, "receipt_constructed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
 
@@ -561,9 +513,21 @@ func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) 
 	return nil
 }
 
-func (h *WSHandler) computeMissingWant(summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64) ([]string, error) {
+func (h *WSHandler) computeMissingWant(summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64, debugLoggers ...gossipv1.DebugSessionLogger) ([]string, error) {
 	if summary == nil {
 		return []string{}, nil
+	}
+
+	debugEnabled := gossipv1.DebugLoggingEnabled() && len(debugLoggers) > 0
+	var debug gossipv1.DebugSessionLogger
+	if debugEnabled {
+		debug = debugLoggers[0]
+	}
+	logDecision := func(source string, itemID string, reason string) {
+		if !debugEnabled {
+			return
+		}
+		debug.LogItem("local", gossipv1.FrameTypeRequest, itemID, "want_decision", "source", source, "reason", reason)
 	}
 
 	previewIDs, err := gossipv1.NormalizeDigestHexIDs(summary.PreviewItemIDs)
@@ -584,23 +548,29 @@ func (h *WSHandler) computeMissingWant(summary *gossipv1.SummaryPayload, candida
 	seenWant := make(map[string]struct{}, limit)
 	for _, id := range previewIDs {
 		if _, duplicate := seenWant[id]; duplicate {
+			logDecision("preview", id, "duplicate_selected")
 			continue
 		}
 		if !gossipv1.BloomFilterMightContain(bloom, id) {
+			logDecision("preview", id, "bloom_miss")
 			continue
 		}
 
 		known, knownErr := h.hasObjectID(id)
 		if knownErr != nil {
+			logDecision("preview", id, "known_lookup_error")
 			return nil, knownErr
 		}
 		if known {
+			logDecision("preview", id, "already_have")
 			continue
 		}
+		logDecision("preview", id, "selected")
 
 		seenWant[id] = struct{}{}
 		want = append(want, id)
 		if len(want) >= limit {
+			logDecision("preview", id, "limit_reached")
 			gossipv1.SortDigestHexIDs(want)
 			return want, nil
 		}
@@ -612,23 +582,29 @@ func (h *WSHandler) computeMissingWant(summary *gossipv1.SummaryPayload, candida
 	}
 	for _, id := range normalizedCandidates {
 		if _, duplicate := seenWant[id]; duplicate {
+			logDecision("candidate", id, "duplicate_selected")
 			continue
 		}
 		if !gossipv1.BloomFilterMightContain(bloom, id) {
+			logDecision("candidate", id, "bloom_miss")
 			continue
 		}
 
 		known, knownErr := h.hasObjectID(id)
 		if knownErr != nil {
+			logDecision("candidate", id, "known_lookup_error")
 			return nil, knownErr
 		}
 		if known {
+			logDecision("candidate", id, "already_have")
 			continue
 		}
+		logDecision("candidate", id, "selected")
 
 		seenWant[id] = struct{}{}
 		want = append(want, id)
 		if len(want) >= limit {
+			logDecision("candidate", id, "limit_reached")
 			break
 		}
 	}
@@ -676,33 +652,51 @@ func validateSummaryPreviewCursor(previewIDs []string, previewCursor string) err
 	return nil
 }
 
-func validateTransferObject(object gossipv1.TransferObject) error {
-	if object.ID == "" {
-		return fmt.Errorf("id is required")
+func transferObjectToMessage(object gossipv1.TransferObject) (*model.Message, error) {
+	if object.ItemID == "" {
+		return nil, fmt.Errorf("item_id is required")
 	}
-	if !gossipv1.IsDigestHexID(object.ID) {
-		return fmt.Errorf("id must be 64 lowercase hex chars")
+	if !gossipv1.IsDigestHexID(object.ItemID) {
+		return nil, fmt.Errorf("item_id must be 64 lowercase hex chars")
 	}
-	if object.From == "" {
-		return fmt.Errorf("from is required")
+	envelope, err := gossipv1.DecodeItemEnvelopeB64(object.EnvelopeB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode envelope_b64: %w", err)
 	}
-	if object.To == "" {
-		return fmt.Errorf("to is required")
+	if envelope.To == "" {
+		return nil, fmt.Errorf("envelope destination is required")
 	}
-	if object.PayloadB64 == "" {
-		return fmt.Errorf("payload_b64 is required")
+	if envelope.From == "" {
+		return nil, fmt.Errorf("envelope manifest/source is required")
 	}
-	if object.CreatedAt <= 0 {
-		return fmt.Errorf("created_at must be > 0")
+	if _, err := model.DecodePayloadB64(envelope.PayloadB64); err != nil {
+		return nil, fmt.Errorf("invalid payload_b64")
 	}
-	if object.ExpiresAt <= object.CreatedAt {
-		return fmt.Errorf("expires_at must be greater than created_at")
+	if envelope.ExpiresAt > 0 && object.ExpiryUnixMS != uint64(envelope.ExpiresAt)*1000 {
+		return nil, fmt.Errorf("expiry_unix_ms must equal envelope expiry")
 	}
-	expectedID := gossipv1.ComputeTransferObjectItemID(object)
-	if object.ID != expectedID {
-		return fmt.Errorf("id must equal sha256(canonical envelope bytes)")
+	if object.HopCount > 65535 {
+		return nil, fmt.Errorf("hop_count must be <= 65535")
 	}
-	return nil
+	if object.ItemID != gossipv1.ComputeTransferObjectItemID(object) {
+		return nil, fmt.Errorf("item_id must equal sha256(envelope bytes)")
+	}
+	now := time.Now().UTC()
+	createdAt := now
+	if envelope.CreatedAt > 0 {
+		createdAt = time.Unix(envelope.CreatedAt, 0).UTC()
+	}
+	expiresAt := time.UnixMilli(int64(object.ExpiryUnixMS)).UTC()
+	if envelope.ExpiresAt > 0 {
+		expiresAt = time.Unix(envelope.ExpiresAt, 0).UTC()
+	}
+	if !expiresAt.After(createdAt) {
+		if !expiresAt.After(now) {
+			return nil, fmt.Errorf("object already expired")
+		}
+		createdAt = expiresAt.Add(-time.Second)
+	}
+	return &model.Message{ID: object.ItemID, From: envelope.From, To: envelope.To, Payload: envelope.PayloadB64, CreatedAt: createdAt, ExpiresAt: expiresAt}, nil
 }
 
 func isNotFoundError(err error) bool {
@@ -816,18 +810,46 @@ func canonicalTransferObjectFromMessage(message *model.Message) (gossipv1.Transf
 
 	createdAt := message.CreatedAt.UTC().Unix()
 	expiresAt := message.ExpiresAt.UTC().Unix()
+	if envelopeB64, err := gossipv1.EncodeTransferEnvelopeB64(message.To, message.From, message.Payload); err == nil {
+		candidate := gossipv1.TransferObject{
+			ItemID:       message.ID,
+			EnvelopeB64:  envelopeB64,
+			ExpiryUnixMS: uint64(message.ExpiresAt.UTC().UnixMilli()),
+			HopCount:     0,
+			Envelope: gossipv1.ItemEnvelope{
+				From:       message.From,
+				To:         message.To,
+				PayloadB64: message.Payload,
+				CreatedAt:  createdAt,
+				ExpiresAt:  expiresAt,
+			},
+		}
+		if gossipv1.ComputeTransferObjectItemID(candidate) == message.ID {
+			return candidate, true
+		}
+	}
+
 	expectedID := gossipv1.ComputeItemID(message.From, message.To, message.Payload, createdAt, expiresAt)
 	if message.ID != expectedID {
 		return gossipv1.TransferObject{}, false
 	}
+	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(message.From, message.To, message.Payload, createdAt, expiresAt)
+	if err != nil {
+		return gossipv1.TransferObject{}, false
+	}
 
 	return gossipv1.TransferObject{
-		ID:         message.ID,
-		From:       message.From,
-		To:         message.To,
-		PayloadB64: message.Payload,
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
+		ItemID:       message.ID,
+		EnvelopeB64:  envelopeB64,
+		ExpiryUnixMS: uint64(message.ExpiresAt.UTC().UnixMilli()),
+		HopCount:     0,
+		Envelope: gossipv1.ItemEnvelope{
+			From:       message.From,
+			To:         message.To,
+			PayloadB64: message.Payload,
+			CreatedAt:  createdAt,
+			ExpiresAt:  expiresAt,
+		},
 	}, true
 }
 
@@ -922,7 +944,7 @@ func (h *WSHandler) sendEnvelope(session *clientSession, frameType string, paylo
 		if transfer, ok := payload.(gossipv1.TransferPayload); ok {
 			ids := make([]string, 0, len(transfer.Objects))
 			for _, object := range transfer.Objects {
-				ids = append(ids, object.ID)
+				ids = append(ids, object.ItemID)
 			}
 			count, sample, hash := gossipv1.ItemIDSample(ids, wsDebugItemSampleLimit)
 			metadata = append(metadata,
@@ -934,19 +956,11 @@ func (h *WSHandler) sendEnvelope(session *clientSession, frameType string, paylo
 	case gossipv1.FrameTypeReceipt:
 		if receipt, ok := payload.(gossipv1.ReceiptPayload); ok {
 			acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, wsDebugItemSampleLimit)
-			rejectedIDs := make([]string, 0, len(receipt.Rejected))
-			for _, rejected := range receipt.Rejected {
-				rejectedIDs = append(rejectedIDs, rejected.ID)
-			}
-			rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
 			metadata = append(metadata,
-				"item_count", acceptedCount+rejectedCount,
+				"item_count", acceptedCount,
 				"accepted_count", acceptedCount,
 				"accepted_item_ids_sample", acceptedSample,
 				"accepted_item_ids_hash", acceptedHash,
-				"rejected_count", rejectedCount,
-				"rejected_item_ids_sample", rejectedSample,
-				"rejected_item_ids_hash", rejectedHash,
 			)
 		}
 	}

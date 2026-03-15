@@ -386,19 +386,26 @@ func TestTransferObjectToMessageRejectsItemIDHashMismatch(t *testing.T) {
 	}
 
 	_, err := transferObjectToMessage(gossipv1.TransferObject{
-		ID:         mismatchedID,
-		From:       "sender-a",
-		To:         "recipient-a",
-		PayloadB64: "QQ",
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
+		ItemID:       mismatchedID,
+		EnvelopeB64:  mustItemEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt),
+		ExpiryUnixMS: uint64(expiresAt) * 1000,
+		HopCount:     0,
 	})
 	if err == nil {
 		t.Fatal("expected item_id mismatch to be rejected")
 	}
-	if err.Error() != "id must equal sha256(canonical envelope bytes)" {
+	if err.Error() != "item_id must equal sha256(envelope bytes)" {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func mustItemEnvelopeB64(t *testing.T, from string, to string, payloadB64 string, createdAt int64, expiresAt int64) string {
+	t.Helper()
+	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(from, to, payloadB64, createdAt, expiresAt)
+	if err != nil {
+		t.Fatalf("encode envelope: %v", err)
+	}
+	return envelopeB64
 }
 
 func ptrHello(value gossipv1.HelloPayload) *gossipv1.HelloPayload {

@@ -226,22 +226,8 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 		Type: gossipv1.EventTypeTransfer,
 		Transfer: &gossipv1.ParsedTransferPayload{
 			Objects: []gossipv1.IndexedTransferObject{
-				{Index: 0, Object: gossipv1.TransferObject{
-					ID:         validID,
-					From:       "sender-a",
-					To:         "recipient-a",
-					PayloadB64: "QQ",
-					CreatedAt:  validCreatedAt,
-					ExpiresAt:  validExpiresAt,
-				}},
-				{Index: 1, Object: gossipv1.TransferObject{
-					ID:         invalidID,
-					From:       "sender-a",
-					To:         "recipient-a",
-					PayloadB64: "not_base64",
-					CreatedAt:  validCreatedAt,
-					ExpiresAt:  validExpiresAt,
-				}},
+				{Index: 0, Object: mustTransferObject(t, validID, "sender-a", "recipient-a", "QQ", validCreatedAt, validExpiresAt)},
+				{Index: 1, Object: mustTransferObject(t, invalidID, "sender-a", "recipient-a", "not_base64", validCreatedAt, validExpiresAt)},
 			},
 		},
 	}
@@ -264,9 +250,8 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 		if _, hasAccepted := payload["accepted"]; hasAccepted {
 			t.Fatalf("receipt payload must not include accepted key: %#v", payload)
 		}
-		rejected, _ := payload["rejected"].([]any)
-		if len(rejected) != 1 {
-			t.Fatalf("expected one rejected object, got %#v", payload["rejected"])
+		if _, hasRejected := payload["rejected"]; hasRejected {
+			t.Fatalf("receipt payload must not include rejected key: %#v", payload)
 		}
 	default:
 		t.Fatal("expected receipt frame")
@@ -290,15 +275,8 @@ func TestHandleTransferRejectsItemIDHashMismatch(t *testing.T) {
 		Type: gossipv1.EventTypeTransfer,
 		Transfer: &gossipv1.ParsedTransferPayload{
 			Objects: []gossipv1.IndexedTransferObject{{
-				Index: 0,
-				Object: gossipv1.TransferObject{
-					ID:         mismatchedID,
-					From:       "sender-a",
-					To:         "recipient-a",
-					PayloadB64: "QQ",
-					CreatedAt:  createdAt,
-					ExpiresAt:  expiresAt,
-				},
+				Index:  0,
+				Object: mustTransferObject(t, mismatchedID, "sender-a", "recipient-a", "QQ", createdAt, expiresAt),
 			}},
 		},
 	}
@@ -320,14 +298,8 @@ func TestHandleTransferRejectsItemIDHashMismatch(t *testing.T) {
 		if len(receipt.Accepted) != 0 {
 			t.Fatalf("expected no accepted ids, got %#v", receipt.Accepted)
 		}
-		if len(receipt.Rejected) != 1 {
-			t.Fatalf("expected one rejected object, got %#v", receipt.Rejected)
-		}
-		if receipt.Rejected[0].ID != mismatchedID {
-			t.Fatalf("unexpected rejected id: got=%q want=%q", receipt.Rejected[0].ID, mismatchedID)
-		}
-		if receipt.Rejected[0].Reason != "id must equal sha256(canonical envelope bytes)" {
-			t.Fatalf("unexpected rejection reason: %q", receipt.Rejected[0].Reason)
+		if _, ok := decoded.Payload["rejected"]; ok {
+			t.Fatalf("receipt payload must not include rejected key: %#v", decoded.Payload)
 		}
 	default:
 		t.Fatal("expected receipt frame")
@@ -340,7 +312,6 @@ func TestHandleReceiptAcksAcceptedOnly(t *testing.T) {
 
 	receipt := gossipv1.ReceiptPayload{
 		Accepted: []string{"msg-a", "msg-b"},
-		Rejected: []gossipv1.TransferObjectRejection{{Index: 2, ID: "msg-c", Reason: "invalid"}},
 	}
 
 	if err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &receipt}); err != nil {
@@ -392,15 +363,8 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 	event := gossipv1.Event{
 		Type: gossipv1.EventTypeTransfer,
 		Transfer: &gossipv1.ParsedTransferPayload{Objects: []gossipv1.IndexedTransferObject{{
-			Index: 0,
-			Object: gossipv1.TransferObject{
-				ID:         duplicateID,
-				From:       "sender-a",
-				To:         "recipient-a",
-				PayloadB64: "QQ",
-				CreatedAt:  createdAt.Unix(),
-				ExpiresAt:  expiresAt.Unix(),
-			},
+			Index:  0,
+			Object: mustTransferObject(t, duplicateID, "sender-a", "recipient-a", "QQ", createdAt.Unix(), expiresAt.Unix()),
 		}}},
 	}
 
@@ -735,5 +699,19 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 	}
 	if secondCursor != nextSummary.PreviewCursor {
 		t.Fatalf("unexpected second next cursor: got=%q want=%q", secondCursor, nextSummary.PreviewCursor)
+	}
+}
+
+func mustTransferObject(t *testing.T, itemID string, from string, to string, payloadB64 string, createdAt int64, expiresAt int64) gossipv1.TransferObject {
+	t.Helper()
+	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(from, to, payloadB64, createdAt, expiresAt)
+	if err != nil {
+		t.Fatalf("encode envelope: %v", err)
+	}
+	return gossipv1.TransferObject{
+		ItemID:       itemID,
+		EnvelopeB64:  envelopeB64,
+		ExpiryUnixMS: uint64(expiresAt) * 1000,
+		HopCount:     0,
 	}
 }
