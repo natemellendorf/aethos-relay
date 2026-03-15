@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1089,44 +1088,7 @@ func (pm *PeerManager) listSummaryEligibleIDs(ctx context.Context) ([]string, er
 		return nil, errors.New("federation: envelope store is required for summary preview inventory")
 	}
 
-	destinationIDs, err := pm.envelopeStore.GetAllDestinationIDs(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(destinationIDs) == 0 {
-		return []string{}, nil
-	}
-	if len(destinationIDs) > 1 {
-		sort.Strings(destinationIDs)
-	}
-
-	const pageSize = 512
-	allIDs := make([]string, 0, pageSize)
-	for _, destinationID := range destinationIDs {
-		cursor := ""
-		for {
-			ids, nextCursor, _, pageErr := pm.envelopeStore.GetEnvelopeIDsByDestinationPage(ctx, destinationID, cursor, pageSize)
-			if pageErr != nil {
-				return nil, pageErr
-			}
-			if len(ids) == 0 {
-				break
-			}
-
-			allIDs = append(allIDs, ids...)
-			if nextCursor == "" || nextCursor == cursor {
-				break
-			}
-			cursor = nextCursor
-		}
-	}
-
-	eligible, err := gossipv1.NormalizeDigestHexIDs(allIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	return eligible, nil
+	return pm.envelopeStore.GetAllEnvelopeIDs(ctx)
 }
 
 func (pm *PeerManager) computeMissingWant(ctx context.Context, summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64) ([]string, error) {

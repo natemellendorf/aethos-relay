@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
@@ -93,12 +94,15 @@ func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageCursorPaging(t *testi
 		}
 	}
 
-	ids, nextCursor, totalCount, err := store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, "", 2)
+	ids, nextCursor, totalCount, eligibleIDs, err := store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, "", 2)
 	if err != nil {
 		t.Fatalf("page 1: %v", err)
 	}
 	if totalCount != 4 {
 		t.Fatalf("unexpected total count: got=%d want=4", totalCount)
+	}
+	if len(eligibleIDs) != 4 {
+		t.Fatalf("unexpected eligible ids size: got=%d want=4", len(eligibleIDs))
 	}
 	if len(ids) != 2 || ids[0] != allIDs[0] || ids[1] != allIDs[1] {
 		t.Fatalf("unexpected page 1 ids: %#v", ids)
@@ -107,7 +111,7 @@ func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageCursorPaging(t *testi
 		t.Fatalf("unexpected page 1 cursor: got=%s want=%s", nextCursor, allIDs[1])
 	}
 
-	ids, nextCursor, totalCount, err = store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, nextCursor, 2)
+	ids, nextCursor, totalCount, _, err = store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, nextCursor, 2)
 	if err != nil {
 		t.Fatalf("page 2: %v", err)
 	}
@@ -121,7 +125,7 @@ func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageCursorPaging(t *testi
 		t.Fatalf("unexpected page 2 cursor: got=%s want=%s", nextCursor, allIDs[3])
 	}
 
-	ids, nextCursor, totalCount, err = store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, nextCursor, 2)
+	ids, nextCursor, totalCount, _, err = store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, nextCursor, 2)
 	if err != nil {
 		t.Fatalf("page 3: %v", err)
 	}
@@ -151,7 +155,7 @@ func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageRejectsInvalidCursor(
 	}
 	defer store.Close()
 
-	_, _, _, err = store.GetEnvelopeIDsByDestinationPage(context.Background(), "destination-123", "not-a-digest", 10)
+	_, _, _, _, err = store.GetEnvelopeIDsByDestinationPage(context.Background(), "destination-123", "not-a-digest", 10)
 	if err == nil {
 		t.Fatal("expected invalid cursor error")
 	}
@@ -188,7 +192,7 @@ func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageSkipsNonDigestIDs(t *
 		}
 	}
 
-	ids, nextCursor, totalCount, err := store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, "", 10)
+	ids, nextCursor, totalCount, eligibleIDs, err := store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, "", 10)
 	if err != nil {
 		t.Fatalf("get page: %v", err)
 	}
@@ -198,8 +202,110 @@ func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageSkipsNonDigestIDs(t *
 	if len(ids) != 1 || ids[0] != digestID {
 		t.Fatalf("unexpected ids: %#v", ids)
 	}
+	if len(eligibleIDs) != 1 || eligibleIDs[0] != digestID {
+		t.Fatalf("unexpected eligible ids: %#v", eligibleIDs)
+	}
 	if nextCursor != digestID {
 		t.Fatalf("unexpected next cursor: got=%q want=%q", nextCursor, digestID)
+	}
+}
+
+func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageStrictlyGreaterThanCursor(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "envelope-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	store := NewBBoltEnvelopeStore(tmpPath)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	destID := "destination-123"
+	allIDs := []string{strings.Repeat("01", 32), strings.Repeat("10", 32), strings.Repeat("20", 32)}
+	for _, id := range allIDs {
+		if err := store.PersistEnvelope(context.Background(), &model.Envelope{
+			ID:            id,
+			DestinationID: destID,
+			OpaquePayload: []byte("QQ"),
+			OriginRelayID: "relay-test",
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("persist envelope %s: %v", id, err)
+		}
+	}
+
+	ids, nextCursor, totalCount, _, err := store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, allIDs[1], 10)
+	if err != nil {
+		t.Fatalf("get page: %v", err)
+	}
+	if totalCount != 3 {
+		t.Fatalf("unexpected total count: got=%d want=3", totalCount)
+	}
+	if len(ids) != 1 || ids[0] != allIDs[2] {
+		t.Fatalf("expected strictly greater cursor semantics, got %#v", ids)
+	}
+	if nextCursor != allIDs[2] {
+		t.Fatalf("unexpected next cursor: got=%q want=%q", nextCursor, allIDs[2])
+	}
+}
+
+func TestBBoltEnvelopeStore_GetEnvelopeIDsByDestinationPageEligibleIDsBuildCanonicalBloom(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "envelope-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	store := NewBBoltEnvelopeStore(tmpPath)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	destID := "destination-bloom"
+	idsToPersist := []string{strings.Repeat("0a", 32), strings.Repeat("1b", 32), strings.Repeat("2c", 32)}
+	for _, id := range idsToPersist {
+		if err := store.PersistEnvelope(context.Background(), &model.Envelope{
+			ID:            id,
+			DestinationID: destID,
+			OpaquePayload: []byte("QQ"),
+			OriginRelayID: "relay-test",
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("persist envelope %s: %v", id, err)
+		}
+	}
+
+	_, _, totalCount, eligibleIDs, err := store.GetEnvelopeIDsByDestinationPage(context.Background(), destID, "", 2)
+	if err != nil {
+		t.Fatalf("get page: %v", err)
+	}
+	if totalCount != len(idsToPersist) {
+		t.Fatalf("unexpected total count: got=%d want=%d", totalCount, len(idsToPersist))
+	}
+	if len(eligibleIDs) != len(idsToPersist) {
+		t.Fatalf("unexpected eligible ids size: got=%d want=%d", len(eligibleIDs), len(idsToPersist))
+	}
+
+	summary := gossipv1.BuildSummaryPreviewPayload(eligibleIDs, eligibleIDs, "")
+	if summary.ItemCount != uint64(len(eligibleIDs)) {
+		t.Fatalf("unexpected summary item_count: got=%d want=%d", summary.ItemCount, len(eligibleIDs))
+	}
+	for _, id := range eligibleIDs {
+		if !gossipv1.BloomFilterMightContain(summary.BloomFilter, id) {
+			t.Fatalf("expected bloom to contain eligible item_id %s", id)
+		}
 	}
 }
 

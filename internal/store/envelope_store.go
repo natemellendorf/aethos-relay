@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -39,6 +40,7 @@ func (s *BBoltEnvelopeStore) Open() error {
 			model.BucketEnvelopes,
 			model.BucketByDestination,
 			model.BucketByExpiry,
+			model.BucketEnvelopeExpiry,
 			model.BucketSeen,
 			model.BucketRelayIngest,
 			model.BucketMeta,
@@ -48,10 +50,39 @@ func (s *BBoltEnvelopeStore) Open() error {
 				return xerrors.Errorf("failed to create bucket %s: %w", string(b), err)
 			}
 		}
+
+		if err := s.backfillEnvelopeExpiryIndex(tx); err != nil {
+			return xerrors.Errorf("failed to backfill envelope expiry index: %w", err)
+		}
 		return nil
 	})
 	if err != nil {
 		return xerrors.Errorf("failed to initialize envelope buckets: %w", err)
+	}
+
+	return nil
+}
+
+func (s *BBoltEnvelopeStore) backfillEnvelopeExpiryIndex(tx *bolt.Tx) error {
+	envelopesBucket := tx.Bucket(model.BucketEnvelopes)
+	envelopeExpiryBucket := tx.Bucket(model.BucketEnvelopeExpiry)
+	if envelopesBucket == nil || envelopeExpiryBucket == nil {
+		return fmt.Errorf("required envelope buckets are missing")
+	}
+
+	cursor := envelopesBucket.Cursor()
+	for envID, encodedEnvelope := cursor.First(); envID != nil; envID, encodedEnvelope = cursor.Next() {
+		if envelopeExpiryBucket.Get(envID) != nil {
+			continue
+		}
+
+		envelope, err := s.codec.DecodeEnvelope(encodedEnvelope)
+		if err != nil {
+			continue
+		}
+		if err := envelopeExpiryBucket.Put(envID, encodeUnixNano(envelope.ExpiresAt.UTC().UnixNano())); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -71,6 +102,7 @@ func (s *BBoltEnvelopeStore) PersistEnvelope(ctx context.Context, env *model.Env
 		envelopesBucket := tx.Bucket(model.BucketEnvelopes)
 		byDestinationBucket := tx.Bucket(model.BucketByDestination)
 		byExpiryBucket := tx.Bucket(model.BucketByExpiry)
+		envelopeExpiryBucket := tx.Bucket(model.BucketEnvelopeExpiry)
 
 		existingBytes := envelopesBucket.Get([]byte(env.ID))
 		if existingBytes != nil {
@@ -114,6 +146,9 @@ func (s *BBoltEnvelopeStore) PersistEnvelope(ctx context.Context, env *model.Env
 		expiryKey := model.ExpiryIndexKey(env.ExpiresAt, env.ID)
 		if err := byExpiryBucket.Put(expiryKey, []byte(env.ID)); err != nil {
 			return xerrors.Errorf("failed to add to expiry index: %w", err)
+		}
+		if err := envelopeExpiryBucket.Put([]byte(env.ID), encodeUnixNano(env.ExpiresAt.UTC().UnixNano())); err != nil {
+			return xerrors.Errorf("failed to add to envelope expiry index: %w", err)
 		}
 
 		return nil
@@ -182,94 +217,134 @@ func (s *BBoltEnvelopeStore) GetEnvelopesByDestination(ctx context.Context, dest
 }
 
 // GetEnvelopeIDsByDestinationPage retrieves envelope IDs for a destination with deterministic cursor paging.
-func (s *BBoltEnvelopeStore) GetEnvelopeIDsByDestinationPage(ctx context.Context, destID string, afterCursor string, limit int) ([]string, string, int, error) {
+func (s *BBoltEnvelopeStore) GetEnvelopeIDsByDestinationPage(ctx context.Context, destID string, afterCursor string, limit int) ([]string, string, int, []string, error) {
 	if limit <= 0 {
-		return []string{}, "", 0, nil
+		return []string{}, "", 0, []string{}, nil
 	}
 	if afterCursor != "" && !gossipv1.IsDigestHexID(afterCursor) {
-		return nil, "", 0, fmt.Errorf("destination cursor must be 64 lowercase hex chars")
+		return nil, "", 0, nil, fmt.Errorf("destination cursor must be 64 lowercase hex chars")
 	}
 
-	prefix := []byte(destID + string(rune(0)))
+	prefix := destinationIndexPrefix(destID)
+	pageIDs := make([]string, 0, limit)
 	eligibleIDs := make([]string, 0, limit)
+	nowUnixNano := time.Now().UTC().UnixNano()
+	totalCount := 0
 
 	err := s.db.View(func(tx *bolt.Tx) error {
 		destinationBucket := tx.Bucket(model.BucketByDestination)
-		envelopesBucket := tx.Bucket(model.BucketEnvelopes)
-		if destinationBucket == nil || envelopesBucket == nil {
+		envelopeExpiryBucket := tx.Bucket(model.BucketEnvelopeExpiry)
+		if destinationBucket == nil || envelopeExpiryBucket == nil {
 			return fmt.Errorf("required envelope buckets are missing")
 		}
 
 		cursor := destinationBucket.Cursor()
-		for k, v := cursor.Seek(prefix); k != nil; k, v = cursor.Next() {
+		for k, _ := cursor.Seek(prefix); k != nil; k, _ = cursor.Next() {
 			if !bytes.HasPrefix(k, prefix) {
 				break
 			}
 
-			envBytes := envelopesBucket.Get(v)
-			if envBytes == nil {
+			itemID, ok := destinationIndexItemID(prefix, k)
+			if !ok {
+				continue
+			}
+			if !isEligibleDestinationItem(itemID, envelopeExpiryBucket.Get([]byte(itemID)), nowUnixNano) {
 				continue
 			}
 
-			env, decodeErr := s.codec.DecodeEnvelope(envBytes)
-			if decodeErr != nil {
+			totalCount++
+			eligibleIDs = append(eligibleIDs, itemID)
+		}
+
+		startKey := prefix
+		if afterCursor != "" {
+			startKey = append(append([]byte(nil), prefix...), afterCursor...)
+		}
+		for k, _ := cursor.Seek(startKey); k != nil && len(pageIDs) < limit; k, _ = cursor.Next() {
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+
+			itemID, ok := destinationIndexItemID(prefix, k)
+			if !ok {
 				continue
 			}
-			if env.IsExpired() {
+			if afterCursor != "" && itemID == afterCursor {
 				continue
 			}
-			if !gossipv1.IsDigestHexID(env.ID) {
+			if !isEligibleDestinationItem(itemID, envelopeExpiryBucket.Get([]byte(itemID)), nowUnixNano) {
 				continue
 			}
 
-			eligibleIDs = append(eligibleIDs, env.ID)
+			pageIDs = append(pageIDs, itemID)
 		}
 
 		return nil
 	})
 
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", 0, nil, err
 	}
 
-	if len(eligibleIDs) == 0 {
-		return []string{}, "", 0, nil
+	if totalCount == 0 {
+		return []string{}, "", 0, []string{}, nil
 	}
 
-	eligibleIDs, err = gossipv1.NormalizeDigestHexIDs(eligibleIDs)
-	if err != nil {
-		return nil, "", 0, err
-	}
-	totalCount := len(eligibleIDs)
-
-	start := 0
-	if afterCursor != "" {
-		for start < len(eligibleIDs) && gossipv1.CompareDigestHexIDs(eligibleIDs[start], afterCursor) <= 0 {
-			start++
-		}
-	}
-
-	if start >= len(eligibleIDs) {
-		return []string{}, "", totalCount, nil
-	}
-
-	end := start + limit
-	if end > len(eligibleIDs) {
-		end = len(eligibleIDs)
-	}
-
-	ids := append([]string(nil), eligibleIDs[start:end]...)
 	nextCursor := ""
-	if len(ids) > 0 {
-		nextCursor = ids[len(ids)-1]
+	if len(pageIDs) > 0 {
+		nextCursor = pageIDs[len(pageIDs)-1]
 	}
 
-	return ids, nextCursor, totalCount, nil
+	return pageIDs, nextCursor, totalCount, eligibleIDs, nil
+}
+
+// GetAllEnvelopeIDs returns all unique, non-expired digest envelope IDs.
+func (s *BBoltEnvelopeStore) GetAllEnvelopeIDs(ctx context.Context) ([]string, error) {
+	nowUnixNano := time.Now().UTC().UnixNano()
+	eligibleByID := make(map[string]struct{})
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		destinationBucket := tx.Bucket(model.BucketByDestination)
+		envelopeExpiryBucket := tx.Bucket(model.BucketEnvelopeExpiry)
+		if destinationBucket == nil || envelopeExpiryBucket == nil {
+			return fmt.Errorf("required envelope buckets are missing")
+		}
+
+		cursor := destinationBucket.Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			itemID, ok := destinationIndexItemIDFromKey(k)
+			if !ok {
+				continue
+			}
+			if !isEligibleDestinationItem(itemID, envelopeExpiryBucket.Get([]byte(itemID)), nowUnixNano) {
+				continue
+			}
+
+			eligibleByID[itemID] = struct{}{}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(eligibleByID) == 0 {
+		return []string{}, nil
+	}
+
+	eligibleIDs := make([]string, 0, len(eligibleByID))
+	for itemID := range eligibleByID {
+		eligibleIDs = append(eligibleIDs, itemID)
+	}
+	gossipv1.SortDigestHexIDs(eligibleIDs)
+
+	return eligibleIDs, nil
 }
 
 // RemoveEnvelope removes an envelope from all buckets.
 func (s *BBoltEnvelopeStore) RemoveEnvelope(ctx context.Context, envID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
+		envelopeExpiryBucket := tx.Bucket(model.BucketEnvelopeExpiry)
 		// Get envelope first to find keys
 		envBytes := tx.Bucket(model.BucketEnvelopes).Get([]byte(envID))
 		if envBytes != nil {
@@ -287,11 +362,61 @@ func (s *BBoltEnvelopeStore) RemoveEnvelope(ctx context.Context, envID string) e
 
 		// Remove from envelopes bucket
 		tx.Bucket(model.BucketEnvelopes).Delete([]byte(envID))
+		envelopeExpiryBucket.Delete([]byte(envID))
 
 		// Note: We don't remove seen entries - they're for historical tracking
 
 		return nil
 	})
+}
+
+func destinationIndexPrefix(destinationID string) []byte {
+	prefix := make([]byte, len(destinationID)+1)
+	copy(prefix, destinationID)
+	prefix[len(destinationID)] = byte(0)
+	return prefix
+}
+
+func destinationIndexItemID(prefix []byte, key []byte) (string, bool) {
+	if len(key) <= len(prefix) || !bytes.HasPrefix(key, prefix) {
+		return "", false
+	}
+	return string(key[len(prefix):]), true
+}
+
+func destinationIndexItemIDFromKey(key []byte) (string, bool) {
+	separator := bytes.IndexByte(key, byte(0))
+	if separator < 0 || separator+1 >= len(key) {
+		return "", false
+	}
+	return string(key[separator+1:]), true
+}
+
+func isEligibleDestinationItem(itemID string, encodedExpiry []byte, nowUnixNano int64) bool {
+	if !gossipv1.IsDigestHexID(itemID) {
+		return false
+	}
+	expiresAtUnixNano, ok := decodeUnixNano(encodedExpiry)
+	if !ok {
+		return false
+	}
+	if nowUnixNano > expiresAtUnixNano {
+		return false
+	}
+	return true
+}
+
+func encodeUnixNano(unixNano int64) []byte {
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, uint64(unixNano))
+	return out
+}
+
+func decodeUnixNano(raw []byte) (int64, bool) {
+	if len(raw) < 8 {
+		return 0, false
+	}
+	return int64(binary.BigEndian.Uint64(raw[:8])), true
 }
 
 // GetExpiredEnvelopes returns envelopes that have expired.

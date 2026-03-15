@@ -138,8 +138,12 @@ func (s *ingestEnvelopeStoreSpy) GetEnvelopesByDestination(ctx context.Context, 
 	return nil, nil
 }
 
-func (s *ingestEnvelopeStoreSpy) GetEnvelopeIDsByDestinationPage(ctx context.Context, destID string, afterCursor string, limit int) ([]string, string, int, error) {
-	return nil, "", 0, nil
+func (s *ingestEnvelopeStoreSpy) GetEnvelopeIDsByDestinationPage(ctx context.Context, destID string, afterCursor string, limit int) ([]string, string, int, []string, error) {
+	return nil, "", 0, nil, nil
+}
+
+func (s *ingestEnvelopeStoreSpy) GetAllEnvelopeIDs(ctx context.Context) ([]string, error) {
+	return nil, nil
 }
 
 func (s *ingestEnvelopeStoreSpy) RemoveEnvelope(ctx context.Context, envID string) error {

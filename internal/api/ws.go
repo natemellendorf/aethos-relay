@@ -788,12 +788,7 @@ func (h *WSHandler) buildRecipientSummary(queueRecipient string, afterCursor str
 		return gossipv1.BuildSummaryPreviewPayload(nil, nil, ""), "", nil
 	}
 
-	eligibleIDs, err := h.listRecipientEligibleIDs(queueRecipient)
-	if err != nil {
-		return gossipv1.SummaryPayload{}, "", err
-	}
-
-	previewIDs, nextCursor, _, err := h.envelopeStore.GetEnvelopeIDsByDestinationPage(context.Background(), queueRecipient, afterCursor, int(gossipv1.MaxSummaryPreviewItems))
+	previewIDs, nextCursor, totalCount, eligibleIDs, err := h.envelopeStore.GetEnvelopeIDsByDestinationPage(context.Background(), queueRecipient, afterCursor, int(gossipv1.MaxSummaryPreviewItems))
 	if err != nil {
 		return gossipv1.SummaryPayload{}, "", err
 	}
@@ -807,41 +802,8 @@ func (h *WSHandler) buildRecipientSummary(queueRecipient string, afterCursor str
 	}
 
 	summary := gossipv1.BuildSummaryPreviewPayload(eligibleIDs, normalizedPreview, "")
-	summary.ItemCount = uint64(len(eligibleIDs))
+	summary.ItemCount = uint64(totalCount)
 	return summary, nextCursor, nil
-}
-
-func (h *WSHandler) listRecipientEligibleIDs(queueRecipient string) ([]string, error) {
-	if queueRecipient == "" || h.envelopeStore == nil {
-		return []string{}, nil
-	}
-
-	const pageSize = 512
-	allIDs := make([]string, 0, pageSize)
-	cursor := ""
-
-	for {
-		ids, nextCursor, _, err := h.envelopeStore.GetEnvelopeIDsByDestinationPage(context.Background(), queueRecipient, cursor, pageSize)
-		if err != nil {
-			return nil, err
-		}
-		if len(ids) == 0 {
-			break
-		}
-
-		allIDs = append(allIDs, ids...)
-		if nextCursor == "" || nextCursor == cursor {
-			break
-		}
-		cursor = nextCursor
-	}
-
-	normalized, err := gossipv1.NormalizeDigestHexIDs(allIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	return normalized, nil
 }
 
 func canonicalTransferObjectFromMessage(message *model.Message) (gossipv1.TransferObject, bool) {

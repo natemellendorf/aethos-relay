@@ -8,13 +8,14 @@ import (
 
 // EnvelopeBucket keys for bbolt storage
 var (
-	BucketEnvelopes     = []byte("envelopes")
-	BucketByDestination = []byte("by_destination")
-	BucketByExpiry      = []byte("by_expiry")
-	BucketSeen          = []byte("seen")
-	BucketRelayIngest   = []byte("relay_ingest")
-	BucketMeta          = []byte("meta")
-	MetaLastSweep       = []byte("last_sweep")
+	BucketEnvelopes      = []byte("envelopes")
+	BucketByDestination  = []byte("by_destination")
+	BucketByExpiry       = []byte("by_expiry")
+	BucketEnvelopeExpiry = []byte("envelope_expiry")
+	BucketSeen           = []byte("seen")
+	BucketRelayIngest    = []byte("relay_ingest")
+	BucketMeta           = []byte("meta")
+	MetaLastSweep        = []byte("last_sweep")
 )
 
 // Envelope represents a federation message envelope that is persisted.
@@ -187,6 +188,12 @@ func (c *EnvelopeCodec) DecodeEnvelope(data []byte) (*Envelope, error) {
 }
 
 // DestinationIndexKey creates a composite key for the by_destination bucket.
+//
+// Key layout: destination_id || '\x00' || item_id
+//
+// item_id is a fixed-length lowercase hex digest (64 bytes as text). For this
+// alphabet, lexicographic byte order over item_id text equals digest-byte order,
+// so bbolt cursor iteration over key suffixes preserves spec item_id ordering.
 func DestinationIndexKey(destinationID string, msgID string) []byte {
 	var buf bytes.Buffer
 	buf.WriteString(destinationID)
