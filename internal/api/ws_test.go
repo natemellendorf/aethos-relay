@@ -187,6 +187,32 @@ func TestComputeMissingWantReturnsUnknownIDs(t *testing.T) {
 	}
 }
 
+func TestComputeMissingWantAppliesPreviewPriorityCapAndFinalSort(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	candidateOnly := strings.Repeat("01", 32)
+	previewOnly := strings.Repeat("ff", 32)
+	bloomIDs := []string{candidateOnly, previewOnly}
+	summary := gossipv1.BuildSummaryPreviewPayload(bloomIDs, []string{previewOnly}, "")
+
+	// peer cap should keep preview-priority item first.
+	want, err := h.computeMissingWant(&summary, []string{candidateOnly}, 1)
+	if err != nil {
+		t.Fatalf("computeMissingWant cap=1 failed: %v", err)
+	}
+	if len(want) != 1 || want[0] != previewOnly {
+		t.Fatalf("unexpected preview-priority want set: %#v", want)
+	}
+
+	// with remaining capacity, candidates are added and final output must be digest-sorted.
+	want, err = h.computeMissingWant(&summary, []string{candidateOnly}, 2)
+	if err != nil {
+		t.Fatalf("computeMissingWant cap=2 failed: %v", err)
+	}
+	if len(want) != 2 || want[0] != candidateOnly || want[1] != previewOnly {
+		t.Fatalf("unexpected final sorted want set: %#v", want)
+	}
+}
+
 func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	session := &clientSession{client: &model.Client{Send: make(chan []byte, 4)}}
@@ -238,6 +264,67 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 		rejected, _ := payload["rejected"].([]any)
 		if len(rejected) != 1 {
 			t.Fatalf("expected one rejected object, got %#v", payload["rejected"])
+		}
+	default:
+		t.Fatal("expected receipt frame")
+	}
+}
+
+func TestHandleTransferRejectsItemIDHashMismatch(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 2)}}
+
+	now := time.Now().UTC()
+	createdAt := now.Add(-time.Minute).Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	validID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	mismatchedID := strings.Repeat("ab", 32)
+	if mismatchedID == validID {
+		mismatchedID = strings.Repeat("ac", 32)
+	}
+
+	event := gossipv1.Event{
+		Type: gossipv1.EventTypeTransfer,
+		Transfer: &gossipv1.ParsedTransferPayload{
+			Objects: []gossipv1.IndexedTransferObject{{
+				Index: 0,
+				Object: gossipv1.TransferObject{
+					ID:         mismatchedID,
+					From:       "sender-a",
+					To:         "recipient-a",
+					PayloadB64: "QQ",
+					CreatedAt:  createdAt,
+					ExpiresAt:  expiresAt,
+				},
+			}},
+		},
+	}
+
+	if err := h.handleTransfer(session, event); err != nil {
+		t.Fatalf("handleTransfer failed: %v", err)
+	}
+	if len(st.persistedIDs) != 0 {
+		t.Fatalf("mismatched id transfer must not persist, got %#v", st.persistedIDs)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		receipt, err := gossipv1.ParseReceiptPayload(decoded.Payload)
+		if err != nil {
+			t.Fatalf("parse receipt payload: %v", err)
+		}
+		if len(receipt.Accepted) != 0 {
+			t.Fatalf("expected no accepted ids, got %#v", receipt.Accepted)
+		}
+		if len(receipt.Rejected) != 1 {
+			t.Fatalf("expected one rejected object, got %#v", receipt.Rejected)
+		}
+		if receipt.Rejected[0].ID != mismatchedID {
+			t.Fatalf("unexpected rejected id: got=%q want=%q", receipt.Rejected[0].ID, mismatchedID)
+		}
+		if receipt.Rejected[0].Reason != "id must equal sha256(canonical envelope bytes)" {
+			t.Fatalf("unexpected rejection reason: %q", receipt.Rejected[0].Reason)
 		}
 	default:
 		t.Fatal("expected receipt frame")

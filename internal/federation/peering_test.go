@@ -2,6 +2,7 @@ package federation
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"strings"
@@ -347,6 +348,56 @@ func TestHandleSummaryRejectsInvalidPreviewCursor(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected invalid preview_cursor to be rejected")
+	}
+}
+
+func TestComputeMissingWantAppliesPreviewPriorityCapAndFinalSort(t *testing.T) {
+	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+	candidateOnly := strings.Repeat("01", 32)
+	previewOnly := strings.Repeat("ff", 32)
+	bloomIDs := []string{candidateOnly, previewOnly}
+	summary := gossipv1.BuildSummaryPreviewPayload(bloomIDs, []string{previewOnly}, "")
+
+	want, err := pm.computeMissingWant(context.Background(), &summary, []string{candidateOnly}, 1)
+	if err != nil {
+		t.Fatalf("computeMissingWant cap=1 failed: %v", err)
+	}
+	if len(want) != 1 || want[0] != previewOnly {
+		t.Fatalf("unexpected preview-priority want set: %#v", want)
+	}
+
+	want, err = pm.computeMissingWant(context.Background(), &summary, []string{candidateOnly}, 2)
+	if err != nil {
+		t.Fatalf("computeMissingWant cap=2 failed: %v", err)
+	}
+	if len(want) != 2 || want[0] != candidateOnly || want[1] != previewOnly {
+		t.Fatalf("unexpected final sorted want set: %#v", want)
+	}
+}
+
+func TestTransferObjectToMessageRejectsItemIDHashMismatch(t *testing.T) {
+	now := time.Now().UTC()
+	createdAt := now.Add(-time.Minute).Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	validID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	mismatchedID := strings.Repeat("de", 32)
+	if mismatchedID == validID {
+		mismatchedID = strings.Repeat("df", 32)
+	}
+
+	_, err := transferObjectToMessage(gossipv1.TransferObject{
+		ID:         mismatchedID,
+		From:       "sender-a",
+		To:         "recipient-a",
+		PayloadB64: "QQ",
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
+	})
+	if err == nil {
+		t.Fatal("expected item_id mismatch to be rejected")
+	}
+	if err.Error() != "id must equal sha256(canonical envelope bytes)" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
