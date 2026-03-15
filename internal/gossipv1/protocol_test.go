@@ -10,7 +10,7 @@ import (
 
 func TestParseReceiptPayloadRejectsRejectedEntryMissingIDAndIndex(t *testing.T) {
 	_, err := ParseReceiptPayload(map[string]any{
-		"accepted": []string{},
+		"received": []string{},
 		"rejected": []map[string]any{{
 			"reason": "invalid transfer object",
 		}},
@@ -25,12 +25,49 @@ func TestParseReceiptPayloadRejectsRejectedEntryMissingIDAndIndex(t *testing.T) 
 
 func TestParseReceiptPayloadRejectsDuplicateAcceptedIDs(t *testing.T) {
 	_, err := ParseReceiptPayload(map[string]any{
-		"accepted": []string{"msg-1", "msg-1"},
+		"received": []string{"msg-1", "msg-1"},
 	})
 	if err == nil {
 		t.Fatal("expected parse error for duplicate accepted ids")
 	}
 	if !strings.Contains(err.Error(), "contains duplicate ids") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEncodeReceiptPayloadEmitsReceivedWithoutAccepted(t *testing.T) {
+	receipt := ReceiptPayload{Accepted: []string{"msg-1"}}
+
+	frame, err := EncodeEnvelope(FrameTypeReceipt, receipt)
+	if err != nil {
+		t.Fatalf("encode receipt envelope: %v", err)
+	}
+
+	decoded, err := DecodeEnvelope(frame)
+	if err != nil {
+		t.Fatalf("decode receipt envelope: %v", err)
+	}
+
+	if _, ok := decoded.Payload["accepted"]; ok {
+		t.Fatalf("receipt payload must not include accepted key: %#v", decoded.Payload)
+	}
+	received, ok := decoded.Payload["received"].([]any)
+	if !ok {
+		t.Fatalf("receipt payload must include received array: %#v", decoded.Payload)
+	}
+	if len(received) != 1 || received[0] != "msg-1" {
+		t.Fatalf("unexpected received ids: %#v", received)
+	}
+}
+
+func TestParseReceiptPayloadRejectsLegacyAcceptedKey(t *testing.T) {
+	_, err := ParseReceiptPayload(map[string]any{
+		"accepted": []string{"msg-1"},
+	})
+	if err == nil {
+		t.Fatal("expected parse error for legacy accepted key")
+	}
+	if !strings.Contains(err.Error(), "unknown receipt payload field \"accepted\"") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

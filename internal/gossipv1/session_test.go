@@ -7,7 +7,7 @@ func TestSessionAdapterReceiptValidationEmptyReceiptWithPendingTransferFails(t *
 	adapter.SetExpectedReceipt([]string{"msg-1"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"accepted": []string{},
+		"received": []string{},
 	}))
 	if len(events) != 1 || events[0].Type != EventTypeFatal {
 		t.Fatalf("expected fatal empty receipt coverage event, got %#v", events)
@@ -19,7 +19,7 @@ func TestSessionAdapterReceiptValidationPartialReceiptWithPendingTransferFails(t
 	adapter.SetExpectedReceipt([]string{"msg-1", "msg-2"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"accepted": []string{"msg-1"},
+		"received": []string{"msg-1"},
 	}))
 	if len(events) != 1 || events[0].Type != EventTypeFatal {
 		t.Fatalf("expected fatal partial receipt coverage event, got %#v", events)
@@ -31,7 +31,7 @@ func TestSessionAdapterReceiptValidationRejectedEntryMissingIDAndIndexFails(t *t
 	adapter.SetExpectedReceipt([]string{"msg-1"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"accepted": []string{},
+		"received": []string{},
 		"rejected": []map[string]any{{
 			"reason": "invalid transfer object",
 		}},
@@ -46,7 +46,7 @@ func TestSessionAdapterReceiptValidationEmptyTransferWithEmptyReceiptPasses(t *t
 	adapter.SetExpectedReceipt(nil)
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"accepted": []string{},
+		"received": []string{},
 	}))
 	if len(events) != 1 || events[0].Type != EventTypeReceipt {
 		t.Fatalf("expected receipt event, got %#v", events)
@@ -58,7 +58,7 @@ func TestSessionAdapterReceiptValidationUnknownAcceptedIDFails(t *testing.T) {
 	adapter.SetExpectedReceipt([]string{"msg-1"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"accepted": []string{"msg-unknown"},
+		"received": []string{"msg-unknown"},
 	}))
 	if len(events) != 1 || events[0].Type != EventTypeFatal {
 		t.Fatalf("expected fatal mismatched receipt event, got %#v", events)
@@ -70,7 +70,7 @@ func TestSessionAdapterReceiptValidationRejectedIndexResolvesCoveragePasses(t *t
 	adapter.SetExpectedReceipt([]string{"msg-1", "msg-2"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"accepted": []string{"msg-1"},
+		"received": []string{"msg-1"},
 		"rejected": []map[string]any{{
 			"index":  uint64(1),
 			"reason": "invalid transfer object",
@@ -86,7 +86,7 @@ func TestSessionAdapterReceiptValidationDuplicateAcknowledgementFails(t *testing
 	adapter.SetExpectedReceipt([]string{"msg-1", "msg-2"})
 
 	events := adapter.PushInbound(mustPrefixedEnvelope(t, FrameTypeReceipt, map[string]any{
-		"accepted": []string{"msg-1"},
+		"received": []string{"msg-1"},
 		"rejected": []map[string]any{{
 			"id":     "msg-1",
 			"reason": "duplicate ack",
