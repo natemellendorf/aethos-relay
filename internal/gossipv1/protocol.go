@@ -113,7 +113,7 @@ type IndexedTransferObject struct {
 }
 
 type ReceiptPayload struct {
-	Accepted []string                  `cbor:"accepted"`
+	Accepted []string                  `cbor:"received"`
 	Rejected []TransferObjectRejection `cbor:"rejected,omitempty"`
 }
 
@@ -571,7 +571,7 @@ func ParseReceiptPayload(payload map[string]any) (ReceiptPayload, error) {
 	}
 
 	allowed := map[string]struct{}{
-		"accepted": {},
+		"received": {},
 		"rejected": {},
 	}
 	for key := range payload {
@@ -580,15 +580,15 @@ func ParseReceiptPayload(payload map[string]any) (ReceiptPayload, error) {
 		}
 	}
 
-	accepted, err := parseStringSlice(payload, "accepted")
+	received, err := parseStringSlice(payload, "received")
 	if err != nil {
 		return ReceiptPayload{}, err
 	}
-	if hasDuplicateStrings(accepted) {
-		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt accepted contains duplicate ids")
+	if hasDuplicateStrings(received) {
+		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt received contains duplicate ids")
 	}
-	if uint64(len(accepted)) > MaxReceiptItems {
-		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt accepted exceeds limit: %d > %d", len(accepted), MaxReceiptItems)
+	if uint64(len(received)) > MaxReceiptItems {
+		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt received exceeds limit: %d > %d", len(received), MaxReceiptItems)
 	}
 
 	rejected, err := parseReceiptRejected(payload)
@@ -599,7 +599,7 @@ func ParseReceiptPayload(payload map[string]any) (ReceiptPayload, error) {
 		return ReceiptPayload{}, fmt.Errorf("gossipv1: receipt rejected exceeds limit: %d > %d", len(rejected), MaxReceiptItems)
 	}
 
-	return ReceiptPayload{Accepted: accepted, Rejected: rejected}, nil
+	return ReceiptPayload{Accepted: received, Rejected: rejected}, nil
 }
 
 func ValidateHello(hello HelloPayload) error {

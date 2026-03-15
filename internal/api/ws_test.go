@@ -257,9 +257,12 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 	select {
 	case outbound := <-session.client.Send:
 		payload := decodeEnvelopePayloadMap(t, outbound)
-		accepted, _ := payload["accepted"].([]any)
-		if len(accepted) != 1 || accepted[0] != validID {
-			t.Fatalf("unexpected accepted list: %#v", payload["accepted"])
+		received, _ := payload["received"].([]any)
+		if len(received) != 1 || received[0] != validID {
+			t.Fatalf("unexpected received list: %#v", payload["received"])
+		}
+		if _, hasAccepted := payload["accepted"]; hasAccepted {
+			t.Fatalf("receipt payload must not include accepted key: %#v", payload)
 		}
 		rejected, _ := payload["rejected"].([]any)
 		if len(rejected) != 1 {
@@ -411,9 +414,12 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 	select {
 	case outbound := <-session.client.Send:
 		payload := decodeEnvelopePayloadMap(t, outbound)
-		accepted, _ := payload["accepted"].([]any)
-		if len(accepted) != 1 || accepted[0] != duplicateID {
-			t.Fatalf("unexpected receipt accepted list: %#v", payload["accepted"])
+		received, _ := payload["received"].([]any)
+		if len(received) != 1 || received[0] != duplicateID {
+			t.Fatalf("unexpected receipt received list: %#v", payload["received"])
+		}
+		if _, hasAccepted := payload["accepted"]; hasAccepted {
+			t.Fatalf("receipt payload must not include accepted key: %#v", payload)
 		}
 	default:
 		t.Fatal("expected receipt frame")
