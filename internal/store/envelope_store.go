@@ -9,6 +9,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/xerrors"
 
+	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 )
 
@@ -67,6 +68,28 @@ func (s *BBoltEnvelopeStore) Close() error {
 // PersistEnvelope stores an envelope and adds it to destination and expiry indexes.
 func (s *BBoltEnvelopeStore) PersistEnvelope(ctx context.Context, env *model.Envelope) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
+		envelopesBucket := tx.Bucket(model.BucketEnvelopes)
+		byDestinationBucket := tx.Bucket(model.BucketByDestination)
+		byExpiryBucket := tx.Bucket(model.BucketByExpiry)
+
+		existingBytes := envelopesBucket.Get([]byte(env.ID))
+		if existingBytes != nil {
+			existing, decodeErr := s.codec.DecodeEnvelope(existingBytes)
+			if decodeErr == nil {
+				existingDestKey := model.DestinationIndexKey(existing.DestinationID, env.ID)
+				newDestKey := model.DestinationIndexKey(env.DestinationID, env.ID)
+				if !bytes.Equal(existingDestKey, newDestKey) {
+					_ = byDestinationBucket.Delete(existingDestKey)
+				}
+
+				existingExpiryKey := model.ExpiryIndexKey(existing.ExpiresAt, env.ID)
+				newExpiryKey := model.ExpiryIndexKey(env.ExpiresAt, env.ID)
+				if !bytes.Equal(existingExpiryKey, newExpiryKey) {
+					_ = byExpiryBucket.Delete(existingExpiryKey)
+				}
+			}
+		}
+
 		// Validate envelope before persisting
 		if err := env.Validate(); err != nil {
 			return xerrors.Errorf("invalid envelope: %w", err)
@@ -77,19 +100,19 @@ func (s *BBoltEnvelopeStore) PersistEnvelope(ctx context.Context, env *model.Env
 		if err != nil {
 			return xerrors.Errorf("failed to encode envelope: %w", err)
 		}
-		if err := tx.Bucket(model.BucketEnvelopes).Put([]byte(env.ID), envBytes); err != nil {
+		if err := envelopesBucket.Put([]byte(env.ID), envBytes); err != nil {
 			return xerrors.Errorf("failed to store envelope: %w", err)
 		}
 
 		// Add to destination index
 		destKey := model.DestinationIndexKey(env.DestinationID, env.ID)
-		if err := tx.Bucket(model.BucketByDestination).Put(destKey, []byte(env.ID)); err != nil {
+		if err := byDestinationBucket.Put(destKey, []byte(env.ID)); err != nil {
 			return xerrors.Errorf("failed to add to destination index: %w", err)
 		}
 
 		// Add to expiry index
 		expiryKey := model.ExpiryIndexKey(env.ExpiresAt, env.ID)
-		if err := tx.Bucket(model.BucketByExpiry).Put(expiryKey, []byte(env.ID)); err != nil {
+		if err := byExpiryBucket.Put(expiryKey, []byte(env.ID)); err != nil {
 			return xerrors.Errorf("failed to add to expiry index: %w", err)
 		}
 
@@ -156,6 +179,92 @@ func (s *BBoltEnvelopeStore) GetEnvelopesByDestination(ctx context.Context, dest
 	})
 
 	return envelopes, err
+}
+
+// GetEnvelopeIDsByDestinationPage retrieves envelope IDs for a destination with deterministic cursor paging.
+func (s *BBoltEnvelopeStore) GetEnvelopeIDsByDestinationPage(ctx context.Context, destID string, afterCursor string, limit int) ([]string, string, int, error) {
+	if limit <= 0 {
+		return []string{}, "", 0, nil
+	}
+	if afterCursor != "" && !gossipv1.IsDigestHexID(afterCursor) {
+		return nil, "", 0, fmt.Errorf("destination cursor must be 64 lowercase hex chars")
+	}
+
+	prefix := []byte(destID + string(rune(0)))
+	eligibleIDs := make([]string, 0, limit)
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		destinationBucket := tx.Bucket(model.BucketByDestination)
+		envelopesBucket := tx.Bucket(model.BucketEnvelopes)
+		if destinationBucket == nil || envelopesBucket == nil {
+			return fmt.Errorf("required envelope buckets are missing")
+		}
+
+		cursor := destinationBucket.Cursor()
+		for k, v := cursor.Seek(prefix); k != nil; k, v = cursor.Next() {
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+
+			envBytes := envelopesBucket.Get(v)
+			if envBytes == nil {
+				continue
+			}
+
+			env, decodeErr := s.codec.DecodeEnvelope(envBytes)
+			if decodeErr != nil {
+				continue
+			}
+			if env.IsExpired() {
+				continue
+			}
+			if !gossipv1.IsDigestHexID(env.ID) {
+				continue
+			}
+
+			eligibleIDs = append(eligibleIDs, env.ID)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	if len(eligibleIDs) == 0 {
+		return []string{}, "", 0, nil
+	}
+
+	eligibleIDs, err = gossipv1.NormalizeDigestHexIDs(eligibleIDs)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	totalCount := len(eligibleIDs)
+
+	start := 0
+	if afterCursor != "" {
+		for start < len(eligibleIDs) && gossipv1.CompareDigestHexIDs(eligibleIDs[start], afterCursor) <= 0 {
+			start++
+		}
+	}
+
+	if start >= len(eligibleIDs) {
+		return []string{}, "", totalCount, nil
+	}
+
+	end := start + limit
+	if end > len(eligibleIDs) {
+		end = len(eligibleIDs)
+	}
+
+	ids := append([]string(nil), eligibleIDs[start:end]...)
+	nextCursor := ""
+	if len(ids) > 0 {
+		nextCursor = ids[len(ids)-1]
+	}
+
+	return ids, nextCursor, totalCount, nil
 }
 
 // RemoveEnvelope removes an envelope from all buckets.

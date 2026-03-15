@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -317,13 +318,35 @@ func TestForwardToPeersRequiresMessage(t *testing.T) {
 func TestHandleSummarySkipsRequestWhenComputedWantEmpty(t *testing.T) {
 	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
 	peer := &Peer{ID: "peer-1"}
+	id := strings.Repeat("aa", 32)
+	bloom := gossipv1.BuildSummaryPayload([]string{id}).BloomFilter
 
 	err := pm.handleSummary(peer, gossipv1.Event{
 		Type:    gossipv1.EventTypeSummary,
-		Summary: &gossipv1.SummaryPayload{Have: []string{"msg-1"}},
+		Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{id}, PreviewCursor: id},
 	})
-	if err != nil {
-		t.Fatalf("expected summary with empty want to be no-op, got %v", err)
+	if err == nil {
+		t.Fatal("expected summary with unresolved unknown digest to fail due to missing connection")
+	}
+}
+
+func TestHandleSummaryRejectsInvalidPreviewCursor(t *testing.T) {
+	pm := NewPeerManager("relay-a", nil, nil, time.Hour)
+	peer := &Peer{ID: "peer-1"}
+	idA := strings.Repeat("ab", 32)
+	idB := strings.Repeat("ac", 32)
+	bloom := gossipv1.BuildSummaryPayload([]string{idA, idB}).BloomFilter
+
+	err := pm.handleSummary(peer, gossipv1.Event{
+		Type: gossipv1.EventTypeSummary,
+		Summary: &gossipv1.SummaryPayload{
+			BloomFilter:    bloom,
+			PreviewItemIDs: []string{idA, idB},
+			PreviewCursor:  idA,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid preview_cursor to be rejected")
 	}
 }
 

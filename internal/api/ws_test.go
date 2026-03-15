@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
+	"github.com/natemellendorf/aethos-relay/internal/store"
 	"github.com/natemellendorf/aethos-relay/internal/storeforward"
 )
 
@@ -130,6 +133,20 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 	return h, st
 }
 
+func newEnvelopeStoreForTest(t *testing.T) *store.BBoltEnvelopeStore {
+	t.Helper()
+
+	envelopeStore := store.NewBBoltEnvelopeStore(filepath.Join(t.TempDir(), "relay.db.envelopes"))
+	if err := envelopeStore.Open(); err != nil {
+		t.Fatalf("open envelope store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = envelopeStore.Close()
+	})
+
+	return envelopeStore
+}
+
 func decodeEnvelopePayloadMap(t *testing.T, payload []byte) map[string]any {
 	t.Helper()
 	decoded := decodeEnvelope(t, payload)
@@ -156,13 +173,16 @@ func decodeEnvelope(t *testing.T, payload []byte) gossipv1.DecodedEnvelope {
 
 func TestComputeMissingWantReturnsUnknownIDs(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
-	st.messagesByID["msg-1"] = &model.Message{ID: "msg-1"}
+	known := strings.Repeat("01", 32)
+	unknown := strings.Repeat("02", 32)
+	st.messagesByID[known] = &model.Message{ID: known}
+	summary := &gossipv1.SummaryPayload{BloomFilter: gossipv1.BuildSummaryPayload([]string{known, unknown}).BloomFilter, PreviewItemIDs: []string{known, unknown}, PreviewCursor: unknown}
 
-	want, err := h.computeMissingWant([]string{"msg-1", "msg-2"})
+	want, err := h.computeMissingWant(summary, nil, gossipv1.MaxWantItems)
 	if err != nil {
 		t.Fatalf("computeMissingWant failed: %v", err)
 	}
-	if len(want) != 1 || want[0] != "msg-2" {
+	if len(want) != 1 || want[0] != unknown {
 		t.Fatalf("unexpected want set: %#v", want)
 	}
 }
@@ -172,25 +192,29 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 	session := &clientSession{client: &model.Client{Send: make(chan []byte, 4)}}
 
 	now := time.Now().UTC()
+	validCreatedAt := now.Add(-time.Minute).Unix()
+	validExpiresAt := now.Add(time.Hour).Unix()
+	validID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", validCreatedAt, validExpiresAt)
+	invalidID := gossipv1.ComputeItemID("sender-a", "recipient-a", "not_base64", validCreatedAt, validExpiresAt)
 	event := gossipv1.Event{
 		Type: gossipv1.EventTypeTransfer,
 		Transfer: &gossipv1.ParsedTransferPayload{
 			Objects: []gossipv1.IndexedTransferObject{
 				{Index: 0, Object: gossipv1.TransferObject{
-					ID:         "msg-valid",
+					ID:         validID,
 					From:       "sender-a",
 					To:         "recipient-a",
 					PayloadB64: "QQ",
-					CreatedAt:  now.Add(-time.Minute).Unix(),
-					ExpiresAt:  now.Add(time.Hour).Unix(),
+					CreatedAt:  validCreatedAt,
+					ExpiresAt:  validExpiresAt,
 				}},
 				{Index: 1, Object: gossipv1.TransferObject{
-					ID:         "msg-bad",
+					ID:         invalidID,
 					From:       "sender-a",
 					To:         "recipient-a",
 					PayloadB64: "not_base64",
-					CreatedAt:  now.Add(-time.Minute).Unix(),
-					ExpiresAt:  now.Add(time.Hour).Unix(),
+					CreatedAt:  validCreatedAt,
+					ExpiresAt:  validExpiresAt,
 				}},
 			},
 		},
@@ -200,7 +224,7 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 		t.Fatalf("handleTransfer failed: %v", err)
 	}
 
-	if len(st.persistedIDs) != 1 || st.persistedIDs[0] != "msg-valid" {
+	if len(st.persistedIDs) != 1 || st.persistedIDs[0] != validID {
 		t.Fatalf("expected only msg-valid persisted, got %#v", st.persistedIDs)
 	}
 
@@ -208,7 +232,7 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 	case outbound := <-session.client.Send:
 		payload := decodeEnvelopePayloadMap(t, outbound)
 		accepted, _ := payload["accepted"].([]any)
-		if len(accepted) != 1 || accepted[0] != "msg-valid" {
+		if len(accepted) != 1 || accepted[0] != validID {
 			t.Fatalf("unexpected accepted list: %#v", payload["accepted"])
 		}
 		rejected, _ := payload["rejected"].([]any)
@@ -263,13 +287,16 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 	session := &clientSession{client: &model.Client{Send: make(chan []byte, 1), DeliveryID: "client\x00device"}}
 
 	now := time.Now().UTC()
-	st.messagesByID["msg-dup"] = &model.Message{
-		ID:        "msg-dup",
+	createdAt := now.Add(-time.Minute)
+	expiresAt := now.Add(time.Hour)
+	duplicateID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", createdAt.Unix(), expiresAt.Unix())
+	st.messagesByID[duplicateID] = &model.Message{
+		ID:        duplicateID,
 		From:      "sender-a",
 		To:        "recipient-a",
 		Payload:   "QQ",
-		CreatedAt: now.Add(-time.Minute),
-		ExpiresAt: now.Add(time.Hour),
+		CreatedAt: createdAt,
+		ExpiresAt: expiresAt,
 	}
 
 	event := gossipv1.Event{
@@ -277,12 +304,12 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 		Transfer: &gossipv1.ParsedTransferPayload{Objects: []gossipv1.IndexedTransferObject{{
 			Index: 0,
 			Object: gossipv1.TransferObject{
-				ID:         "msg-dup",
+				ID:         duplicateID,
 				From:       "sender-a",
 				To:         "recipient-a",
 				PayloadB64: "QQ",
-				CreatedAt:  now.Add(-time.Minute).Unix(),
-				ExpiresAt:  now.Add(time.Hour).Unix(),
+				CreatedAt:  createdAt.Unix(),
+				ExpiresAt:  expiresAt.Unix(),
 			},
 		}}},
 	}
@@ -298,7 +325,7 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 	case outbound := <-session.client.Send:
 		payload := decodeEnvelopePayloadMap(t, outbound)
 		accepted, _ := payload["accepted"].([]any)
-		if len(accepted) != 1 || accepted[0] != "msg-dup" {
+		if len(accepted) != 1 || accepted[0] != duplicateID {
 			t.Fatalf("unexpected receipt accepted list: %#v", payload["accepted"])
 		}
 	default:
@@ -310,7 +337,19 @@ func TestHandleHelloValidatedEmitsCanonicalSummaryOnly(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	clientHello := gossipv1.BuildRelayHello("client-summary-canonical")
 	queueRecipient := storeforward.QueueRecipient(storeforward.DeliveryIdentity(clientHello.NodeID, clientHello.NodePubKey))
-	st.queuedByRecipient[queueRecipient] = []string{"msg-b", "", "msg-a", "msg-a"}
+	now := time.Now().UTC()
+	digestA := gossipv1.ComputeItemID("sender-a", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	digestB := gossipv1.ComputeItemID("sender-b", queueRecipient, "Qg", now.Add(time.Second).Unix(), now.Add(time.Hour).Unix())
+	st.queuedByRecipient[queueRecipient] = []string{digestB, "", digestA, digestA}
+	st.messagesByID[digestA] = &model.Message{ID: digestA, To: queueRecipient, ExpiresAt: time.Now().Add(time.Hour)}
+	st.messagesByID[digestB] = &model.Message{ID: digestB, To: queueRecipient, ExpiresAt: time.Now().Add(time.Hour)}
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+	for _, id := range []string{digestA, digestB} {
+		if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{ID: id, DestinationID: queueRecipient, OpaquePayload: []byte("QQ"), OriginRelayID: "relay", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+			t.Fatalf("persist envelope: %v", err)
+		}
+	}
 
 	session := &clientSession{
 		client:  &model.Client{Send: make(chan []byte, 2)},
@@ -328,7 +367,7 @@ func TestHandleHelloValidatedEmitsCanonicalSummaryOnly(t *testing.T) {
 		if decoded.Type != gossipv1.FrameTypeSummary {
 			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
 		}
-		if len(decoded.Payload) != 2 {
+		if len(decoded.Payload) != 4 {
 			t.Fatalf("summary payload must include only canonical keys, got %#v", decoded.Payload)
 		}
 		if _, hasLegacyHave := decoded.Payload["have"]; hasLegacyHave {
@@ -339,16 +378,269 @@ func TestHandleHelloValidatedEmitsCanonicalSummaryOnly(t *testing.T) {
 		if parseErr != nil {
 			t.Fatalf("summary payload must be parseable by client decoder: %v", parseErr)
 		}
-		if summary.ItemCount != 2 {
-			t.Fatalf("unexpected summary item_count: got=%d want=2", summary.ItemCount)
+		if summary.ItemCount != uint64(len(summary.PreviewItemIDs)) {
+			t.Fatalf("unexpected summary item_count: got=%d want=%d", summary.ItemCount, len(summary.PreviewItemIDs))
 		}
-		if !gossipv1.BloomFilterMightContain(summary.BloomFilter, "msg-a") {
-			t.Fatal("summary bloom filter must include msg-a")
+		if len(summary.PreviewItemIDs) < 2 {
+			t.Fatalf("unexpected summary preview_item_ids: %#v", summary.PreviewItemIDs)
 		}
-		if !gossipv1.BloomFilterMightContain(summary.BloomFilter, "msg-b") {
-			t.Fatal("summary bloom filter must include msg-b")
+		contains := func(ids []string, target string) bool {
+			for _, id := range ids {
+				if id == target {
+					return true
+				}
+			}
+			return false
+		}
+		if !contains(summary.PreviewItemIDs, digestA) || !contains(summary.PreviewItemIDs, digestB) {
+			t.Fatalf("summary preview must include canonical queued IDs: %#v", summary.PreviewItemIDs)
+		}
+		if !gossipv1.BloomFilterMightContain(summary.BloomFilter, digestA) {
+			t.Fatal("summary bloom filter must include digestA")
+		}
+		if !gossipv1.BloomFilterMightContain(summary.BloomFilter, digestB) {
+			t.Fatal("summary bloom filter must include digestB")
 		}
 	default:
 		t.Fatal("expected outbound SUMMARY frame")
+	}
+}
+
+func TestHandleHelloValidatedSummaryUsesCanonicalEnvelopePreview(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	clientHello := gossipv1.BuildRelayHello("client-summary-envelope")
+	queueRecipient := storeforward.QueueRecipient(storeforward.DeliveryIdentity(clientHello.NodeID, clientHello.NodePubKey))
+
+	// Legacy queue-shaped IDs should not drive preview when envelope store is configured.
+	legacyQueueID := "legacy-queue-id"
+	st.queuedByRecipient[queueRecipient] = []string{legacyQueueID}
+	st.messagesByID[legacyQueueID] = &model.Message{ID: legacyQueueID, To: queueRecipient, ExpiresAt: time.Now().Add(time.Hour)}
+	now := time.Now().UTC()
+	eligibleID := gossipv1.ComputeItemID("sender-eligible", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	otherID := gossipv1.ComputeItemID("sender-other", "different-destination", "Qg", now.Add(time.Second).Unix(), now.Add(time.Hour).Unix())
+
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            eligibleID,
+		DestinationID: queueRecipient,
+		OpaquePayload: []byte("QQ"),
+		OriginRelayID: "relay-test",
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("persist eligible envelope: %v", err)
+	}
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            otherID,
+		DestinationID: "different-destination",
+		OpaquePayload: []byte("QQ"),
+		OriginRelayID: "relay-test",
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("persist unrelated envelope: %v", err)
+	}
+
+	session := &clientSession{
+		client:  &model.Client{Send: make(chan []byte, 2)},
+		adapter: gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-test"), false),
+	}
+
+	if err := h.handleHelloValidated(session, gossipv1.Event{Type: gossipv1.EventTypeHelloValidated, Hello: &clientHello}); err != nil {
+		t.Fatalf("handleHelloValidated failed: %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		summary, err := gossipv1.ParseSummaryPayload(decodeEnvelope(t, outbound).Payload)
+		if err != nil {
+			t.Fatalf("parse summary payload: %v", err)
+		}
+		if len(summary.PreviewItemIDs) != 1 || summary.PreviewItemIDs[0] != eligibleID {
+			t.Fatalf("unexpected recipient-aware preview IDs: %#v", summary.PreviewItemIDs)
+		}
+		for _, id := range summary.PreviewItemIDs {
+			if id == legacyQueueID {
+				t.Fatalf("summary preview must not use queue-shaped legacy ids: %#v", summary.PreviewItemIDs)
+			}
+		}
+	default:
+		t.Fatal("expected outbound SUMMARY frame")
+	}
+}
+
+func TestHandleSummaryRequestsUnknownPreviewIDs(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 1)}}
+	session.peerMaxWant = 2
+
+	knownID := strings.Repeat("0e", 32)
+	unknownA := strings.Repeat("0f", 32)
+	unknownB := strings.Repeat("10", 32)
+	st.messagesByID[knownID] = &model.Message{ID: knownID, ExpiresAt: time.Now().Add(time.Hour)}
+	bloom := gossipv1.BuildSummaryPayload([]string{knownID, unknownA, unknownB}).BloomFilter
+	event := gossipv1.Event{Type: gossipv1.EventTypeSummary, Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{knownID, unknownA, unknownB}, PreviewCursor: unknownB}}
+
+	if err := h.handleSummary(session, event); err != nil {
+		t.Fatalf("handleSummary failed: %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeRequest {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		request, err := gossipv1.ParseRequestPayload(decoded.Payload)
+		if err != nil {
+			t.Fatalf("parse request payload: %v", err)
+		}
+		if len(request.Want) != 2 || request.Want[0] != unknownA || request.Want[1] != unknownB {
+			t.Fatalf("unexpected request want set: %#v", request.Want)
+		}
+	default:
+		t.Fatal("expected outbound REQUEST frame")
+	}
+}
+
+func TestComputeMissingWantUsesEnvelopeStoreAndMessageStoreForKnownObjects(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	objectID := strings.Repeat("11", 32)
+	bloom := gossipv1.BuildSummaryPayload([]string{objectID}).BloomFilter
+	st.messagesByID[objectID] = &model.Message{ID: objectID, ExpiresAt: time.Now().Add(time.Hour)}
+	summary := &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{objectID}, PreviewCursor: objectID}
+
+	want, err := h.computeMissingWant(summary, nil, gossipv1.MaxWantItems)
+	if err != nil {
+		t.Fatalf("computeMissingWant failed: %v", err)
+	}
+	if len(want) != 0 {
+		t.Fatalf("expected known object in message store to suppress request, got %#v", want)
+	}
+
+	now := time.Now().UTC()
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            objectID,
+		DestinationID: "dest-1",
+		OpaquePayload: []byte("QQ"),
+		OriginRelayID: "relay-test",
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("persist envelope: %v", err)
+	}
+
+	want, err = h.computeMissingWant(summary, nil, gossipv1.MaxWantItems)
+	if err != nil {
+		t.Fatalf("computeMissingWant after persist failed: %v", err)
+	}
+	if len(want) != 0 {
+		t.Fatalf("expected object to remain known after envelope persist, got %#v", want)
+	}
+}
+
+func TestHandleSummaryRejectsInvalidPreviewCursor(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 1)}}
+	idA := strings.Repeat("12", 32)
+	idB := strings.Repeat("13", 32)
+	bloom := gossipv1.BuildSummaryPayload([]string{idA, idB}).BloomFilter
+	event := gossipv1.Event{Type: gossipv1.EventTypeSummary, Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{idA, idB}, PreviewCursor: idA}}
+
+	if err := h.handleSummary(session, event); err == nil {
+		t.Fatal("expected summary cursor invariant violation")
+	}
+}
+
+func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	queueRecipient := "wayfarer-summary-paging"
+	now := time.Now().UTC()
+	allItemIDs := make([]string, 0, 70)
+	for i := 0; i < 70; i++ {
+		payload := model.EncodePayloadB64([]byte{byte(i + 1)}, model.PayloadEncodingPrefBase64URL)
+		createdAt := now.Add(time.Duration(i) * time.Second)
+		expiresAt := now.Add(2 * time.Hour)
+		itemID := gossipv1.ComputeItemID("sender", queueRecipient, payload, createdAt.Unix(), expiresAt.Unix())
+		allItemIDs = append(allItemIDs, itemID)
+
+		if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+			ID:            itemID,
+			DestinationID: queueRecipient,
+			OpaquePayload: []byte(payload),
+			OriginRelayID: "relay-test",
+			CreatedAt:     createdAt,
+			ExpiresAt:     expiresAt,
+		}); err != nil {
+			t.Fatalf("persist envelope %d: %v", i, err)
+		}
+	}
+
+	// Non-content-addressed IDs must never appear in preview inventory.
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            "123e4567-e89b-12d3-a456-426614174000",
+		DestinationID: queueRecipient,
+		OpaquePayload: []byte("legacy"),
+		OriginRelayID: "relay-test",
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(2 * time.Hour),
+	}); err != nil {
+		t.Fatalf("persist non-digest envelope: %v", err)
+	}
+
+	summary, nextCursor, err := h.buildRecipientSummary(queueRecipient, "")
+	if err != nil {
+		t.Fatalf("build first summary: %v", err)
+	}
+	if len(summary.BloomFilter) != gossipv1.BloomFilterBytes {
+		t.Fatalf("unexpected bloom length: got=%d want=%d", len(summary.BloomFilter), gossipv1.BloomFilterBytes)
+	}
+	if summary.ItemCount != uint64(len(allItemIDs)) {
+		t.Fatalf("unexpected item_count: got=%d want=%d", summary.ItemCount, len(allItemIDs))
+	}
+	if len(summary.PreviewItemIDs) != int(gossipv1.MaxSummaryPreviewItems) {
+		t.Fatalf("unexpected preview size: got=%d want=%d", len(summary.PreviewItemIDs), gossipv1.MaxSummaryPreviewItems)
+	}
+	if summary.PreviewCursor == "" {
+		t.Fatal("expected non-empty preview cursor")
+	}
+	if summary.PreviewCursor != summary.PreviewItemIDs[len(summary.PreviewItemIDs)-1] {
+		t.Fatalf("preview cursor invariant violated: cursor=%q last=%q", summary.PreviewCursor, summary.PreviewItemIDs[len(summary.PreviewItemIDs)-1])
+	}
+	if nextCursor != summary.PreviewCursor {
+		t.Fatalf("unexpected next cursor: got=%q want=%q", nextCursor, summary.PreviewCursor)
+	}
+
+	for idx := 1; idx < len(summary.PreviewItemIDs); idx++ {
+		if gossipv1.CompareDigestHexIDs(summary.PreviewItemIDs[idx-1], summary.PreviewItemIDs[idx]) >= 0 {
+			t.Fatalf("preview ids not strictly sorted at %d: %q >= %q", idx, summary.PreviewItemIDs[idx-1], summary.PreviewItemIDs[idx])
+		}
+	}
+
+	nextSummary, secondCursor, err := h.buildRecipientSummary(queueRecipient, nextCursor)
+	if err != nil {
+		t.Fatalf("build second summary: %v", err)
+	}
+	if len(nextSummary.PreviewItemIDs) == 0 {
+		t.Fatal("expected non-empty second preview page")
+	}
+	if len(nextSummary.PreviewItemIDs) != len(allItemIDs)-int(gossipv1.MaxSummaryPreviewItems) {
+		t.Fatalf("unexpected second page size: got=%d", len(nextSummary.PreviewItemIDs))
+	}
+	for _, id := range nextSummary.PreviewItemIDs {
+		if gossipv1.CompareDigestHexIDs(id, nextCursor) <= 0 {
+			t.Fatalf("second page id not strictly after cursor: id=%q cursor=%q", id, nextCursor)
+		}
+	}
+	if secondCursor != nextSummary.PreviewCursor {
+		t.Fatalf("unexpected second next cursor: got=%q want=%q", secondCursor, nextSummary.PreviewCursor)
 	}
 }

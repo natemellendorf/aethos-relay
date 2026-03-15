@@ -78,6 +78,10 @@ type EnvelopeStore interface {
 	// GetEnvelopesByDestination retrieves envelopes for a destination.
 	GetEnvelopesByDestination(ctx context.Context, destID string, limit int) ([]*model.Envelope, error)
 
+	// GetEnvelopeIDsByDestinationPage retrieves envelope IDs by destination.
+	// afterCursor returns IDs strictly greater than cursor by digest-byte order.
+	GetEnvelopeIDsByDestinationPage(ctx context.Context, destID string, afterCursor string, limit int) (ids []string, nextCursor string, totalCount int, err error)
+
 	// RemoveEnvelope removes an envelope by ID.
 	RemoveEnvelope(ctx context.Context, envID string) error
 

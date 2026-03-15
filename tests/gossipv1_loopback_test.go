@@ -72,19 +72,22 @@ func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
 	initialSummary := readEnvelope(t, conn)
 	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
 
-	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, map[string]any{"have": []string{"loop-msg-1"}})
+	now := time.Now().UTC()
+	createdAt := now.Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	loopMsgID := testItemID("sender-1", clientHello.NodeID, "QQ", createdAt, expiresAt)
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{loopMsgID}))
 
 	request := readEnvelope(t, conn)
 	assertFrameType(t, request, gossipv1.FrameTypeRequest)
 
-	now := time.Now().UTC()
 	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{{
-		ID:         "loop-msg-1",
+		ID:         loopMsgID,
 		From:       "sender-1",
 		To:         clientHello.NodeID,
 		PayloadB64: "QQ",
-		CreatedAt:  now.Unix(),
-		ExpiresAt:  now.Add(time.Hour).Unix(),
+		CreatedAt:  createdAt,
+		ExpiresAt:  expiresAt,
 	}}})
 
 	receipt := readEnvelope(t, conn)
@@ -93,11 +96,11 @@ func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse receipt: %v", err)
 	}
-	if len(parsedReceipt.Accepted) != 1 || parsedReceipt.Accepted[0] != "loop-msg-1" {
+	if len(parsedReceipt.Accepted) != 1 || parsedReceipt.Accepted[0] != loopMsgID {
 		t.Fatalf("unexpected receipt payload: %#v", parsedReceipt)
 	}
 
-	writeEnvelope(t, conn, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: []string{"loop-msg-1"}})
+	writeEnvelope(t, conn, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: []string{loopMsgID}})
 
 	transfer := readEnvelope(t, conn)
 	assertFrameType(t, transfer, gossipv1.FrameTypeTransfer)
@@ -105,13 +108,13 @@ func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse transfer: %v", err)
 	}
-	if len(parsedTransfer.Objects) != 1 || parsedTransfer.Objects[0].Object.ID != "loop-msg-1" {
+	if len(parsedTransfer.Objects) != 1 || parsedTransfer.Objects[0].Object.ID != loopMsgID {
 		t.Fatalf("unexpected transfer payload: %#v", parsedTransfer)
 	}
 
-	writeEnvelope(t, conn, gossipv1.FrameTypeReceipt, gossipv1.ReceiptPayload{Accepted: []string{"loop-msg-1"}})
+	writeEnvelope(t, conn, gossipv1.FrameTypeReceipt, gossipv1.ReceiptPayload{Accepted: []string{loopMsgID}})
 
-	if _, err := relay.store.GetMessageByID(context.Background(), "loop-msg-1"); err != nil {
+	if _, err := relay.store.GetMessageByID(context.Background(), loopMsgID); err != nil {
 		t.Fatalf("expected persisted loopback message: %v", err)
 	}
 }

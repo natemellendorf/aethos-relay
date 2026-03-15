@@ -5,8 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
 )
@@ -46,13 +44,14 @@ func (e *Engine) AcceptClientSend(from, to, payloadB64 string, ttlSeconds int) (
 	}
 
 	now := e.now()
+	expiresAt := now.Add(ttl)
 	msg := &model.Message{
-		ID:        uuid.New().String(),
+		ID:        gossipv1.ComputeItemID(from, to, payloadB64, now.UTC().Unix(), expiresAt.UTC().Unix()),
 		From:      from,
 		To:        to,
 		Payload:   payloadB64,
 		CreatedAt: now,
-		ExpiresAt: now.Add(ttl),
+		ExpiresAt: expiresAt,
 		Delivered: false,
 	}
 
@@ -70,6 +69,13 @@ func (e *Engine) PersistMessage(ctx context.Context, msg *model.Message) error {
 	if err := e.store.PersistMessage(ctx, msg); err != nil {
 		debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_failed", "decision", "rejected", "reason", "persist_failed", "store_ok", false, "err", err)
 		return err
+	}
+
+	if e.envelopeStore != nil {
+		if _, err := e.persistEnvelopeState(ctx, msg, e.relayID); err != nil {
+			debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_failed", "decision", "rejected", "reason", "envelope_persist_failed", "store_ok", false, "err", err)
+			return err
+		}
 	}
 
 	debug.LogItem("in", gossipv1.FrameTypeTransfer, msg.ID, "durable_write_ok", "decision", "inserted", "store_ok", true)

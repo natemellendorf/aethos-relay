@@ -267,6 +267,7 @@ func main() {
 
 	// Initialize handlers
 	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL, *allowedOrigins, *devMode, *relayID)
+	wsHandler.SetEnvelopeStore(envelopeStore)
 	wsHandler.SetAckDrivenSuppression(*ackDrivenSuppression)
 	wsHandler.SetFederationManager(federationManager)
 	federationManager.SetAckDrivenSuppression(*ackDrivenSuppression)
