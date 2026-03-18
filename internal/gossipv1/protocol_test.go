@@ -2,6 +2,8 @@ package gossipv1
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -72,16 +74,14 @@ func TestParseReceiptPayloadRejectsLegacyAcceptedKey(t *testing.T) {
 }
 
 func TestParseTransferPayloadMixedAcceptsValidObject(t *testing.T) {
-	createdAt := int64(1710000000)
-	expiresAt := int64(1710003600)
-	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
-	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	envelopeB64 := mustSignedTransferEnvelopeB64(t, strings.Repeat("aa", 32), strings.Repeat("bb", 32), "QQ")
+	itemID := ComputeTransferObjectItemID(TransferObject{EnvelopeB64: envelopeB64})
 
 	parsed, err := ParseTransferPayloadMixed(map[string]any{
 		"objects": []map[string]any{{
 			"item_id":        itemID,
 			"envelope_b64":   envelopeB64,
-			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"expiry_unix_ms": uint64(1710003600000),
 			"hop_count":      uint64(0),
 		}},
 	})
@@ -97,14 +97,12 @@ func TestParseTransferPayloadMixedAcceptsValidObject(t *testing.T) {
 }
 
 func TestParseTransferPayloadMixedRejectsMissingItemID(t *testing.T) {
-	createdAt := int64(1710000000)
-	expiresAt := int64(1710003600)
-	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	envelopeB64 := mustSignedTransferEnvelopeB64(t, strings.Repeat("aa", 32), strings.Repeat("bb", 32), "QQ")
 
 	parsed, err := ParseTransferPayloadMixed(map[string]any{
 		"objects": []map[string]any{{
 			"envelope_b64":   envelopeB64,
-			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"expiry_unix_ms": uint64(1710003600000),
 			"hop_count":      uint64(0),
 		}},
 	})
@@ -158,16 +156,14 @@ func TestParseTransferPayloadMixedRejectsInvalidEnvelopeEncoding(t *testing.T) {
 }
 
 func TestParseTransferPayloadMixedRejectsInvalidExpiryUnixMS(t *testing.T) {
-	createdAt := int64(1710000000)
-	expiresAt := int64(1710003600)
-	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
-	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	envelopeB64 := mustSignedTransferEnvelopeB64(t, strings.Repeat("aa", 32), strings.Repeat("bb", 32), "QQ")
+	itemID := ComputeTransferObjectItemID(TransferObject{EnvelopeB64: envelopeB64})
 
 	parsed, err := ParseTransferPayloadMixed(map[string]any{
 		"objects": []map[string]any{{
 			"item_id":        itemID,
 			"envelope_b64":   envelopeB64,
-			"expiry_unix_ms": uint64(expiresAt)*1000 + 1,
+			"expiry_unix_ms": "bad",
 			"hop_count":      uint64(0),
 		}},
 	})
@@ -180,16 +176,14 @@ func TestParseTransferPayloadMixedRejectsInvalidExpiryUnixMS(t *testing.T) {
 }
 
 func TestParseTransferPayloadMixedRejectsInvalidHopCount(t *testing.T) {
-	createdAt := int64(1710000000)
-	expiresAt := int64(1710003600)
-	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
-	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	envelopeB64 := mustSignedTransferEnvelopeB64(t, strings.Repeat("aa", 32), strings.Repeat("bb", 32), "QQ")
+	itemID := ComputeTransferObjectItemID(TransferObject{EnvelopeB64: envelopeB64})
 
 	parsed, err := ParseTransferPayloadMixed(map[string]any{
 		"objects": []map[string]any{{
 			"item_id":        itemID,
 			"envelope_b64":   envelopeB64,
-			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"expiry_unix_ms": uint64(1710003600000),
 			"hop_count":      uint64(65536),
 		}},
 	})
@@ -202,21 +196,19 @@ func TestParseTransferPayloadMixedRejectsInvalidHopCount(t *testing.T) {
 }
 
 func TestParseTransferPayloadMixedMixedBatchKeepsValidObjects(t *testing.T) {
-	createdAt := int64(1710000000)
-	expiresAt := int64(1710003600)
-	envelopeB64 := mustEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt)
-	itemID := ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	envelopeB64 := mustSignedTransferEnvelopeB64(t, strings.Repeat("aa", 32), strings.Repeat("bb", 32), "QQ")
+	itemID := ComputeTransferObjectItemID(TransferObject{EnvelopeB64: envelopeB64})
 
 	parsed, err := ParseTransferPayloadMixed(map[string]any{
 		"objects": []map[string]any{{
 			"item_id":        itemID,
 			"envelope_b64":   envelopeB64,
-			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"expiry_unix_ms": uint64(1710003600000),
 			"hop_count":      uint64(0),
 		}, {
 			"item_id":        strings.Repeat("ab", 32),
 			"envelope_b64":   "%%%",
-			"expiry_unix_ms": uint64(expiresAt) * 1000,
+			"expiry_unix_ms": uint64(1710003600000),
 			"hop_count":      uint64(0),
 		}},
 	})
@@ -234,10 +226,7 @@ func TestParseTransferPayloadMixedMixedBatchKeepsValidObjects(t *testing.T) {
 func TestParseTransferPayloadMixedAcceptsCanonicalTransferEnvelopeSchema(t *testing.T) {
 	toWayfarerID := strings.Repeat("aa", 32)
 	manifestID := strings.Repeat("bb", 32)
-	envelopeB64, err := EncodeTransferEnvelopeB64(toWayfarerID, manifestID, "QQ")
-	if err != nil {
-		t.Fatalf("encode transfer envelope: %v", err)
-	}
+	envelopeB64 := mustSignedTransferEnvelopeB64(t, toWayfarerID, manifestID, "QQ")
 	itemID := ComputeTransferObjectItemID(TransferObject{EnvelopeB64: envelopeB64})
 
 	parsed, err := ParseTransferPayloadMixed(map[string]any{
@@ -262,13 +251,30 @@ func TestParseTransferPayloadMixedAcceptsCanonicalTransferEnvelopeSchema(t *test
 	}
 }
 
-func TestParseTransferPayloadMixedIgnoresUnknownEnvelopeKeys(t *testing.T) {
+func TestParseTransferPayloadMixedRejectsUnknownEnvelopeKeys(t *testing.T) {
 	toBytes := bytes.Repeat([]byte{0xaa}, DigestHexBytes)
 	manifestBytes := bytes.Repeat([]byte{0xbb}, DigestHexBytes)
+	body := []byte("hello")
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	signingPayload, err := canonicalEncMode.Marshal(canonicalTransferSigningPayload{
+		ToWayfarerID: toBytes,
+		ManifestID:   manifestBytes,
+		Body:         body,
+	})
+	if err != nil {
+		t.Fatalf("encode signing payload: %v", err)
+	}
+	digest := sha256.Sum256(append([]byte(envelopeSignatureDomain), signingPayload...))
+	authorSig := ed25519.Sign(privateKey, digest[:])
+
 	envelopeMap := map[string]any{
 		"to_wayfarer_id": toBytes,
 		"manifest_id":    manifestBytes,
-		"body":           []byte("hello"),
+		"body":           body,
+		"author_pubkey":  []byte(publicKey),
+		"author_sig":     authorSig,
 		"x_ext":          []byte("ignored"),
 	}
 	envelopeBytes, err := canonicalEncMode.Marshal(envelopeMap)
@@ -289,8 +295,8 @@ func TestParseTransferPayloadMixedIgnoresUnknownEnvelopeKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse transfer payload: %v", err)
 	}
-	if len(parsed.Rejected) != 0 {
-		t.Fatalf("expected unknown envelope keys to be ignored, got %#v", parsed.Rejected)
+	if len(parsed.Rejected) != 1 || parsed.Rejected[0].Reason != "policy_reject" {
+		t.Fatalf("expected unknown envelope key rejection, got %#v", parsed.Rejected)
 	}
 }
 
@@ -606,6 +612,42 @@ func mustEnvelopeB64(t *testing.T, from string, to string, payloadB64 string, cr
 	envelopeB64, err := EncodeItemEnvelopeB64(from, to, payloadB64, createdAt, expiresAt)
 	if err != nil {
 		t.Fatalf("encode envelope b64: %v", err)
+	}
+	return envelopeB64
+}
+
+func mustSignedTransferEnvelopeB64(t *testing.T, toWayfarerID string, manifestID string, bodyB64 string) string {
+	t.Helper()
+	toBytes, err := hex.DecodeString(toWayfarerID)
+	if err != nil {
+		t.Fatalf("decode to_wayfarer_id: %v", err)
+	}
+	manifestBytes, err := hex.DecodeString(manifestID)
+	if err != nil {
+		t.Fatalf("decode manifest_id: %v", err)
+	}
+	body, err := base64.RawURLEncoding.DecodeString(bodyB64)
+	if err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	seed := bytes.Repeat([]byte{0x24}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+
+	signingPayload, err := canonicalEncMode.Marshal(canonicalTransferSigningPayload{
+		ToWayfarerID: toBytes,
+		ManifestID:   manifestBytes,
+		Body:         body,
+	})
+	if err != nil {
+		t.Fatalf("encode signing payload: %v", err)
+	}
+	digest := sha256.Sum256(append([]byte(envelopeSignatureDomain), signingPayload...))
+	authorSig := ed25519.Sign(privateKey, digest[:])
+
+	envelopeB64, err := EncodeTransferEnvelopeB64(toWayfarerID, manifestID, bodyB64, publicKey, authorSig)
+	if err != nil {
+		t.Fatalf("encode transfer envelope: %v", err)
 	}
 	return envelopeB64
 }

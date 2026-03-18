@@ -2,6 +2,7 @@ package federation
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -1026,6 +1027,11 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 
 		switch result.Status {
 		case storeforward.RelayForwardAccepted, storeforward.RelayForwardDuplicate, storeforward.RelayForwardSeenLoop:
+			if err := pm.persistTransferEnvelope(context.Background(), indexed.Object, msg, int(indexed.Object.HopCount), peer.RemoteNodeID); err != nil {
+				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", msg.ID, "reason", "ingest_failed", "detail", "envelope persist failed", "store_ok", false, "err", err)
+				rejectedIDs = append(rejectedIDs, msg.ID)
+				continue
+			}
 			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", msg.ID, "store_ok", true)
 			receipt.Accepted = append(receipt.Accepted, msg.ID)
 		case storeforward.RelayForwardExpired:
@@ -1051,6 +1057,25 @@ func (pm *PeerManager) handleTransfer(peer *Peer, event gossipv1.Event) error {
 	debug.Log("out", gossipv1.FrameTypeReceipt, "receipt_constructed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
 
 	return pm.sendEnvelope(peer, gossipv1.FrameTypeReceipt, receipt)
+}
+
+func (pm *PeerManager) persistTransferEnvelope(ctx context.Context, object gossipv1.TransferObject, msg *model.Message, hopCount int, originRelayID string) error {
+	if pm.envelopeStore == nil || msg == nil {
+		return nil
+	}
+	envelopeBytes, err := base64.RawURLEncoding.Strict().DecodeString(object.EnvelopeB64)
+	if err != nil {
+		return fmt.Errorf("decode envelope_b64: %w", err)
+	}
+	return pm.envelopeStore.PersistEnvelope(ctx, &model.Envelope{
+		ID:              msg.ID,
+		DestinationID:   msg.To,
+		OpaquePayload:   envelopeBytes,
+		OriginRelayID:   originRelayID,
+		CurrentHopCount: hopCount,
+		CreatedAt:       msg.CreatedAt,
+		ExpiresAt:       msg.ExpiresAt,
+	})
 }
 
 func (pm *PeerManager) handleReceipt(peer *Peer, event gossipv1.Event) error {
@@ -1323,60 +1348,38 @@ func relayForwardErrorReason(err error) string {
 }
 
 func canonicalTransferObjectFromMessage(msg *model.Message) (gossipv1.TransferObject, bool) {
-	if msg == nil {
-		return gossipv1.TransferObject{}, false
-	}
-	if !gossipv1.IsDigestHexID(msg.ID) {
-		return gossipv1.TransferObject{}, false
-	}
-
-	createdAt := msg.CreatedAt.UTC().Unix()
-	expiresAt := msg.ExpiresAt.UTC().Unix()
-	if envelopeB64, err := gossipv1.EncodeTransferEnvelopeB64(msg.To, msg.From, msg.Payload); err == nil {
-		candidate := gossipv1.TransferObject{
-			ItemID:       msg.ID,
-			EnvelopeB64:  envelopeB64,
-			ExpiryUnixMS: uint64(msg.ExpiresAt.UTC().UnixMilli()),
-			HopCount:     0,
-			Envelope: gossipv1.ItemEnvelope{
-				From:       msg.From,
-				To:         msg.To,
-				PayloadB64: msg.Payload,
-				CreatedAt:  createdAt,
-				ExpiresAt:  expiresAt,
-			},
-		}
-		if gossipv1.ComputeTransferObjectItemID(candidate) == msg.ID {
-			return candidate, true
-		}
-	}
-
-	if msg.ID != gossipv1.ComputeItemID(msg.From, msg.To, msg.Payload, createdAt, expiresAt) {
-		return gossipv1.TransferObject{}, false
-	}
-	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(msg.From, msg.To, msg.Payload, createdAt, expiresAt)
-	if err != nil {
-		return gossipv1.TransferObject{}, false
-	}
-
-	return gossipv1.TransferObject{
-		ItemID:       msg.ID,
-		EnvelopeB64:  envelopeB64,
-		ExpiryUnixMS: uint64(msg.ExpiresAt.UTC().UnixMilli()),
-		HopCount:     0,
-		Envelope: gossipv1.ItemEnvelope{
-			From:       msg.From,
-			To:         msg.To,
-			PayloadB64: msg.Payload,
-			CreatedAt:  createdAt,
-			ExpiresAt:  expiresAt,
-		},
-	}, true
+	_ = msg
+	return gossipv1.TransferObject{}, false
 }
 
 func (pm *PeerManager) loadTransferObjectByItemID(ctx context.Context, itemID string) (gossipv1.TransferObject, bool, error) {
 	if !gossipv1.IsDigestHexID(itemID) {
 		return gossipv1.TransferObject{}, false, nil
+	}
+	if pm.envelopeStore != nil {
+		env, err := pm.envelopeStore.GetEnvelopeByID(ctx, itemID)
+		if err != nil {
+			if !isNotFoundError(err) {
+				return gossipv1.TransferObject{}, false, err
+			}
+		} else if env != nil && len(env.OpaquePayload) > 0 {
+			envelopeB64 := base64.RawURLEncoding.EncodeToString(env.OpaquePayload)
+			object := gossipv1.TransferObject{
+				ItemID:       itemID,
+				EnvelopeB64:  envelopeB64,
+				ExpiryUnixMS: uint64(env.ExpiresAt.UTC().UnixMilli()),
+				HopCount:     uint64(env.CurrentHopCount),
+			}
+			if object.ItemID != gossipv1.ComputeTransferObjectItemID(object) {
+				return gossipv1.TransferObject{}, false, nil
+			}
+			parsedEnvelope, err := gossipv1.DecodeItemEnvelopeB64(envelopeB64)
+			if err != nil {
+				return gossipv1.TransferObject{}, false, nil
+			}
+			object.Envelope = parsedEnvelope
+			return object, true, nil
+		}
 	}
 
 	msg, err := pm.store.GetMessageByID(ctx, itemID)

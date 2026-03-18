@@ -1,13 +1,20 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 
 	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
@@ -220,15 +227,19 @@ func TestHandleTransferMixedValidityPersistsOnlyValid(t *testing.T) {
 	now := time.Now().UTC()
 	validCreatedAt := now.Add(-time.Minute).Unix()
 	validExpiresAt := now.Add(time.Hour).Unix()
-	validID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", validCreatedAt, validExpiresAt)
-	invalidID := gossipv1.ComputeItemID("sender-a", "recipient-a", "not_base64", validCreatedAt, validExpiresAt)
+	validObject := mustTransferObject(t, strings.Repeat("bb", 32), "recipient-a", "QQ", validCreatedAt, validExpiresAt)
+	invalidObject := validObject
+	invalidObject.EnvelopeB64 = "%%%"
+	invalidID := strings.Repeat("ab", 32)
+	validID := validObject.ItemID
 	event := gossipv1.Event{
 		Type: gossipv1.EventTypeTransfer,
 		Transfer: &gossipv1.ParsedTransferPayload{
 			Objects: []gossipv1.IndexedTransferObject{
-				{Index: 0, Object: mustTransferObject(t, validID, "sender-a", "recipient-a", "QQ", validCreatedAt, validExpiresAt)},
-				{Index: 1, Object: mustTransferObject(t, invalidID, "sender-a", "recipient-a", "not_base64", validCreatedAt, validExpiresAt)},
+				{Index: 0, Object: validObject},
+				{Index: 1, Object: invalidObject},
 			},
+			Rejected: []gossipv1.TransferObjectRejection{{Index: 1, ID: invalidID, Reason: "invalid_envelope_encoding", Detail: "invalid base64url"}},
 		},
 	}
 
@@ -265,7 +276,8 @@ func TestHandleTransferRejectsItemIDHashMismatch(t *testing.T) {
 	now := time.Now().UTC()
 	createdAt := now.Add(-time.Minute).Unix()
 	expiresAt := now.Add(time.Hour).Unix()
-	validID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	validObject := mustTransferObject(t, strings.Repeat("bb", 32), "recipient-a", "QQ", createdAt, expiresAt)
+	validID := validObject.ItemID
 	mismatchedID := strings.Repeat("ab", 32)
 	if mismatchedID == validID {
 		mismatchedID = strings.Repeat("ac", 32)
@@ -275,8 +287,12 @@ func TestHandleTransferRejectsItemIDHashMismatch(t *testing.T) {
 		Type: gossipv1.EventTypeTransfer,
 		Transfer: &gossipv1.ParsedTransferPayload{
 			Objects: []gossipv1.IndexedTransferObject{{
-				Index:  0,
-				Object: mustTransferObject(t, mismatchedID, "sender-a", "recipient-a", "QQ", createdAt, expiresAt),
+				Index: 0,
+				Object: func() gossipv1.TransferObject {
+					obj := validObject
+					obj.ItemID = mismatchedID
+					return obj
+				}(),
 			}},
 		},
 	}
@@ -350,10 +366,11 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 	now := time.Now().UTC()
 	createdAt := now.Add(-time.Minute)
 	expiresAt := now.Add(time.Hour)
-	duplicateID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", createdAt.Unix(), expiresAt.Unix())
+	duplicateObject := mustTransferObject(t, strings.Repeat("bb", 32), "recipient-a", "QQ", createdAt.Unix(), expiresAt.Unix())
+	duplicateID := duplicateObject.ItemID
 	st.messagesByID[duplicateID] = &model.Message{
 		ID:        duplicateID,
-		From:      "sender-a",
+		From:      strings.Repeat("cc", 32),
 		To:        "recipient-a",
 		Payload:   "QQ",
 		CreatedAt: createdAt,
@@ -364,7 +381,7 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 		Type: gossipv1.EventTypeTransfer,
 		Transfer: &gossipv1.ParsedTransferPayload{Objects: []gossipv1.IndexedTransferObject{{
 			Index:  0,
-			Object: mustTransferObject(t, duplicateID, "sender-a", "recipient-a", "QQ", createdAt.Unix(), expiresAt.Unix()),
+			Object: duplicateObject,
 		}}},
 	}
 
@@ -702,16 +719,51 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 	}
 }
 
-func mustTransferObject(t *testing.T, itemID string, from string, to string, payloadB64 string, createdAt int64, expiresAt int64) gossipv1.TransferObject {
+func mustTransferObject(t *testing.T, manifestID string, to string, payloadB64 string, createdAt int64, expiresAt int64) gossipv1.TransferObject {
 	t.Helper()
-	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(from, to, payloadB64, createdAt, expiresAt)
+	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
-		t.Fatalf("encode envelope: %v", err)
+		t.Fatalf("canonical cbor mode: %v", err)
 	}
+	toBytes, err := hex.DecodeString(manifestDestinationIDHex(t, to))
+	if err != nil {
+		t.Fatalf("decode destination: %v", err)
+	}
+	manifestBytes, err := hex.DecodeString(manifestID)
+	if err != nil {
+		t.Fatalf("decode manifest id: %v", err)
+	}
+	body, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	seed := bytes.Repeat([]byte{0x11}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	signingPayload, err := mode.Marshal(map[string]any{"to_wayfarer_id": toBytes, "manifest_id": manifestBytes, "body": body})
+	if err != nil {
+		t.Fatalf("encode signing payload: %v", err)
+	}
+	digest := sha256.Sum256(append([]byte("AETHOS_ENVELOPE_V1"), signingPayload...))
+	authorSig := ed25519.Sign(privateKey, digest[:])
+	envelopeB64, err := gossipv1.EncodeTransferEnvelopeB64(hex.EncodeToString(toBytes), manifestID, payloadB64, publicKey, authorSig)
+	if err != nil {
+		t.Fatalf("encode transfer envelope: %v", err)
+	}
+	itemID := gossipv1.ComputeTransferObjectItemID(gossipv1.TransferObject{EnvelopeB64: envelopeB64})
 	return gossipv1.TransferObject{
 		ItemID:       itemID,
 		EnvelopeB64:  envelopeB64,
 		ExpiryUnixMS: uint64(expiresAt) * 1000,
 		HopCount:     0,
 	}
+}
+
+func manifestDestinationIDHex(t *testing.T, to string) string {
+	t.Helper()
+	if gossipv1.IsDigestHexID(to) {
+		return to
+	}
+	digest := sha256.Sum256([]byte(to))
+	return hex.EncodeToString(digest[:])
 }

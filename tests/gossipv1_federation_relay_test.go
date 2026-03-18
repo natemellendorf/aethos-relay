@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"encoding/base64"
 	"sort"
 	"sync"
 	"testing"
@@ -358,6 +359,39 @@ func uniqueSorted(values []string) []string {
 
 func persistRelayMessageWithEnvelope(t *testing.T, relay *relayHarness, msg *model.Message) {
 	t.Helper()
+	if msg == nil {
+		return
+	}
+	if _, err := base64.RawURLEncoding.Strict().DecodeString(msg.Payload); err != nil {
+		if err := relay.store.PersistMessage(context.Background(), msg); err != nil {
+			t.Fatalf("persist relay message: %v", err)
+		}
+		if relay.envelope != nil {
+			if err := relay.envelope.PersistEnvelope(context.Background(), &model.Envelope{
+				ID:            msg.ID,
+				DestinationID: msg.To,
+				OpaquePayload: []byte(msg.Payload),
+				OriginRelayID: "",
+				CreatedAt:     msg.CreatedAt,
+				ExpiresAt:     msg.ExpiresAt,
+			}); err != nil {
+				t.Fatalf("persist invalid relay envelope: %v", err)
+			}
+		}
+		return
+	}
+	envelopeB64 := mustSignedEnvelopeB64(t, msg.From, msg.To, msg.Payload)
+	parsed, err := gossipv1.DecodeItemEnvelopeB64(envelopeB64)
+	if err != nil {
+		t.Fatalf("decode transfer envelope: %v", err)
+	}
+	msg.From = parsed.From
+	msg.To = parsed.To
+	msg.Payload = parsed.PayloadB64
+
+	if msg.ID != gossipv1.ComputeTransferObjectItemID(gossipv1.TransferObject{EnvelopeB64: envelopeB64}) {
+		t.Fatalf("message id must match signed envelope bytes")
+	}
 
 	if err := relay.store.PersistMessage(context.Background(), msg); err != nil {
 		t.Fatalf("persist relay message: %v", err)
@@ -365,10 +399,14 @@ func persistRelayMessageWithEnvelope(t *testing.T, relay *relayHarness, msg *mod
 	if relay.envelope == nil || msg == nil {
 		return
 	}
+	envelopeBytes, err := base64.RawURLEncoding.Strict().DecodeString(envelopeB64)
+	if err != nil {
+		t.Fatalf("decode transfer envelope: %v", err)
+	}
 	if err := relay.envelope.PersistEnvelope(context.Background(), &model.Envelope{
 		ID:            msg.ID,
 		DestinationID: msg.To,
-		OpaquePayload: []byte(msg.Payload),
+		OpaquePayload: envelopeBytes,
 		OriginRelayID: "",
 		CreatedAt:     msg.CreatedAt,
 		ExpiresAt:     msg.ExpiresAt,

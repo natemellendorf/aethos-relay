@@ -2,6 +2,7 @@ package gossipv1
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -35,6 +36,8 @@ const (
 	FrameTypeTransfer    = "TRANSFER"
 	FrameTypeReceipt     = "RECEIPT"
 	FrameTypeRelayIngest = "RELAY_INGEST"
+
+	envelopeSignatureDomain = "AETHOS_ENVELOPE_V1"
 )
 
 var canonicalEncMode = mustCanonicalEncMode()
@@ -140,6 +143,14 @@ type canonicalTransferEnvelope struct {
 	ToWayfarerID []byte `cbor:"to_wayfarer_id"`
 	ManifestID   []byte `cbor:"manifest_id"`
 	Body         []byte `cbor:"body"`
+	AuthorPubKey []byte `cbor:"author_pubkey"`
+	AuthorSig    []byte `cbor:"author_sig"`
+}
+
+type canonicalTransferSigningPayload struct {
+	ToWayfarerID []byte `cbor:"to_wayfarer_id"`
+	ManifestID   []byte `cbor:"manifest_id"`
+	Body         []byte `cbor:"body"`
 }
 
 type ItemEnvelope struct {
@@ -148,6 +159,8 @@ type ItemEnvelope struct {
 	PayloadB64 string
 	CreatedAt  int64
 	ExpiresAt  int64
+	ManifestID string
+	AuthorSig  []byte
 }
 
 // IsDigestHexID reports whether value is a lowercase 64-hex digest ID.
@@ -209,7 +222,7 @@ func DecodeItemEnvelopeB64(envelopeB64 string) (ItemEnvelope, error) {
 	return envelope, nil
 }
 
-func EncodeTransferEnvelopeB64(toWayfarerIDHex string, manifestIDHex string, bodyB64 string) (string, error) {
+func EncodeTransferEnvelopeB64(toWayfarerIDHex string, manifestIDHex string, bodyB64 string, authorPubKey []byte, authorSig []byte) (string, error) {
 	toBytes, err := decodeDigestHexBytes(toWayfarerIDHex)
 	if err != nil {
 		return "", fmt.Errorf("gossipv1: invalid to_wayfarer_id: %w", err)
@@ -222,11 +235,19 @@ func EncodeTransferEnvelopeB64(toWayfarerIDHex string, manifestIDHex string, bod
 	if err != nil {
 		return "", fmt.Errorf("gossipv1: invalid envelope body: %w", err)
 	}
+	if len(authorPubKey) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("gossipv1: author_pubkey must be 32 bytes")
+	}
+	if len(authorSig) != ed25519.SignatureSize {
+		return "", fmt.Errorf("gossipv1: author_sig must be 64 bytes")
+	}
 
 	envelope := canonicalTransferEnvelope{
 		ToWayfarerID: toBytes,
 		ManifestID:   manifestBytes,
 		Body:         body,
+		AuthorPubKey: append([]byte(nil), authorPubKey...),
+		AuthorSig:    append([]byte(nil), authorSig...),
 	}
 	encoded, err := canonicalEncMode.Marshal(envelope)
 	if err != nil {
@@ -640,7 +661,17 @@ func ParseTransferPayloadMixed(payload map[string]any) (ParsedTransferPayload, e
 			continue
 		}
 
-		transferBytes += uint64(len(obj.EnvelopeB64))
+		decodedEnvelope, err := decodeBase64URLRaw(obj.EnvelopeB64)
+		if err != nil {
+			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
+				Index:  uint64(idx),
+				ID:     obj.ItemID,
+				Reason: "invalid_envelope_encoding",
+				Detail: err.Error(),
+			})
+			continue
+		}
+		transferBytes += uint64(len(decodedEnvelope))
 		if transferBytes > MaxTransferBytes {
 			parsed.Rejected = append(parsed.Rejected, TransferObjectRejection{
 				Index:  uint64(idx),
@@ -1093,12 +1124,6 @@ func parseTransferObject(payload map[string]any) (TransferObject, error) {
 	if err != nil {
 		return TransferObject{}, classifyTransferFieldError("expiry_unix_ms", err)
 	}
-	if envelope.ExpiresAt > 0 {
-		expected := uint64(envelope.ExpiresAt) * 1000
-		if expiryUnixMS != expected {
-			return TransferObject{}, newTransferParseError("invalid_expiry_unix_ms", "expiry_unix_ms must equal envelope expiry")
-		}
-	}
 
 	hopCount, err := parseUint(payload, "hop_count")
 	if err != nil {
@@ -1204,85 +1229,75 @@ func parseCanonicalItemEnvelope(encoded []byte) (ItemEnvelope, error) {
 	if err := cbor.Unmarshal(encoded, &payload); err != nil {
 		return ItemEnvelope{}, fmt.Errorf("decode envelope bytes: %w", err)
 	}
-
-	if _, hasToWayfarer := payload["to_wayfarer_id"]; hasToWayfarer {
-		toWayfarerID, err := parseBytes(payload, "to_wayfarer_id")
-		if err != nil {
-			return ItemEnvelope{}, err
+	allowed := map[string]struct{}{
+		"to_wayfarer_id": {},
+		"manifest_id":    {},
+		"body":           {},
+		"author_pubkey":  {},
+		"author_sig":     {},
+	}
+	for key := range payload {
+		if _, ok := allowed[key]; !ok {
+			return ItemEnvelope{}, fmt.Errorf("unknown envelope field %q", key)
 		}
-		if len(toWayfarerID) != DigestHexBytes {
-			return ItemEnvelope{}, fmt.Errorf("to_wayfarer_id must be 32 bytes")
-		}
-		manifestID, err := parseBytes(payload, "manifest_id")
-		if err != nil {
-			return ItemEnvelope{}, err
-		}
-		if len(manifestID) != DigestHexBytes {
-			return ItemEnvelope{}, fmt.Errorf("manifest_id must be 32 bytes")
-		}
-		body, err := parseBytes(payload, "body")
-		if err != nil {
-			return ItemEnvelope{}, err
-		}
-
-		return ItemEnvelope{
-			From:       hex.EncodeToString(manifestID),
-			To:         hex.EncodeToString(toWayfarerID),
-			PayloadB64: base64.RawURLEncoding.EncodeToString(body),
-		}, nil
 	}
 
-	from, err := parseString(payload, "from")
+	toWayfarerID, err := parseBytes(payload, "to_wayfarer_id")
 	if err != nil {
 		return ItemEnvelope{}, err
 	}
-	to, err := parseString(payload, "to")
+	if len(toWayfarerID) != DigestHexBytes {
+		return ItemEnvelope{}, fmt.Errorf("to_wayfarer_id must be 32 bytes")
+	}
+	manifestID, err := parseBytes(payload, "manifest_id")
 	if err != nil {
 		return ItemEnvelope{}, err
 	}
-	payloadB64, err := parseString(payload, "payload_b64")
+	if len(manifestID) != DigestHexBytes {
+		return ItemEnvelope{}, fmt.Errorf("manifest_id must be 32 bytes")
+	}
+	body, err := parseBytes(payload, "body")
 	if err != nil {
 		return ItemEnvelope{}, err
 	}
-	createdAt, err := parseInt64(payload, "created_at")
+	authorPubKey, err := parseBytes(payload, "author_pubkey")
 	if err != nil {
 		return ItemEnvelope{}, err
 	}
-	expiresAt, err := parseInt64(payload, "expires_at")
+	if len(authorPubKey) != ed25519.PublicKeySize {
+		return ItemEnvelope{}, fmt.Errorf("author_pubkey must be 32 bytes")
+	}
+	authorSig, err := parseBytes(payload, "author_sig")
 	if err != nil {
 		return ItemEnvelope{}, err
 	}
-	if createdAt <= 0 {
-		return ItemEnvelope{}, fmt.Errorf("created_at must be > 0")
-	}
-	if expiresAt <= createdAt {
-		return ItemEnvelope{}, fmt.Errorf("expires_at must be greater than created_at")
-	}
-	if _, err := decodeBase64URLRaw(payloadB64); err != nil {
-		return ItemEnvelope{}, fmt.Errorf("invalid payload_b64 in envelope: %w", err)
+	if len(authorSig) != ed25519.SignatureSize {
+		return ItemEnvelope{}, fmt.Errorf("author_sig must be 64 bytes")
 	}
 
-	envelope := canonicalItemEnvelope{
-		From:       from,
-		To:         to,
-		PayloadB64: payloadB64,
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
-	}
-	reencoded, err := canonicalEncMode.Marshal(envelope)
+	signingPayload, err := canonicalEncMode.Marshal(canonicalTransferSigningPayload{
+		ToWayfarerID: toWayfarerID,
+		ManifestID:   manifestID,
+		Body:         body,
+	})
 	if err != nil {
-		return ItemEnvelope{}, fmt.Errorf("encode canonical envelope: %w", err)
+		return ItemEnvelope{}, fmt.Errorf("encode signing payload: %w", err)
 	}
-	if !bytes.Equal(encoded, reencoded) {
-		return ItemEnvelope{}, fmt.Errorf("envelope bytes are not canonical deterministic CBOR")
+
+	domainInput := append([]byte(envelopeSignatureDomain), signingPayload...)
+	signatureDigest := sha256.Sum256(domainInput)
+	if !ed25519.Verify(ed25519.PublicKey(authorPubKey), signatureDigest[:], authorSig) {
+		return ItemEnvelope{}, fmt.Errorf("invalid envelope signature")
 	}
+
+	authorID := sha256.Sum256(authorPubKey)
 
 	return ItemEnvelope{
-		From:       from,
-		To:         to,
-		PayloadB64: payloadB64,
-		CreatedAt:  createdAt,
-		ExpiresAt:  expiresAt,
+		From:       hex.EncodeToString(authorID[:]),
+		To:         hex.EncodeToString(toWayfarerID),
+		PayloadB64: base64.RawURLEncoding.EncodeToString(body),
+		ManifestID: hex.EncodeToString(manifestID),
+		AuthorSig:  append([]byte(nil), authorSig...),
 	}, nil
 }
 

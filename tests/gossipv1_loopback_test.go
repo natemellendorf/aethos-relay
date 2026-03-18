@@ -57,7 +57,7 @@ func TestGossipV1HelloLoopbackBetweenRelays(t *testing.T) {
 }
 
 func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
-	relay, wsURL := startRelayForTest(t, "relay-client-flow", false, "", true)
+	relay, wsURL := startRelayForTest(t, "relay-client-flow", true, "", true)
 	defer relay.close()
 
 	conn := mustDial(t, wsURL)

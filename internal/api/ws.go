@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -459,6 +460,11 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 			return err
 		}
 		if err == nil && existing != nil {
+			if err := h.persistTransferEnvelope(indexed.Object, msg, int(indexed.Object.HopCount), ""); err != nil {
+				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "reason", "ingest_failed", "detail", "envelope persist failed", "store_ok", false, "err", err)
+				rejectedIDs = append(rejectedIDs, indexed.Object.ItemID)
+				continue
+			}
 			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "store_ok", true)
 			receipt.Accepted = append(receipt.Accepted, indexed.Object.ItemID)
 			continue
@@ -472,6 +478,11 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 		}
 
 		metrics.IncrementPersisted()
+		if err := h.persistTransferEnvelope(indexed.Object, msg, int(indexed.Object.HopCount), ""); err != nil {
+			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_rejected", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "reason", "ingest_failed", "detail", "envelope persist failed", "store_ok", false, "err", err)
+			rejectedIDs = append(rejectedIDs, indexed.Object.ItemID)
+			continue
+		}
 		debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "store_ok", true)
 		receipt.Accepted = append(receipt.Accepted, indexed.Object.ItemID)
 	}
@@ -652,6 +663,25 @@ func validateSummaryPreviewCursor(previewIDs []string, previewCursor string) err
 	return nil
 }
 
+func (h *WSHandler) persistTransferEnvelope(object gossipv1.TransferObject, msg *model.Message, hopCount int, originRelayID string) error {
+	if h.envelopeStore == nil || msg == nil {
+		return nil
+	}
+	envelopeBytes, err := base64.RawURLEncoding.Strict().DecodeString(object.EnvelopeB64)
+	if err != nil {
+		return fmt.Errorf("decode envelope_b64: %w", err)
+	}
+	return h.envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:              msg.ID,
+		DestinationID:   msg.To,
+		OpaquePayload:   envelopeBytes,
+		OriginRelayID:   originRelayID,
+		CurrentHopCount: hopCount,
+		CreatedAt:       msg.CreatedAt,
+		ExpiresAt:       msg.ExpiresAt,
+	})
+}
+
 func transferObjectToMessage(object gossipv1.TransferObject) (*model.Message, error) {
 	if object.ItemID == "" {
 		return nil, fmt.Errorf("item_id is required")
@@ -801,61 +831,38 @@ func (h *WSHandler) buildRecipientSummary(queueRecipient string, afterCursor str
 }
 
 func canonicalTransferObjectFromMessage(message *model.Message) (gossipv1.TransferObject, bool) {
-	if message == nil {
-		return gossipv1.TransferObject{}, false
-	}
-	if !gossipv1.IsDigestHexID(message.ID) {
-		return gossipv1.TransferObject{}, false
-	}
-
-	createdAt := message.CreatedAt.UTC().Unix()
-	expiresAt := message.ExpiresAt.UTC().Unix()
-	if envelopeB64, err := gossipv1.EncodeTransferEnvelopeB64(message.To, message.From, message.Payload); err == nil {
-		candidate := gossipv1.TransferObject{
-			ItemID:       message.ID,
-			EnvelopeB64:  envelopeB64,
-			ExpiryUnixMS: uint64(message.ExpiresAt.UTC().UnixMilli()),
-			HopCount:     0,
-			Envelope: gossipv1.ItemEnvelope{
-				From:       message.From,
-				To:         message.To,
-				PayloadB64: message.Payload,
-				CreatedAt:  createdAt,
-				ExpiresAt:  expiresAt,
-			},
-		}
-		if gossipv1.ComputeTransferObjectItemID(candidate) == message.ID {
-			return candidate, true
-		}
-	}
-
-	expectedID := gossipv1.ComputeItemID(message.From, message.To, message.Payload, createdAt, expiresAt)
-	if message.ID != expectedID {
-		return gossipv1.TransferObject{}, false
-	}
-	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(message.From, message.To, message.Payload, createdAt, expiresAt)
-	if err != nil {
-		return gossipv1.TransferObject{}, false
-	}
-
-	return gossipv1.TransferObject{
-		ItemID:       message.ID,
-		EnvelopeB64:  envelopeB64,
-		ExpiryUnixMS: uint64(message.ExpiresAt.UTC().UnixMilli()),
-		HopCount:     0,
-		Envelope: gossipv1.ItemEnvelope{
-			From:       message.From,
-			To:         message.To,
-			PayloadB64: message.Payload,
-			CreatedAt:  createdAt,
-			ExpiresAt:  expiresAt,
-		},
-	}, true
+	_ = message
+	return gossipv1.TransferObject{}, false
 }
 
 func (h *WSHandler) loadTransferObjectByItemID(itemID string) (gossipv1.TransferObject, bool, error) {
 	if !gossipv1.IsDigestHexID(itemID) {
 		return gossipv1.TransferObject{}, false, nil
+	}
+	if h.envelopeStore != nil {
+		env, err := h.envelopeStore.GetEnvelopeByID(context.Background(), itemID)
+		if err != nil {
+			if !isNotFoundError(err) {
+				return gossipv1.TransferObject{}, false, err
+			}
+		} else if env != nil && len(env.OpaquePayload) > 0 {
+			envelopeB64 := base64.RawURLEncoding.EncodeToString(env.OpaquePayload)
+			object := gossipv1.TransferObject{
+				ItemID:       itemID,
+				EnvelopeB64:  envelopeB64,
+				ExpiryUnixMS: uint64(env.ExpiresAt.UTC().UnixMilli()),
+				HopCount:     uint64(env.CurrentHopCount),
+			}
+			if object.ItemID != gossipv1.ComputeTransferObjectItemID(object) {
+				return gossipv1.TransferObject{}, false, nil
+			}
+			parsedEnvelope, err := gossipv1.DecodeItemEnvelopeB64(envelopeB64)
+			if err != nil {
+				return gossipv1.TransferObject{}, false, nil
+			}
+			object.Envelope = parsedEnvelope
+			return object, true, nil
+		}
 	}
 
 	message, err := h.store.GetMessageByID(context.Background(), itemID)

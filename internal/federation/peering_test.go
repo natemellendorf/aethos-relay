@@ -3,11 +3,17 @@ package federation
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 
 	"github.com/natemellendorf/aethos-relay/internal/gossipv1"
 	"github.com/natemellendorf/aethos-relay/internal/model"
@@ -377,9 +383,9 @@ func TestComputeMissingWantAppliesPreviewPriorityCapAndFinalSort(t *testing.T) {
 
 func TestTransferObjectToMessageRejectsItemIDHashMismatch(t *testing.T) {
 	now := time.Now().UTC()
-	createdAt := now.Add(-time.Minute).Unix()
 	expiresAt := now.Add(time.Hour).Unix()
-	validID := gossipv1.ComputeItemID("sender-a", "recipient-a", "QQ", createdAt, expiresAt)
+	envelopeB64 := mustTransferEnvelopeB64(t, strings.Repeat("bb", 32), "recipient-a", "QQ")
+	validID := gossipv1.ComputeTransferObjectItemID(gossipv1.TransferObject{EnvelopeB64: envelopeB64})
 	mismatchedID := strings.Repeat("de", 32)
 	if mismatchedID == validID {
 		mismatchedID = strings.Repeat("df", 32)
@@ -387,7 +393,7 @@ func TestTransferObjectToMessageRejectsItemIDHashMismatch(t *testing.T) {
 
 	_, err := transferObjectToMessage(gossipv1.TransferObject{
 		ItemID:       mismatchedID,
-		EnvelopeB64:  mustItemEnvelopeB64(t, "sender-a", "recipient-a", "QQ", createdAt, expiresAt),
+		EnvelopeB64:  envelopeB64,
 		ExpiryUnixMS: uint64(expiresAt) * 1000,
 		HopCount:     0,
 	})
@@ -399,11 +405,38 @@ func TestTransferObjectToMessageRejectsItemIDHashMismatch(t *testing.T) {
 	}
 }
 
-func mustItemEnvelopeB64(t *testing.T, from string, to string, payloadB64 string, createdAt int64, expiresAt int64) string {
+func mustTransferEnvelopeB64(t *testing.T, manifestID string, to string, payloadB64 string) string {
 	t.Helper()
-	envelopeB64, err := gossipv1.EncodeItemEnvelopeB64(from, to, payloadB64, createdAt, expiresAt)
+	mode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
-		t.Fatalf("encode envelope: %v", err)
+		t.Fatalf("canonical cbor mode: %v", err)
+	}
+	destinationDigest := sha256.Sum256([]byte(to))
+	toHex := hex.EncodeToString(destinationDigest[:])
+	toBytes, err := hex.DecodeString(toHex)
+	if err != nil {
+		t.Fatalf("decode to digest: %v", err)
+	}
+	manifestBytes, err := hex.DecodeString(manifestID)
+	if err != nil {
+		t.Fatalf("decode manifest id: %v", err)
+	}
+	body, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	seed := bytes.Repeat([]byte{0x33}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	signingPayload, err := mode.Marshal(map[string]any{"to_wayfarer_id": toBytes, "manifest_id": manifestBytes, "body": body})
+	if err != nil {
+		t.Fatalf("encode signing payload: %v", err)
+	}
+	digest := sha256.Sum256(append([]byte("AETHOS_ENVELOPE_V1"), signingPayload...))
+	authorSig := ed25519.Sign(privateKey, digest[:])
+	envelopeB64, err := gossipv1.EncodeTransferEnvelopeB64(toHex, manifestID, payloadB64, publicKey, authorSig)
+	if err != nil {
+		t.Fatalf("encode transfer envelope: %v", err)
 	}
 	return envelopeB64
 }
