@@ -60,7 +60,10 @@ On TRANSFER object ingest:
 
 ### Receipt
 
-Receipt payload uses canonical `received` list (accepted item IDs only).
+Receipt payload uses canonical wire field `received` (accepted item IDs only).
+
+- Wire key is `received` in JSON/CBOR.
+- Go structs may use field names like `Accepted` internally, but must encode/decode the wire key `received`.
 
 - Accepted IDs acknowledge what this relay accepted for this transfer.
 - No legacy `accepted`/`rejected` receipt keys.
@@ -85,7 +88,7 @@ Objects are rejected when any of these fail:
 - object already expired
 - policy size limits
 
-Rejections are local decision outcomes; wire receipt remains accepted-ID list only.
+Rejections are local decision outcomes; wire receipt remains `received` list only.
 
 ## 7) Migration/deprecation: legacy `relay_forward.message`
 

@@ -21,6 +21,7 @@ These vectors summarize accepted and rejected forwarding behavior expected under
 - Loop suppression uses seen-by-source behavior in ingest engine (`seen_loop`).
 - Duplicate object ingest is idempotent.
 - Expired objects are not persisted and are excluded from acceptance receipt IDs.
+- RECEIPT acknowledgements use wire field `received[]` (no legacy `accepted`/`rejected` keys).
 
 ## Test coverage in this repo
 
