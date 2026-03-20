@@ -148,6 +148,13 @@ go run ./cmd/relay/main.go \
 The canonical specification for wire protocol fields and semantics is defined in the aethos protocol repository.
 See [aethos/docs/spec](https://github.com/natemellendorf/aethos/tree/main/docs/spec).
 
+### Relay federation authoritative docs (this repository)
+
+- [docs/federation/GOSSIPV1_RELAY_PROFILE.md](docs/federation/GOSSIPV1_RELAY_PROFILE.md)
+- [docs/federation/CONFORMANCE_VECTORS.md](docs/federation/CONFORMANCE_VECTORS.md)
+- [docs/federation-gossipv1-audit.md](docs/federation-gossipv1-audit.md)
+- [docs/adr/0001-gossipv1-federation-option-b.md](docs/adr/0001-gossipv1-federation-option-b.md)
+
 ## Flags
 
 Boolean flags can be passed as either `-flag` or `-flag=true|false`.
@@ -191,15 +198,15 @@ Boolean flags can be passed as either `-flag` or `-flag=true|false`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-federation-topk` | `2` | Number of top peers to forward to |
-| `-federation-explore-prob` | `0.1` | Probability of exploring a non-topK peer |
-| `-federation-batch-interval` | `500ms` | Batching interval |
-| `-federation-batch-jitter` | `250ms` | Batching jitter range |
-| `-federation-batch-max` | `10` | Max frames per batch |
-| `-federation-pad-buckets` | `1024,4096,16384,65536` | Padding bucket sizes (comma-separated) |
-| `-federation-pad-enabled` | `false` | Enable payload padding |
-| `-federation-cover-enabled` | `false` | Enable cover frames |
-| `-federation-cover-max` | `3` | Max cover frames when queue empty |
+| `-federation-topk` | `2` | Forwarding policy top-k candidate count (currently not active in relay-to-relay path) |
+| `-federation-explore-prob` | `0.1` | Forwarding policy exploration probability (currently not active in relay-to-relay path) |
+| `-federation-batch-interval` | `500ms` | TAR batch interval (currently not active in relay-to-relay path) |
+| `-federation-batch-jitter` | `250ms` | TAR batch jitter range (currently not active in relay-to-relay path) |
+| `-federation-batch-max` | `10` | TAR max frames per batch (currently not active in relay-to-relay path) |
+| `-federation-pad-buckets` | `1024,4096,16384,65536` | TAR padding bucket sizes (currently not active in relay-to-relay path) |
+| `-federation-pad-enabled` | `false` | Enable TAR payload padding (currently not active in relay-to-relay path) |
+| `-federation-cover-enabled` | `false` | Enable TAR cover frames (currently not active in relay-to-relay path) |
+| `-federation-cover-max` | `3` | TAR max cover frames when queue empty (currently not active in relay-to-relay path) |
 
 Example with TAR enabled:
 
@@ -338,49 +345,34 @@ Response:
 
 ## Federation Protocol
 
-Relays communicate via WebSocket at `/federation/ws`:
+Relays communicate via WebSocket at `/federation/ws` using **Gossip V1 binary envelopes**.
 
-The canonical specification for these behaviors is defined in the aethos protocol repository.
-See [FEDERATION_PROTOCOL_V1.md](https://github.com/natemellendorf/aethos/blob/main/docs/spec/FEDERATION_PROTOCOL_V1.md).
+Authoritative relay-to-relay profile in this repo:
 
-### Frames
+- [docs/federation/GOSSIPV1_RELAY_PROFILE.md](docs/federation/GOSSIPV1_RELAY_PROFILE.md)
+- [docs/federation/CONFORMANCE_VECTORS.md](docs/federation/CONFORMANCE_VECTORS.md)
 
-**relay_hello** - Initial handshake:
-```json
-{"type": "relay_hello", "relay_id": "relay-us-east", "version": "1.0"}
-```
+High-level flow:
 
-**relay_forward** - Forward envelope payload:
+- HELLO handshake
+- SUMMARY inventory hint
+- REQUEST missing item IDs
+- TRANSFER objects (content-addressed)
+- RECEIPT accepted item IDs
 
-Current `aethos-relay` wire shape:
-```json
-{"type": "relay_forward", "message": {...}}
-```
-
-Canonical v1 spec shape:
-```json
-{"type": "relay_forward", "envelope": {...}}
-```
-
-Implementation note (known deviation): the current relay implementation uses `{"type":"relay_forward","message":...}` on the wire and treats `message` as the forwarded envelope payload.
-
-**relay_ack** - Acknowledge receipt:
-```json
-{"type": "relay_ack", "envelope_id": "...", "destination": "...", "status": "accepted"}
-```
-
-### Federation Behavior
-
-- **Multi-relay forwarding**: Messages are forwarded to selected peers based on score (topK + exploration)
-- **Loop prevention**: Seen bucket tracks which relays have processed each envelope
-- **Graceful degradation**: Unhealthy peers are skipped; messages still reach healthy peers
-- **Backoff**: Failed peers have exponential backoff before retry
+Legacy JSON relay federation frames (`relay_forward`, `relay_ack`) are deprecated and non-authoritative.
 
 ## Traffic Analysis Resistance (TAR)
 
-The relay implements several techniques to resist traffic analysis:
+The relay exposes TAR-related runtime configuration surfaces.
 
-### Batching and Jitter
+Current status in this repo:
+
+- TAR/forwarding knobs are parsed and validated.
+- They are not yet wired into active relay-to-relay Gossip V1 scheduling.
+- Treat them as intra-domain policy surfaces, not inter-domain contract behavior.
+
+### Batching and jitter (config surface)
 
 Outbound frames are batched and sent at intervals with random jitter:
 - **Batching**: Frames are collected and sent in batches (up to `federation-batch-max` per tick)
@@ -388,7 +380,7 @@ Outbound frames are batched and sent at intervals with random jitter:
 
 This makes it harder for observers to correlate message sends with network timing.
 
-### Padding
+### Padding (config surface)
 
 When enabled, payloads are padded to fixed-size buckets:
 - Payloads are padded to the smallest bucket >= actual size
@@ -400,7 +392,7 @@ When enabled, payloads are padded to fixed-size buckets:
 - Hides actual message size from network observers
 - Buckets should be chosen based on expected message size distribution
 
-### Cover Frames
+### Cover frames (config surface)
 
 When enabled and the send queue is empty, the relay sends dummy "cover" frames:
 - Frame type: `relay_cover` with timestamp and nonce

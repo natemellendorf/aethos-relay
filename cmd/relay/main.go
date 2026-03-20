@@ -63,16 +63,18 @@ func main() {
 	autoPeerDiscovery := flag.Bool("auto-peer-discovery", false, "Enable automatic peer discovery via gossip (default false)")
 	descriptorStorePath := flag.String("descriptor-store-path", "", "Path to descriptor bbolt database (defaults to store-path + '.descriptors')")
 
-	// TAR (Traffic Analysis Resistance) flags
-	federationTopK := flag.Int("federation-topk", 2, "Number of top peers to forward to (default 2)")
-	federationExploreProb := flag.Float64("federation-explore-prob", 0.1, "Probability of exploring a non-topK peer (default 0.1)")
-	federationBatchInterval := flag.Duration("federation-batch-interval", 500*time.Millisecond, "Batching interval (default 500ms)")
-	federationBatchJitter := flag.Duration("federation-batch-jitter", 250*time.Millisecond, "Batching jitter range (default 250ms)")
-	federationBatchMax := flag.Int("federation-batch-max", 10, "Max frames per batch (default 10)")
-	federationPadBuckets := flag.String("federation-pad-buckets", "1024,4096,16384,65536", "Padding bucket sizes (comma-separated)")
-	federationPadEnabled := flag.Bool("federation-pad-enabled", false, "Enable payload padding (default false)")
-	federationCoverEnabled := flag.Bool("federation-cover-enabled", false, "Enable cover frames (default false)")
-	federationCoverMax := flag.Int("federation-cover-max", 3, "Max cover frames when queue empty (default 3)")
+	// TAR (Traffic Analysis Resistance) / forwarding policy flags.
+	// NOTE: these knobs are currently parsed and validated but not wired into
+	// active relay-to-relay gossip scheduling in the canonical Gossip V1 path.
+	federationTopK := flag.Int("federation-topk", 2, "Forwarding policy top-k candidate count (currently not active in relay-to-relay path)")
+	federationExploreProb := flag.Float64("federation-explore-prob", 0.1, "Forwarding policy exploration probability (currently not active in relay-to-relay path)")
+	federationBatchInterval := flag.Duration("federation-batch-interval", 500*time.Millisecond, "TAR batch interval (currently not active in relay-to-relay path)")
+	federationBatchJitter := flag.Duration("federation-batch-jitter", 250*time.Millisecond, "TAR batch jitter range (currently not active in relay-to-relay path)")
+	federationBatchMax := flag.Int("federation-batch-max", 10, "TAR max frames per batch (currently not active in relay-to-relay path)")
+	federationPadBuckets := flag.String("federation-pad-buckets", "1024,4096,16384,65536", "TAR padding bucket sizes (currently not active in relay-to-relay path)")
+	federationPadEnabled := flag.Bool("federation-pad-enabled", false, "Enable TAR payload padding (currently not active in relay-to-relay path)")
+	federationCoverEnabled := flag.Bool("federation-cover-enabled", false, "Enable TAR cover frames (currently not active in relay-to-relay path)")
+	federationCoverMax := flag.Int("federation-cover-max", 3, "TAR max cover frames when queue empty (currently not active in relay-to-relay path)")
 
 	flag.Parse()
 
@@ -146,6 +148,7 @@ func main() {
 	forwardingConfig.Validate()
 
 	log.Printf("Forwarding: topk=%d, explore_prob=%.2f", forwardingConfig.TopK, forwardingConfig.ExploreProb)
+	log.Printf("NOTE: federation TAR/forwarding tuning flags are currently not wired into active Gossip V1 relay-to-relay scheduling")
 
 	// Determine envelope store path
 	envStorePath := *envelopeStorePath

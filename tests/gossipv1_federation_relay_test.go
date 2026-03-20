@@ -234,6 +234,145 @@ func TestGossipV1FederationEndpointAcceptsClientLikePeerFrames(t *testing.T) {
 	}
 }
 
+func TestGossipV1FederationEndpointRejectsExpiredAndInvalidHopThenAcceptsValid(t *testing.T) {
+	relay, _ := startRelayForTest(t, "relay-phase4-rejection-cases", true, "", true)
+	defer relay.close()
+
+	conn := mustDial(t, relay.fedURL)
+	defer conn.Close()
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeHello, gossipv1.BuildRelayHello("reject-case-peer"))
+
+	remoteHello := readEnvelope(t, conn)
+	assertFrameType(t, remoteHello, gossipv1.FrameTypeHello)
+
+	initialSummary := readEnvelope(t, conn)
+	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
+
+	requestFor := func(itemID string) {
+		t.Helper()
+		writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{itemID}))
+		request := readEnvelope(t, conn)
+		assertFrameType(t, request, gossipv1.FrameTypeRequest)
+		parsedRequest, err := gossipv1.ParseRequestPayload(request.Payload)
+		if err != nil {
+			t.Fatalf("parse request: %v", err)
+		}
+		if len(parsedRequest.Want) != 1 || parsedRequest.Want[0] != itemID {
+			t.Fatalf("unexpected request payload: %#v", parsedRequest)
+		}
+	}
+
+	now := time.Now().UTC()
+
+	// Rejection case: expired object.
+	expiredCreatedAt := now.Add(-2 * time.Hour).Unix()
+	expiredExpiresAt := now.Add(-1 * time.Hour).Unix()
+	expiredID := testItemID("sender-expired", "wayfarer-reject", "QQ", expiredCreatedAt, expiredExpiresAt)
+	requestFor(expiredID)
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
+		mustTransferObject(t, expiredID, "sender-expired", "wayfarer-reject", "QQ", expiredCreatedAt, expiredExpiresAt),
+	}})
+	expiredReceipt := readEnvelope(t, conn)
+	assertFrameType(t, expiredReceipt, gossipv1.FrameTypeReceipt)
+	parsedExpiredReceipt, err := gossipv1.ParseReceiptPayload(expiredReceipt.Payload)
+	if err != nil {
+		t.Fatalf("parse expired receipt: %v", err)
+	}
+	if len(parsedExpiredReceipt.Accepted) != 0 {
+		t.Fatalf("expired transfer should be rejected, got receipt: %#v", parsedExpiredReceipt)
+	}
+	if _, err := relay.store.GetMessageByID(context.Background(), expiredID); err == nil {
+		t.Fatalf("expired transfer should not persist message %s", expiredID)
+	}
+
+	// Rejection case: invalid hop_count > 65535.
+	hopCreatedAt := now.Unix()
+	hopExpiresAt := now.Add(time.Hour).Unix()
+	hopInvalidID := testItemID("sender-hop", "wayfarer-reject", "Qg", hopCreatedAt, hopExpiresAt)
+	requestFor(hopInvalidID)
+	hopInvalidObject := mustTransferObject(t, hopInvalidID, "sender-hop", "wayfarer-reject", "Qg", hopCreatedAt, hopExpiresAt)
+	hopInvalidObject.HopCount = 65536
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{hopInvalidObject}})
+	hopInvalidReceipt := readEnvelope(t, conn)
+	assertFrameType(t, hopInvalidReceipt, gossipv1.FrameTypeReceipt)
+	parsedHopInvalidReceipt, err := gossipv1.ParseReceiptPayload(hopInvalidReceipt.Payload)
+	if err != nil {
+		t.Fatalf("parse invalid-hop receipt: %v", err)
+	}
+	if len(parsedHopInvalidReceipt.Accepted) != 0 {
+		t.Fatalf("invalid-hop transfer should be rejected, got receipt: %#v", parsedHopInvalidReceipt)
+	}
+	if _, err := relay.store.GetMessageByID(context.Background(), hopInvalidID); err == nil {
+		t.Fatalf("invalid-hop transfer should not persist message %s", hopInvalidID)
+	}
+
+	// Follow-up acceptance case to prove connection/session remains healthy.
+	validCreatedAt := now.Add(time.Second).Unix()
+	validExpiresAt := now.Add(2 * time.Hour).Unix()
+	validID := testItemID("sender-valid", "wayfarer-reject", "Qw", validCreatedAt, validExpiresAt)
+	requestFor(validID)
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
+		mustTransferObject(t, validID, "sender-valid", "wayfarer-reject", "Qw", validCreatedAt, validExpiresAt),
+	}})
+	validReceipt := readEnvelope(t, conn)
+	assertFrameType(t, validReceipt, gossipv1.FrameTypeReceipt)
+	parsedValidReceipt, err := gossipv1.ParseReceiptPayload(validReceipt.Payload)
+	if err != nil {
+		t.Fatalf("parse valid receipt: %v", err)
+	}
+	if len(parsedValidReceipt.Accepted) != 1 || parsedValidReceipt.Accepted[0] != validID {
+		t.Fatalf("valid transfer should be accepted, got receipt: %#v", parsedValidReceipt)
+	}
+	if _, err := relay.store.GetMessageByID(context.Background(), validID); err != nil {
+		t.Fatalf("expected valid transfer persisted: %v", err)
+	}
+}
+
+func TestGossipV1FederationEndpointDuplicateFromSameSourceIsIdempotent(t *testing.T) {
+	relay, _ := startRelayForTest(t, "relay-phase4-duplicate-idempotent", true, "", true)
+	defer relay.close()
+
+	conn := mustDial(t, relay.fedURL)
+	defer conn.Close()
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeHello, gossipv1.BuildRelayHello("duplicate-source-peer"))
+
+	remoteHello := readEnvelope(t, conn)
+	assertFrameType(t, remoteHello, gossipv1.FrameTypeHello)
+
+	initialSummary := readEnvelope(t, conn)
+	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
+
+	now := time.Now().UTC()
+	createdAt := now.Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	itemID := testItemID("sender-dup", "wayfarer-dup", "QQ", createdAt, expiresAt)
+	object := mustTransferObject(t, itemID, "sender-dup", "wayfarer-dup", "QQ", createdAt, expiresAt)
+
+	// Prime a request for the item via summary.
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{itemID}))
+	request := readEnvelope(t, conn)
+	assertFrameType(t, request, gossipv1.FrameTypeRequest)
+
+	for i := 0; i < 2; i++ {
+		writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{object}})
+		receipt := readEnvelope(t, conn)
+		assertFrameType(t, receipt, gossipv1.FrameTypeReceipt)
+		parsedReceipt, err := gossipv1.ParseReceiptPayload(receipt.Payload)
+		if err != nil {
+			t.Fatalf("parse receipt iteration=%d: %v", i, err)
+		}
+		if len(parsedReceipt.Accepted) != 1 || parsedReceipt.Accepted[0] != itemID {
+			t.Fatalf("unexpected receipt iteration=%d: %#v", i, parsedReceipt)
+		}
+	}
+
+	if _, err := relay.store.GetMessageByID(context.Background(), itemID); err != nil {
+		t.Fatalf("expected duplicate-idempotent message persisted: %v", err)
+	}
+}
+
 type federationEventRecorder struct {
 	mu        sync.Mutex
 	counts    map[gossipv1.EventType]int
