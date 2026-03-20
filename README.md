@@ -208,7 +208,7 @@ Boolean flags can be passed as either `-flag` or `-flag=true|false`.
 | `-federation-cover-enabled` | `false` | Enable TAR cover frames (currently not active in relay-to-relay path) |
 | `-federation-cover-max` | `3` | TAR max cover frames when queue empty (currently not active in relay-to-relay path) |
 
-Example with TAR enabled:
+Example of future TAR configuration (flag surface only; not active in current relay-to-relay scheduling path):
 
 ```bash
 go run ./cmd/relay/main.go \
@@ -374,15 +374,15 @@ Current status in this repo:
 
 ### Batching and jitter (config surface)
 
-Outbound frames are batched and sent at intervals with random jitter:
+When TAR scheduling is wired into the relay-to-relay path, outbound frames are expected to be batched and sent at intervals with random jitter:
 - **Batching**: Frames are collected and sent in batches (up to `federation-batch-max` per tick)
 - **Jitter**: Each tick interval includes random jitter (`+/-federation-batch-jitter`)
 
-This makes it harder for observers to correlate message sends with network timing.
+When active, this would make it harder for observers to correlate message sends with network timing.
 
 ### Padding (config surface)
 
-When enabled, payloads are padded to fixed-size buckets:
+When TAR padding is wired and enabled, payloads are expected to be padded to fixed-size buckets:
 - Payloads are padded to the smallest bucket >= actual size
 - Original content is preserved at the start; remainder is random bytes
 - Example: 2000-byte payload becomes 4096 bytes
@@ -394,7 +394,7 @@ When enabled, payloads are padded to fixed-size buckets:
 
 ### Cover frames (config surface)
 
-When enabled and the send queue is empty, the relay sends dummy "cover" frames:
+When TAR cover traffic is wired and enabled, and the send queue is empty, the relay is expected to send dummy "cover" frames:
 - Frame type: `relay_cover` with timestamp and nonce
 - Relay-to-relay only; not stored or forwarded beyond one hop
 
