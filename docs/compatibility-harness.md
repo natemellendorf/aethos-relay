@@ -1,40 +1,19 @@
 # Compatibility test harness
 
-This repository now includes a deterministic compatibility test harness for RelayLink v0.1.
-
-## CLI client
-
-`cmd/relaylink` provides a simple WebSocket CLI with commands:
-
-- `hello --wayfarer-id <id>`
-- `send --wayfarer-id <id> --to <wayfarer_id> --payload-file <path> --ttl <seconds>`
-- `pull --wayfarer-id <id> --limit <N> [--out-dir <dir>]`
-- `ack --wayfarer-id <id> --msg-id <uuid>`
-
-Behavior:
-
-- `send` reads raw bytes and base64-encodes before transmit.
-- `pull` decodes base64 payloads (and can write decoded bytes to `--out-dir`).
-- output is JSON for deterministic test harness usage.
-
-## Deterministic fixture
-
-See `tests/fixtures/README.md` for the deterministic CBOR fixture and exact generation command.
+This repository includes deterministic compatibility tests for the canonical Gossip V1 path.
 
 ## Integration tests
 
-- `tests/compatibility_harness_test.go::TestRelayLinkCompatibilityPayloadIntegrityAndAck` validates:
-  - hello handshake
-  - send
-  - pull
-  - byte-for-byte payload equality
-  - ack behavior with empty queue verification
-  - TTL preservation in persisted message metadata
+- `tests/compatibility_harness_test.go::TestCompatibilityHarnessCanonicalClientRelayPath`
+  - validates HELLO/SUMMARY/REQUEST/TRANSFER/RECEIPT client flow
+  - validates accepted vs rejected transfer object handling
 
-- `tests/compatibility_harness_test.go::TestRelayLinkCompatibilityFederationOptional` is opt-in and runs when:
+- `tests/compatibility_harness_test.go::TestCompatibilityHarnessRejectsNonBinaryFrames`
+  - validates non-binary websocket frame rejection
 
-```bash
-AETHOS_RELAY_TEST_FEDERATION=1 go test ./tests -run Federation
-```
+## Federation interoperability tests
 
-This test validates federated forwarding with unchanged payload bytes.
+Relay-to-relay conformance vectors are covered in:
+
+- `tests/gossipv1_federation_relay_test.go`
+- `docs/federation/CONFORMANCE_VECTORS.md`
