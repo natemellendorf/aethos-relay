@@ -390,7 +390,7 @@ Stop and yield conditions include:
 - **round budget:** `-gossip-drain-round-budget` exhausted,
 - **byte budget:** `-gossip-drain-byte-budget` exhausted (sent + received),
 - **wall-clock budget:** `-gossip-drain-wallclock-budget` exhausted,
-- **fairness yield:** voluntary yield every `-gossip-drain-yield-every-rounds` rounds (when `-gossip-drain-yield-enabled`),
+- **fairness yield:** voluntary yield every `-gossip-drain-yield-every-rounds` rounds (when `-gossip-drain-yield-enabled`); **yield ends the current drain session** and the peer can continue on a new session,
 - **silence / disconnect:** client disconnect or `-gossip-drain-silence-timeout` elapses without client activity.
 
 Session-level structured logs and Prometheus metrics include identity, rounds/items/bytes, no-progress streak, stop reason, and storage latency for query/import/ack operations.

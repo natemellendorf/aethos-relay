@@ -127,6 +127,26 @@ func (s *DrainSession) RecordBytesSent(bytes int) DrainStopReason {
 	return s.stopReasonForBudgetExceeded(time.Now().UTC())
 }
 
+func (s *DrainSession) CanSendBytes(bytes int) (bool, DrainStopReason) {
+	if bytes <= 0 {
+		return true, DrainStopReasonNone
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	if reason := s.stopReasonForBudgetExceeded(now); reason != DrainStopReasonNone {
+		return false, reason
+	}
+	if s.limits.ByteBudget > 0 && (s.state.BytesSent+s.state.BytesReceived+int64(bytes)) >= s.limits.ByteBudget {
+		s.state.StopReason = DrainStopReasonSessionByteBudget
+		return false, s.state.StopReason
+	}
+
+	return true, DrainStopReasonNone
+}
+
 func (s *DrainSession) RecordBytesReceived(bytes int) DrainStopReason {
 	if bytes <= 0 {
 		return DrainStopReasonNone

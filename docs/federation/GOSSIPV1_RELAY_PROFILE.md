@@ -127,7 +127,7 @@ Session stop/yield conditions:
 Notes on fairness budgets (non-normative, implementation guidance):
 
 - **Budgets are per session** (one authenticated WebSocket connection).
-- A "fairness yield" is a voluntary stop that allows the server to rotate attention across many concurrent sessions.
+- A "fairness yield" is a voluntary stop that allows the server to rotate attention across many concurrent sessions; in this implementation, yield is terminal for the current drain session (peer continues on a new session).
 - A "no-progress" round is a round where reconciliation does not materially advance (e.g., no useful REQUEST/TRANSFER work occurs), and consecutive no-progress rounds are capped to avoid busy looping.
 
 Fleet topology assumptions:

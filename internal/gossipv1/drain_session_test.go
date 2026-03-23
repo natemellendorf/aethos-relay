@@ -38,9 +38,13 @@ func TestDrainSessionStopsOnBudgets(t *testing.T) {
 	t.Run("byte budget", func(t *testing.T) {
 		session := NewDrainSession("ws-byte", startedAt, DrainSessionLimits{ByteBudget: 16})
 		session.RecordBytesReceived(9)
-		reason := session.RecordBytesSent(8)
-		if reason != DrainStopReasonSessionByteBudget {
-			t.Fatalf("unexpected stop reason: got=%s want=%s", reason, DrainStopReasonSessionByteBudget)
+		canSend, preSendReason := session.CanSendBytes(7)
+		if canSend || preSendReason != DrainStopReasonSessionByteBudget {
+			t.Fatalf("unexpected pre-send budget result: canSend=%v reason=%s", canSend, preSendReason)
+		}
+		recordedReason := session.RecordBytesSent(8)
+		if recordedReason != DrainStopReasonSessionByteBudget {
+			t.Fatalf("unexpected stop reason: got=%s want=%s", recordedReason, DrainStopReasonSessionByteBudget)
 		}
 	})
 

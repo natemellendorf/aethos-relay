@@ -161,6 +161,32 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 	return h, st
 }
 
+func newWSHandlerWithBoltStore(t *testing.T) (*WSHandler, *store.BBoltStore, *store.BBoltEnvelopeStore) {
+	t.Helper()
+
+	baseDir := t.TempDir()
+	messageStore := store.NewBBoltStore(filepath.Join(baseDir, "relay.db"))
+	if err := messageStore.Open(); err != nil {
+		t.Fatalf("open message store: %v", err)
+	}
+	envelopeStore := store.NewBBoltEnvelopeStore(filepath.Join(baseDir, "relay.db.envelopes"))
+	if err := envelopeStore.Open(); err != nil {
+		t.Fatalf("open envelope store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = envelopeStore.Close()
+		_ = messageStore.Close()
+	})
+
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	h := NewWSHandler(messageStore, clients, 24*time.Hour, "", true, "relay-test")
+	h.SetAutoDeliverQueued(false)
+	h.SetEnvelopeStore(envelopeStore)
+
+	return h, messageStore, envelopeStore
+}
+
 func TestSetLoadBalancerModeNormalizesDeploymentAssumption(t *testing.T) {
 	h, _ := newWSHandlerWithSpyStore(t)
 
@@ -403,6 +429,63 @@ func TestHandleReceiptStopsWhenAckRoundHasNoProgress(t *testing.T) {
 	}
 }
 
+func TestHandleReceiptNoProgressResendsSummaryWhenInventoryExists(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	clientHello := gossipv1.BuildRelayHello("client-receipt-no-progress")
+	deliveryIdentity := storeforward.DeliveryIdentity(clientHello.NodeID, clientHello.NodePubKey)
+	queueRecipient := storeforward.QueueRecipient(deliveryIdentity)
+	now := time.Now().UTC()
+	eligibleID := gossipv1.ComputeItemID("sender-eligible", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            eligibleID,
+		DestinationID: queueRecipient,
+		OpaquePayload: []byte("QQ"),
+		OriginRelayID: "relay-test",
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("persist eligible envelope: %v", err)
+	}
+
+	noopAckedID := strings.Repeat("3f", 32)
+	st.ackedByMsg[noopAckedID] = map[string]bool{deliveryIdentity: true}
+
+	session := &clientSession{
+		client:         &model.Client{DeliveryID: deliveryIdentity, Send: make(chan []byte, 2)},
+		queueRecipient: queueRecipient,
+		sessionID:      "ws-receipt-no-progress",
+		peerLabel:      "peer-receipt-no-progress",
+		drain: gossipv1.NewDrainSession("ws-receipt-no-progress", now, gossipv1.DrainSessionLimits{
+			NoProgressRoundCap: 2,
+		}),
+	}
+
+	err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &gossipv1.ReceiptPayload{Accepted: []string{noopAckedID}}})
+	if err != nil {
+		t.Fatalf("expected no stop on first no-progress receipt, got %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeSummary {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		summary, parseErr := gossipv1.ParseSummaryPayload(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse summary payload: %v", parseErr)
+		}
+		if summary.ItemCount != 1 || len(summary.PreviewItemIDs) != 1 || summary.PreviewItemIDs[0] != eligibleID {
+			t.Fatalf("unexpected summary from no-progress receipt path: %#v", summary.PreviewItemIDs)
+		}
+	default:
+		t.Fatal("expected SUMMARY frame after no-progress receipt")
+	}
+}
+
 func TestHandleRequestStopsWhenRoundBudgetExceeded(t *testing.T) {
 	h, _ := newWSHandlerWithSpyStore(t)
 	now := time.Now().UTC()
@@ -444,6 +527,108 @@ func TestSendEnvelopeStopsOnByteBudgetExceeded(t *testing.T) {
 	}
 	if stopErr.reason != gossipv1.DrainStopReasonSessionByteBudget {
 		t.Fatalf("unexpected stop reason: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonSessionByteBudget)
+	}
+
+	select {
+	case <-session.client.Send:
+		t.Fatal("expected no queued frame when byte budget pre-check fails")
+	default:
+	}
+}
+
+func TestEnvelopeOnlyAckFlowSummaryTransferReceiptAndSuppression(t *testing.T) {
+	h, messageStore, envelopeStore := newWSHandlerWithBoltStore(t)
+	clientHello := gossipv1.BuildRelayHello("client-envelope-only-ack")
+	deliveryIdentity := storeforward.DeliveryIdentity(clientHello.NodeID, clientHello.NodePubKey)
+	queueRecipient := storeforward.QueueRecipient(deliveryIdentity)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	createdAt := now.Add(-time.Minute)
+	expiresAt := now.Add(time.Hour)
+	transferObject := mustTransferObject(t, strings.Repeat("bb", 32), queueRecipient, "QQ", createdAt.Unix(), expiresAt.Unix())
+	opaquePayload, decodeErr := base64.RawURLEncoding.DecodeString(transferObject.EnvelopeB64)
+	if decodeErr != nil {
+		t.Fatalf("decode envelope payload: %v", decodeErr)
+	}
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            transferObject.ItemID,
+		DestinationID: queueRecipient,
+		OpaquePayload: opaquePayload,
+		OriginRelayID: "relay-test",
+		CreatedAt:     createdAt,
+		ExpiresAt:     expiresAt,
+	}); err != nil {
+		t.Fatalf("persist envelope: %v", err)
+	}
+
+	if _, err := messageStore.GetMessageByID(context.Background(), transferObject.ItemID); err == nil {
+		t.Fatal("expected no message record for envelope-only item")
+	}
+
+	initialSummary, _, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build initial summary: %v", err)
+	}
+	if initialSummary.ItemCount != 1 || len(initialSummary.PreviewItemIDs) != 1 || initialSummary.PreviewItemIDs[0] != transferObject.ItemID {
+		t.Fatalf("unexpected initial envelope-only summary: %#v", initialSummary.PreviewItemIDs)
+	}
+
+	session := &clientSession{
+		client: &model.Client{
+			DeliveryID: deliveryIdentity,
+			Send:       make(chan []byte, 4),
+		},
+		adapter:        gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-test"), false),
+		sessionID:      "ws-envelope-only-ack",
+		peerLabel:      "peer-envelope-only-ack",
+		queueRecipient: queueRecipient,
+		drain:          gossipv1.NewDrainSession("ws-envelope-only-ack", now, gossipv1.DrainSessionLimits{}),
+	}
+
+	if err := h.handleRequest(session, gossipv1.Event{Type: gossipv1.EventTypeRequest, Request: &gossipv1.RequestPayload{Want: []string{transferObject.ItemID}}}); err != nil {
+		t.Fatalf("handleRequest for envelope-only item failed: %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeTransfer {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		transferPayload, parseErr := gossipv1.ParseTransferPayloadMixed(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse transfer payload: %v", parseErr)
+		}
+		if len(transferPayload.Objects) != 1 || transferPayload.Objects[0].Object.ItemID != transferObject.ItemID {
+			t.Fatalf("unexpected transfer payload: %#v", transferPayload.Objects)
+		}
+	default:
+		t.Fatal("expected outbound TRANSFER frame")
+	}
+
+	err = h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &gossipv1.ReceiptPayload{Accepted: []string{transferObject.ItemID}}})
+	stopErr := asSessionStop(err)
+	if stopErr == nil {
+		t.Fatalf("expected drain stop after post-ack empty summary, got %v", err)
+	}
+	if stopErr.reason != gossipv1.DrainStopReasonNoEligibleItems {
+		t.Fatalf("unexpected stop reason after envelope-only ack: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonNoEligibleItems)
+	}
+
+	acked, ackErr := messageStore.IsAckedBy(context.Background(), transferObject.ItemID, deliveryIdentity)
+	if ackErr != nil {
+		t.Fatalf("check ack marker for envelope-only item: %v", ackErr)
+	}
+	if !acked {
+		t.Fatal("expected ack marker for envelope-only item")
+	}
+
+	filteredSummary, _, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build filtered summary: %v", err)
+	}
+	if filteredSummary.ItemCount != 0 || len(filteredSummary.PreviewItemIDs) != 0 {
+		t.Fatalf("expected acked envelope-only item to be filtered, got item_count=%d preview=%#v", filteredSummary.ItemCount, filteredSummary.PreviewItemIDs)
 	}
 }
 

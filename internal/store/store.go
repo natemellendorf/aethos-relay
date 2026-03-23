@@ -29,11 +29,13 @@ type Store interface {
 	// This enables per-device delivery tracking - each device/session must ACK separately.
 	MarkDelivered(ctx context.Context, msgID string, recipientID string) error
 
-	// MarkAcked marks a message as acknowledged by a specific recipient identity.
+	// MarkAcked marks an item ID as acknowledged by a specific recipient identity.
+	// Ack markers are durable and idempotent even when no message record exists.
 	// Returns true when this call records a new durable ack transition.
 	MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error)
 
-	// MarkAckedBatch marks many messages as acknowledged in one durable transaction.
+	// MarkAckedBatch marks many item IDs as acknowledged in one durable transaction.
+	// Ack markers are durable and idempotent even when message records are missing.
 	// Returned map contains IDs that transitioned ack state in this call.
 	MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error)
 

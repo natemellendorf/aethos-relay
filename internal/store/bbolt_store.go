@@ -264,10 +264,6 @@ func (s *BBoltStore) MarkAcked(ctx context.Context, msgID string, recipientID st
 	transitioned := false
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		if tx.Bucket(BucketMessages).Get([]byte(msgID)) == nil {
-			return fmt.Errorf("message not found: %s", msgID)
-		}
-
 		ackKey := EncodeDeliveryKey(msgID, recipientID)
 		ackBucket := tx.Bucket(BucketAckState)
 		if ackBucket == nil {
@@ -299,7 +295,6 @@ func (s *BBoltStore) MarkAckedBatch(ctx context.Context, msgIDs []string, recipi
 	}
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		messagesBucket := tx.Bucket(BucketMessages)
 		ackBucket := tx.Bucket(BucketAckState)
 		if ackBucket == nil {
 			return xerrors.New("ack state bucket missing")
@@ -310,9 +305,6 @@ func (s *BBoltStore) MarkAckedBatch(ctx context.Context, msgIDs []string, recipi
 		for _, msgID := range msgIDs {
 			if msgID == "" {
 				continue
-			}
-			if messagesBucket.Get([]byte(msgID)) == nil {
-				return fmt.Errorf("message not found: %s", msgID)
 			}
 			ackKey := EncodeDeliveryKey(msgID, recipientID)
 			if ackBucket.Get(ackKey) != nil {

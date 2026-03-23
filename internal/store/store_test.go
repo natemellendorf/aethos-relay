@@ -582,3 +582,85 @@ func TestMarkAckedBatchTransitionsAndIdempotency(t *testing.T) {
 		t.Fatalf("expected idempotent second batch, got %#v", transitioned)
 	}
 }
+
+func TestMarkAckedAllowsMarkersWithoutMessageRecord(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	recipientID := "wayfarer-1\x00device-a"
+	itemID := "envelope-only-item"
+
+	transitioned, err := store.MarkAcked(nil, itemID, recipientID)
+	if err != nil {
+		t.Fatalf("mark acked without message record: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("expected first ack marker transition for envelope-only item")
+	}
+
+	acked, err := store.IsAckedBy(nil, itemID, recipientID)
+	if err != nil {
+		t.Fatalf("check ack marker: %v", err)
+	}
+	if !acked {
+		t.Fatal("expected ack marker to exist without message record")
+	}
+
+	transitioned, err = store.MarkAcked(nil, itemID, recipientID)
+	if err != nil {
+		t.Fatalf("idempotent mark acked without message record: %v", err)
+	}
+	if transitioned {
+		t.Fatal("expected idempotent ack marker on second mark")
+	}
+}
+
+func TestMarkAckedBatchAllowsMixedMissingAndExistingMessageRecords(t *testing.T) {
+	f, err := os.CreateTemp("", "relay-test-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	store := NewBBoltStore(path)
+	if err := store.Open(); err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	if err := store.PersistMessage(nil, &model.Message{ID: "present-msg", From: "s", To: "r", Payload: "QQ==", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatalf("persist present message: %v", err)
+	}
+
+	recipientID := "wayfarer-1\x00device-a"
+	transitioned, err := store.MarkAckedBatch(nil, []string{"present-msg", "missing-msg", ""}, recipientID)
+	if err != nil {
+		t.Fatalf("mark acked batch with missing records: %v", err)
+	}
+	if len(transitioned) != 2 || !transitioned["present-msg"] || !transitioned["missing-msg"] {
+		t.Fatalf("unexpected transitioned map: %#v", transitioned)
+	}
+
+	ackedPresent, err := store.IsAckedBy(nil, "present-msg", recipientID)
+	if err != nil || !ackedPresent {
+		t.Fatalf("expected present message ack marker, err=%v", err)
+	}
+	ackedMissing, err := store.IsAckedBy(nil, "missing-msg", recipientID)
+	if err != nil || !ackedMissing {
+		t.Fatalf("expected missing message ack marker, err=%v", err)
+	}
+}

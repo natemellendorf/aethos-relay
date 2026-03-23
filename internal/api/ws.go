@@ -491,8 +491,9 @@ func (h *WSHandler) sendDrainSummary(session *clientSession, summaryPath string,
 
 	if canContinue, stopReason := drain.CanStartAnotherRound(time.Now().UTC()); !canContinue {
 		if stopReason == gossipv1.DrainStopReasonFairnessYield {
-			debug.Log("local", "SESSION", "drain_session_yield", "reason", stopReason)
+			debug.Log("local", "SESSION", "drain_session_yield_terminal", "reason", stopReason, "note", "yield ends drain session")
 			metrics.IncrementGossipDrainFairnessEvent("ws", "yield")
+			return stopSession(stopReason, "fairness yield ends drain session")
 		}
 		return stopSession(stopReason, "drain summary pre-check stopped session")
 	}
@@ -586,8 +587,9 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 
 	if canContinue, stopReason := drain.CanStartAnotherRound(time.Now().UTC()); !canContinue {
 		if stopReason == gossipv1.DrainStopReasonFairnessYield {
-			debug.Log("local", "SESSION", "drain_session_yield", "reason", stopReason)
+			debug.Log("local", "SESSION", "drain_session_yield_terminal", "reason", stopReason, "note", "yield ends drain session")
 			metrics.IncrementGossipDrainFairnessEvent("ws", "yield")
+			return stopSession(stopReason, "fairness yield ends drain session")
 		}
 		return stopSession(stopReason, "request blocked by fairness/budget controls")
 	}
@@ -763,19 +765,11 @@ func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) 
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, wsDebugItemSampleLimit)
 	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "acked_count", transitionedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
 
-	if transitionedCount == 0 {
-		if canContinue, reason := drain.CanStartAnotherRound(time.Now().UTC()); !canContinue {
-			if reason == gossipv1.DrainStopReasonFairnessYield {
-				debug.Log("local", "SESSION", "drain_session_yield", "reason", reason)
-				metrics.IncrementGossipDrainFairnessEvent("ws", "yield")
-			}
-			return stopSession(reason, "receipt round ended with no progress")
-		}
-		drain.Stop(gossipv1.DrainStopReasonNoEligibleItems)
-		return stopSession(gossipv1.DrainStopReasonNoEligibleItems, "receipt round ended with no progress")
-	}
 	if session.queueRecipient == "" {
 		return nil
+	}
+	if transitionedCount == 0 {
+		return h.sendDrainSummary(session, "ws.handleReceipt:no_progress_round_reconcile", true)
 	}
 
 	return h.sendDrainSummary(session, "ws.handleReceipt:post_ack_drain", true)
@@ -1267,21 +1261,26 @@ func (h *WSHandler) sendEnvelope(session *clientSession, frameType string, paylo
 		}
 	}
 
-	queued := h.sendBinary(session.client, prefixed)
 	drain := h.ensureDrainSession(session)
+	if canSend, reason := drain.CanSendBytes(len(prefixed)); !canSend {
+		return stopSession(reason, "byte budget exceeded before queueing frame")
+	}
+
+	queued := h.sendBinary(session.client, prefixed)
+	if !queued {
+		drain.Stop(gossipv1.DrainStopReasonSessionTransportBackoff)
+		return stopSession(gossipv1.DrainStopReasonSessionTransportBackoff, "send channel backpressure")
+	}
+
 	if reason := drain.RecordBytesSent(len(prefixed)); reason != gossipv1.DrainStopReasonNone {
 		metrics.AddGossipDrainBytesSent(int64(len(prefixed)))
-		return stopSession(reason, "byte budget exceeded while sending frame")
+		return stopSession(reason, "byte budget exceeded after queueing frame")
 	}
 	metrics.AddGossipDrainBytesSent(int64(len(prefixed)))
 	logFields := make([]any, 0, len(metadata)+6)
 	logFields = append(logFields, metadata...)
 	logFields = append(logFields, "bytes_out", len(prefixed), "transport_ok", queued, "protocol_ok", true, "store_ok", true)
 	debug.Log("out", frameType, "sent", logFields...)
-	if !queued {
-		drain.Stop(gossipv1.DrainStopReasonSessionTransportBackoff)
-		return stopSession(gossipv1.DrainStopReasonSessionTransportBackoff, "send channel backpressure")
-	}
 	return nil
 }
 
