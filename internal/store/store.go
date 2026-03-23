@@ -33,6 +33,10 @@ type Store interface {
 	// Returns true when this call records a new durable ack transition.
 	MarkAcked(ctx context.Context, msgID string, recipientID string) (bool, error)
 
+	// MarkAckedBatch marks many messages as acknowledged in one durable transaction.
+	// Returned map contains IDs that transitioned ack state in this call.
+	MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error)
+
 	// IsDeliveredTo checks if a message has been delivered to a specific recipient.
 	IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error)
 

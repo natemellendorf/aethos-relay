@@ -78,6 +78,10 @@ func (s *ingestStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientI
 	return false, nil
 }
 
+func (s *ingestStoreSpy) MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+
 func (s *ingestStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
 	return false, nil
 }

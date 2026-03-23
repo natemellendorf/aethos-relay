@@ -47,6 +47,14 @@ func main() {
 	ackDrivenSuppression := flag.Bool("ack-driven-suppression", false, "Use canonical ack-driven delivery suppression (default legacy mark-on-push)")
 	scrubInvalidPayloadsStartup := flag.Bool("scrub-invalid-payloads-startup", true, "Remove queued messages with invalid payload_b64 at startup")
 	gossipV1Debug := flag.Bool("gossipv1-debug", false, "Enable verbose structured Gossip V1 debug logging")
+	gossipDrainRoundBudget := flag.Int("gossip-drain-round-budget", 8, "Per-session round budget for gossip drain rounds")
+	gossipDrainByteBudget := flag.Int64("gossip-drain-byte-budget", 8<<20, "Per-session byte budget (sent+received) for gossip drain sessions")
+	gossipDrainWallClockBudget := flag.Duration("gossip-drain-wallclock-budget", 45*time.Second, "Per-session wall-clock budget for gossip drain sessions")
+	gossipDrainNoProgressCap := flag.Int("gossip-drain-no-progress-cap", 2, "Consecutive no-progress rounds before stopping gossip drain session")
+	gossipDrainYieldEveryRounds := flag.Int("gossip-drain-yield-every-rounds", 4, "Yield long gossip sessions every N rounds for fairness")
+	gossipDrainYieldEnabled := flag.Bool("gossip-drain-yield-enabled", true, "Enable fairness yield behavior for long gossip sessions")
+	gossipDrainSilenceTimeout := flag.Duration("gossip-drain-silence-timeout", 45*time.Second, "Client silence timeout for gossip drain sessions")
+	gossipFleetLBMode := flag.String("gossip-fleet-lb-mode", "sticky", "Fleet load balancer mode assumption: sticky or shared")
 
 	// Federation flags
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
@@ -102,6 +110,8 @@ func main() {
 	log.Printf("Ack-driven suppression: %v", *ackDrivenSuppression)
 	log.Printf("Scrub invalid payloads on startup: %v", *scrubInvalidPayloadsStartup)
 	log.Printf("Gossip V1 debug logging: %v", *gossipV1Debug)
+	log.Printf("Gossip drain limits: round_budget=%d byte_budget=%d wall_clock=%s no_progress_cap=%d yield_every_rounds=%d yield_enabled=%v silence_timeout=%s", *gossipDrainRoundBudget, *gossipDrainByteBudget, *gossipDrainWallClockBudget, *gossipDrainNoProgressCap, *gossipDrainYieldEveryRounds, *gossipDrainYieldEnabled, *gossipDrainSilenceTimeout)
+	log.Printf("Gossip fleet LB mode: %s", *gossipFleetLBMode)
 	if *ackDrivenSuppression {
 		log.Printf("WARNING: ack-driven suppression enabled: queue suppression uses ack_state and legacy delivery_state during migration")
 	}
@@ -288,6 +298,16 @@ func main() {
 
 	// Initialize handlers
 	wsHandler := api.NewWSHandler(bbstore, clients, maxTTL, *allowedOrigins, *devMode, *relayID)
+	wsHandler.SetDrainSessionLimits(gossipv1.DrainSessionLimits{
+		RoundBudget:         *gossipDrainRoundBudget,
+		ByteBudget:          *gossipDrainByteBudget,
+		WallClockBudget:     *gossipDrainWallClockBudget,
+		NoProgressRoundCap:  *gossipDrainNoProgressCap,
+		YieldEveryNRounds:   *gossipDrainYieldEveryRounds,
+		SilenceTimeout:      *gossipDrainSilenceTimeout,
+		FairnessYieldEnable: *gossipDrainYieldEnabled,
+	})
+	wsHandler.SetLoadBalancerMode(*gossipFleetLBMode)
 	wsHandler.SetEnvelopeStore(envelopeStore)
 	wsHandler.SetAckDrivenSuppression(*ackDrivenSuppression)
 	wsHandler.SetFederationManager(federationManager)

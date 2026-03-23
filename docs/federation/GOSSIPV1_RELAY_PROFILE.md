@@ -104,3 +104,38 @@ TAR/forwarding knobs are currently config-level only in this repo:
 - not wired into active relay-to-relay scheduling path
 
 They are treated as intra-domain policy surface, not inter-domain wire contract.
+
+## 9) Multi-round session behavior and fleet topology
+
+Session behavior for relay/client gossip WebSocket connections supports repeated drain rounds on one authenticated session:
+
+- `SUMMARY -> REQUEST -> TRANSFER -> RECEIPT` may repeat until stop conditions fire.
+- HELLO/SUMMARY/REQUEST/TRANSFER/RECEIPT semantics are unchanged.
+- No new frame types are introduced.
+- Wire schema is unchanged by this behavior (existing payload fields remain canonical).
+
+Session stop/yield conditions:
+
+- no eligible items,
+- repeated no-progress rounds,
+- session round budget,
+- session byte budget,
+- session wall-clock budget,
+- client disconnect/silence,
+- fairness yield.
+
+Notes on fairness budgets (non-normative, implementation guidance):
+
+- **Budgets are per session** (one authenticated WebSocket connection).
+- A "fairness yield" is a voluntary stop that allows the server to rotate attention across many concurrent sessions.
+- A "no-progress" round is a round where reconciliation does not materially advance (e.g., no useful REQUEST/TRANSFER work occurs), and consecutive no-progress rounds are capped to avoid busy looping.
+
+Fleet topology assumptions:
+
+- Preferred: sticky-session LB for long-lived WebSocket sessions.
+- Alternative: shared durable backend across relay instances if LB is non-sticky.
+
+Deployment expectation and current implementation (non-normative):
+
+- The relay's multi-round drain loop does not migrate across instances; it runs inside a single connection handler.
+- If your fleet is behind a non-sticky LB and instances do not share durable state, reconnects may land on a different instance and observe a different local view of queued/envelope state.

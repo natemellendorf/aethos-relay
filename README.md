@@ -174,6 +174,14 @@ Boolean flags can be passed as either `-flag` or `-flag=true|false`.
 | `-ack-driven-suppression` | `false` | Use canonical ack-driven delivery suppression (legacy mark-on-push when false) |
 | `-scrub-invalid-payloads-startup` | `true` | Remove queued records with invalid `payload_b64` during startup scrub |
 | `-gossipv1-debug` | `false` | Enable verbose structured Gossip V1 debug logs |
+| `-gossip-drain-round-budget` | `8` | Per-session round budget for Gossip V1 drain rounds |
+| `-gossip-drain-byte-budget` | `8388608` | Per-session byte budget (sent+received) for Gossip V1 drain sessions |
+| `-gossip-drain-wallclock-budget` | `45s` | Per-session wall-clock budget for Gossip V1 drain sessions |
+| `-gossip-drain-no-progress-cap` | `2` | Consecutive no-progress rounds before stopping a drain session |
+| `-gossip-drain-yield-every-rounds` | `4` | Yield long sessions every N rounds for fairness |
+| `-gossip-drain-yield-enabled` | `true` | Enable fairness-yield behavior for long sessions |
+| `-gossip-drain-silence-timeout` | `45s` | Client silence timeout for drain sessions |
+| `-gossip-fleet-lb-mode` | `sticky` | Fleet LB assumption (`sticky` or `shared`) for deployment visibility |
 
 ### Federation Flags
 
@@ -297,6 +305,14 @@ Available metrics include:
 - `federation_peer_score{peer="..."}` - Current score for a federation peer
 - `federation_peer_acks_total{peer="..."}` - Total acks received from a peer
 - `federation_peer_timeouts_total{peer="..."}` - Total timeouts for a peer
+- `gossip_drain_sessions_started_total{path="ws"}` - Gossip drain sessions started
+- `gossip_drain_sessions_ended_total{path="ws",stop_reason="..."}` - Gossip drain sessions ended by reason
+- `gossip_drain_rounds_completed_total` - Completed drain rounds
+- `gossip_drain_items_requested_total` - Requested item IDs across rounds
+- `gossip_drain_items_transferred_total` - Transferred items across rounds
+- `gossip_drain_items_acknowledged_total` - Acknowledged items across rounds
+- `gossip_drain_bytes_sent_total` / `gossip_drain_bytes_received_total` - Drain bytes by direction
+- `gossip_drain_storage_latency_seconds{path="ws",op="summary_query|transfer_import|receipt_ack"}` - Storage operation latency
 
 ## Peer Scoring
 
@@ -359,6 +375,40 @@ High-level flow:
 - REQUEST missing item IDs
 - TRANSFER objects (content-addressed)
 - RECEIPT accepted item IDs
+
+### Multi-round drain sessions
+
+Client and relay gossip connections support repeated reconciliation rounds on **one authenticated WebSocket gossip session**:
+
+- A single authenticated session may run multiple `SUMMARY -> REQUEST -> TRANSFER -> RECEIPT` rounds until the session is **drained** (no eligible work remains) or a configured **fairness/stop budget** is reached.
+- **Wire schema is unchanged:** no new frame types, and existing frame payload fields keep their canonical names and meanings.
+
+Stop and yield conditions include:
+
+- **drained:** no eligible items remain for this peer/session,
+- **no-progress cap:** repeated no-progress rounds (e.g., SUMMARY produces no useful REQUEST/TRANSFER work) until `-gossip-drain-no-progress-cap` is hit,
+- **round budget:** `-gossip-drain-round-budget` exhausted,
+- **byte budget:** `-gossip-drain-byte-budget` exhausted (sent + received),
+- **wall-clock budget:** `-gossip-drain-wallclock-budget` exhausted,
+- **fairness yield:** voluntary yield every `-gossip-drain-yield-every-rounds` rounds (when `-gossip-drain-yield-enabled`),
+- **silence / disconnect:** client disconnect or `-gossip-drain-silence-timeout` elapses without client activity.
+
+Session-level structured logs and Prometheus metrics include identity, rounds/items/bytes, no-progress streak, stop reason, and storage latency for query/import/ack operations.
+
+### Fleet topology assumptions
+
+For load-balanced relay fleets, use one of these models:
+
+- **sticky sessions (recommended):** keep a connected gossip WebSocket pinned to one relay instance for full multi-round drain continuity.
+- **shared durable backend:** if stickiness is not guaranteed, all relay instances must share durable queue/envelope state so reconnects can safely continue draining.
+
+What this implementation assumes/does today:
+
+- The multi-round drain loop is **scoped to a single WebSocket connection**.
+- `-gossip-fleet-lb-mode` is an **operator visibility knob** (`sticky` or `shared`): it records/logs the deployment intent and is surfaced in session logs/metrics.
+- This repo does **not** implement cross-instance session affinity by itself. If your LB can move a reconnect to a different instance, you only get correct continuity if instances share the same durable backing stores (or if you ensure stickiness).
+
+Set `-gossip-fleet-lb-mode` (`sticky` or `shared`) to log and surface deployment intent.
 
 Legacy JSON relay federation frames (`relay_forward`, `relay_ack`) are deprecated and non-authoritative.
 

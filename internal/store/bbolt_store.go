@@ -242,14 +242,8 @@ func (s *BBoltStore) GetQueuedMessagesRaw(ctx context.Context, recipientID strin
 // This enables per-device delivery tracking.
 func (s *BBoltStore) MarkDelivered(ctx context.Context, msgID string, recipientID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
-		if msgBytes == nil {
+		if tx.Bucket(BucketMessages).Get([]byte(msgID)) == nil {
 			return fmt.Errorf("message not found: %s", msgID)
-		}
-
-		msg, err := DecodeMessage(msgBytes)
-		if err != nil {
-			return xerrors.Errorf("failed to decode message: %w", err)
 		}
 
 		// Store per-device delivery state with composite key: msgID|recipientID
@@ -258,18 +252,6 @@ func (s *BBoltStore) MarkDelivered(ctx context.Context, msgID string, recipientI
 		nowBytes, _ := now.MarshalBinary()
 		if err := tx.Bucket(BucketDeliveryState).Put(deliveryKey, nowBytes); err != nil {
 			return xerrors.Errorf("failed to update delivery state: %w", err)
-		}
-
-		// Update message DeliveredAt if this is the first delivery
-		if msg.DeliveredAt == nil {
-			msg.DeliveredAt = &now
-			updatedBytes, err := EncodeMessage(msg)
-			if err != nil {
-				return xerrors.Errorf("failed to encode message: %w", err)
-			}
-			if err := tx.Bucket(BucketMessages).Put([]byte(msgID), updatedBytes); err != nil {
-				return xerrors.Errorf("failed to update message: %w", err)
-			}
 		}
 
 		return nil
@@ -282,8 +264,7 @@ func (s *BBoltStore) MarkAcked(ctx context.Context, msgID string, recipientID st
 	transitioned := false
 
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		msgBytes := tx.Bucket(BucketMessages).Get([]byte(msgID))
-		if msgBytes == nil {
+		if tx.Bucket(BucketMessages).Get([]byte(msgID)) == nil {
 			return fmt.Errorf("message not found: %s", msgID)
 		}
 
@@ -303,20 +284,44 @@ func (s *BBoltStore) MarkAcked(ctx context.Context, msgID string, recipientID st
 		}
 		transitioned = true
 
-		msg, err := DecodeMessage(msgBytes)
-		if err != nil {
-			return xerrors.Errorf("failed to decode message: %w", err)
+		return nil
+	})
+
+	return transitioned, err
+}
+
+// MarkAckedBatch marks many message IDs as acknowledged for one recipient in one transaction.
+// Returned map contains only IDs that transitioned ack state in this call.
+func (s *BBoltStore) MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error) {
+	transitioned := make(map[string]bool, len(msgIDs))
+	if len(msgIDs) == 0 {
+		return transitioned, nil
+	}
+
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		messagesBucket := tx.Bucket(BucketMessages)
+		ackBucket := tx.Bucket(BucketAckState)
+		if ackBucket == nil {
+			return xerrors.New("ack state bucket missing")
 		}
 
-		if msg.DeliveredAt == nil {
-			msg.DeliveredAt = &now
-			updatedBytes, err := EncodeMessage(msg)
-			if err != nil {
-				return xerrors.Errorf("failed to encode message: %w", err)
+		now := time.Now()
+		nowBytes, _ := now.MarshalBinary()
+		for _, msgID := range msgIDs {
+			if msgID == "" {
+				continue
 			}
-			if err := tx.Bucket(BucketMessages).Put([]byte(msgID), updatedBytes); err != nil {
-				return xerrors.Errorf("failed to update message: %w", err)
+			if messagesBucket.Get([]byte(msgID)) == nil {
+				return fmt.Errorf("message not found: %s", msgID)
 			}
+			ackKey := EncodeDeliveryKey(msgID, recipientID)
+			if ackBucket.Get(ackKey) != nil {
+				continue
+			}
+			if err := ackBucket.Put(ackKey, nowBytes); err != nil {
+				return xerrors.Errorf("failed to update ack state: %w", err)
+			}
+			transitioned[msgID] = true
 		}
 
 		return nil

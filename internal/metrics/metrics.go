@@ -80,6 +80,9 @@ var (
 
 	// PeerScoreMetrics tracks peer scoring metrics.
 	PeerScoreMetrics = &PeerScoreMetricsGroup{}
+
+	// GossipDrainMetrics tracks gossip session drain behavior.
+	GossipDrainMetrics = &GossipDrainMetricsGroup{}
 )
 
 // PeerScoreMetricsGroup holds peer scoring-related metrics.
@@ -87,6 +90,21 @@ type PeerScoreMetricsGroup struct {
 	PeerScore    *prometheus.GaugeVec
 	PeerAcks     *prometheus.CounterVec
 	PeerTimeouts *prometheus.CounterVec
+}
+
+// GossipDrainMetricsGroup holds session drain metrics.
+type GossipDrainMetricsGroup struct {
+	SessionsStarted      *prometheus.CounterVec
+	SessionsEnded        *prometheus.CounterVec
+	FairnessEvents       *prometheus.CounterVec
+	StorageLatency       *prometheus.HistogramVec
+	RoundsCompleted      prometheus.Counter
+	ItemsRequested       prometheus.Counter
+	ItemsTransferred     prometheus.Counter
+	ItemsAcknowledged    prometheus.Counter
+	BytesSent            prometheus.Counter
+	BytesReceived        prometheus.Counter
+	NoProgressRoundTotal prometheus.Counter
 }
 
 func init() {
@@ -104,6 +122,64 @@ func init() {
 		Name: "federation_peer_timeouts_total",
 		Help: "Total timeouts for a federation peer",
 	}, []string{"peer"})
+}
+
+func init() {
+	GossipDrainMetrics.SessionsStarted = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gossip_drain_sessions_started_total",
+		Help: "Total gossip drain sessions started",
+	}, []string{"path"})
+
+	GossipDrainMetrics.SessionsEnded = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gossip_drain_sessions_ended_total",
+		Help: "Total gossip drain sessions ended",
+	}, []string{"path", "stop_reason"})
+
+	GossipDrainMetrics.FairnessEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gossip_drain_fairness_events_total",
+		Help: "Total gossip fairness throttle and yield events",
+	}, []string{"path", "event"})
+
+	GossipDrainMetrics.StorageLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gossip_drain_storage_latency_seconds",
+		Help:    "Storage latency for gossip drain operations",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"path", "op"})
+
+	GossipDrainMetrics.RoundsCompleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gossip_drain_rounds_completed_total",
+		Help: "Total gossip drain rounds completed",
+	})
+
+	GossipDrainMetrics.ItemsRequested = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gossip_drain_items_requested_total",
+		Help: "Total gossip drain items requested",
+	})
+
+	GossipDrainMetrics.ItemsTransferred = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gossip_drain_items_transferred_total",
+		Help: "Total gossip drain items transferred",
+	})
+
+	GossipDrainMetrics.ItemsAcknowledged = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gossip_drain_items_acknowledged_total",
+		Help: "Total gossip drain items acknowledged",
+	})
+
+	GossipDrainMetrics.BytesSent = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gossip_drain_bytes_sent_total",
+		Help: "Total gossip drain bytes sent",
+	})
+
+	GossipDrainMetrics.BytesReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gossip_drain_bytes_received_total",
+		Help: "Total gossip drain bytes received",
+	})
+
+	GossipDrainMetrics.NoProgressRoundTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gossip_drain_no_progress_rounds_total",
+		Help: "Total gossip drain rounds with no progress",
+	})
 }
 
 // FederationMetricsGroup holds federation envelope-related metrics.
@@ -315,4 +391,66 @@ func RemovePeerMetrics(peer string) {
 	PeerScoreMetrics.PeerScore.DeleteLabelValues(peer)
 	PeerScoreMetrics.PeerAcks.DeleteLabelValues(peer)
 	PeerScoreMetrics.PeerTimeouts.DeleteLabelValues(peer)
+}
+
+func IncrementGossipDrainSessionStarted(path string) {
+	GossipDrainMetrics.SessionsStarted.WithLabelValues(path).Inc()
+}
+
+func IncrementGossipDrainSessionEnded(path string, stopReason string) {
+	GossipDrainMetrics.SessionsEnded.WithLabelValues(path, stopReason).Inc()
+}
+
+func IncrementGossipDrainFairnessEvent(path string, event string) {
+	GossipDrainMetrics.FairnessEvents.WithLabelValues(path, event).Inc()
+}
+
+func ObserveGossipDrainStorageLatency(path string, op string, seconds float64) {
+	GossipDrainMetrics.StorageLatency.WithLabelValues(path, op).Observe(seconds)
+}
+
+func AddGossipDrainRoundsCompleted(rounds int) {
+	if rounds <= 0 {
+		return
+	}
+	GossipDrainMetrics.RoundsCompleted.Add(float64(rounds))
+}
+
+func AddGossipDrainItemsRequested(count int) {
+	if count <= 0 {
+		return
+	}
+	GossipDrainMetrics.ItemsRequested.Add(float64(count))
+}
+
+func AddGossipDrainItemsTransferred(count int) {
+	if count <= 0 {
+		return
+	}
+	GossipDrainMetrics.ItemsTransferred.Add(float64(count))
+}
+
+func AddGossipDrainItemsAcknowledged(count int) {
+	if count <= 0 {
+		return
+	}
+	GossipDrainMetrics.ItemsAcknowledged.Add(float64(count))
+}
+
+func AddGossipDrainBytesSent(bytes int64) {
+	if bytes <= 0 {
+		return
+	}
+	GossipDrainMetrics.BytesSent.Add(float64(bytes))
+}
+
+func AddGossipDrainBytesReceived(bytes int64) {
+	if bytes <= 0 {
+		return
+	}
+	GossipDrainMetrics.BytesReceived.Add(float64(bytes))
+}
+
+func IncrementGossipDrainNoProgressRound() {
+	GossipDrainMetrics.NoProgressRoundTotal.Inc()
 }

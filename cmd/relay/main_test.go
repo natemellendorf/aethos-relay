@@ -7,14 +7,29 @@ import (
 
 func TestNormalizeBoolFlagArgs(t *testing.T) {
 	boolFlags := map[string]struct{}{
-		"dev-mode":            {},
-		"auto-peer-discovery": {},
-		"gossipv1-debug":      {},
+		"dev-mode":                   {},
+		"auto-peer-discovery":        {},
+		"gossipv1-debug":             {},
+		"gossip-drain-yield-enabled": {},
 	}
 
 	args := []string{"relay", "-ws-addr", "127.0.0.1:8082", "-dev-mode", "true", "-auto-peer-discovery", "false", "-relay-id", "nine"}
 	got := normalizeBoolFlagArgs(args, boolFlags)
 	want := []string{"relay", "-ws-addr", "127.0.0.1:8082", "-dev-mode=true", "-auto-peer-discovery=false", "-relay-id", "nine"}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeBoolFlagArgs() = %v, want %v", got, want)
+	}
+}
+
+func TestNormalizeBoolFlagArgsIncludesGossipDrainYieldEnabled(t *testing.T) {
+	boolFlags := map[string]struct{}{
+		"gossip-drain-yield-enabled": {},
+	}
+
+	args := []string{"relay", "-gossip-drain-yield-enabled", "false"}
+	got := normalizeBoolFlagArgs(args, boolFlags)
+	want := []string{"relay", "-gossip-drain-yield-enabled=false"}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalizeBoolFlagArgs() = %v, want %v", got, want)

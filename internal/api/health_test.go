@@ -26,6 +26,10 @@ func (m *mockStore) SetLastSweepTime(ctx context.Context, t time.Time) error {
 	return nil
 }
 
+func (m *mockStore) MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+
 // mockSweeper implements a minimal sweeper for testing
 type mockSweeper struct {
 	lastSweepTime time.Time
@@ -197,6 +201,10 @@ func (f *failingStore) GetLastSweepTime(ctx context.Context) (time.Time, error) 
 
 func (f *failingStore) SetLastSweepTime(ctx context.Context, t time.Time) error {
 	return &mockError{"store error"}
+}
+
+func (f *failingStore) MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error) {
+	return nil, &mockError{"store error"}
 }
 
 type mockError struct {

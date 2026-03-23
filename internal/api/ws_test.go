@@ -94,6 +94,27 @@ func (s *wsStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientID st
 	return true, nil
 }
 
+func (s *wsStoreSpy) MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error) {
+	if s.ackErr != nil {
+		return nil, s.ackErr
+	}
+	transitioned := make(map[string]bool, len(msgIDs))
+	for _, msgID := range msgIDs {
+		if msgID == "" {
+			continue
+		}
+		if s.ackedByMsg[msgID] == nil {
+			s.ackedByMsg[msgID] = make(map[string]bool)
+		}
+		if s.ackedByMsg[msgID][recipientID] {
+			continue
+		}
+		s.ackedByMsg[msgID][recipientID] = true
+		transitioned[msgID] = true
+	}
+	return transitioned, nil
+}
+
 func (s *wsStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
 	return false, nil
 }
@@ -138,6 +159,20 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 	h := NewWSHandler(st, clients, 24*time.Hour, "", true, "relay-test")
 	h.SetAutoDeliverQueued(false)
 	return h, st
+}
+
+func TestSetLoadBalancerModeNormalizesDeploymentAssumption(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+
+	h.SetLoadBalancerMode("shared")
+	if h.lbMode != "shared" {
+		t.Fatalf("expected shared lb mode, got %q", h.lbMode)
+	}
+
+	h.SetLoadBalancerMode("invalid-mode")
+	if h.lbMode != "sticky" {
+		t.Fatalf("invalid mode should default to sticky, got %q", h.lbMode)
+	}
 }
 
 func newEnvelopeStoreForTest(t *testing.T) *store.BBoltEnvelopeStore {
@@ -324,13 +359,16 @@ func TestHandleTransferRejectsItemIDHashMismatch(t *testing.T) {
 
 func TestHandleReceiptAcksAcceptedOnly(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
-	session := &clientSession{client: &model.Client{DeliveryID: "wayfarer\x00device"}}
+	session := &clientSession{client: &model.Client{DeliveryID: "wayfarer\x00device"}, queueRecipient: "", summaryCursor: ""}
 
 	receipt := gossipv1.ReceiptPayload{
 		Accepted: []string{"msg-a", "msg-b"},
 	}
+	now := time.Now().UTC()
+	session.drain = gossipv1.NewDrainSession("ws-test", now, gossipv1.DrainSessionLimits{})
 
-	if err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &receipt}); err != nil {
+	err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &receipt})
+	if err != nil {
 		t.Fatalf("handleReceipt failed: %v", err)
 	}
 
@@ -340,6 +378,72 @@ func TestHandleReceiptAcksAcceptedOnly(t *testing.T) {
 
 	if !ackedA || !ackedB || ackedC {
 		t.Fatalf("unexpected ack states: a=%t b=%t c=%t", ackedA, ackedB, ackedC)
+	}
+}
+
+func TestHandleReceiptStopsWhenAckRoundHasNoProgress(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	now := time.Now().UTC()
+	session := &clientSession{
+		client:         &model.Client{DeliveryID: "wayfarer\x00device"},
+		queueRecipient: "wayfarer",
+		drain: gossipv1.NewDrainSession("ws-test-no-progress", now, gossipv1.DrainSessionLimits{
+			NoProgressRoundCap: 1,
+		}),
+	}
+	st.ackedByMsg["msg-noop"] = map[string]bool{"wayfarer\x00device": true}
+
+	err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &gossipv1.ReceiptPayload{Accepted: []string{"msg-noop"}}})
+	stopErr := asSessionStop(err)
+	if stopErr == nil {
+		t.Fatalf("expected session stop error, got %v", err)
+	}
+	if stopErr.reason != gossipv1.DrainStopReasonRepeatedNoProgress {
+		t.Fatalf("unexpected stop reason: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonRepeatedNoProgress)
+	}
+}
+
+func TestHandleRequestStopsWhenRoundBudgetExceeded(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	now := time.Now().UTC()
+	session := &clientSession{
+		client:         &model.Client{DeliveryID: "wayfarer\x00device"},
+		queueRecipient: "wayfarer",
+		drain: gossipv1.NewDrainSession("ws-test-budget", now, gossipv1.DrainSessionLimits{
+			RoundBudget: 1,
+		}),
+	}
+	session.drain.CompleteRound(true)
+
+	err := h.handleRequest(session, gossipv1.Event{Type: gossipv1.EventTypeRequest, Request: &gossipv1.RequestPayload{Want: []string{strings.Repeat("0a", 32)}}})
+	stopErr := asSessionStop(err)
+	if stopErr == nil {
+		t.Fatalf("expected stop error, got %v", err)
+	}
+	if stopErr.reason != gossipv1.DrainStopReasonSessionRoundBudget {
+		t.Fatalf("unexpected stop reason: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonSessionRoundBudget)
+	}
+}
+
+func TestSendEnvelopeStopsOnByteBudgetExceeded(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	now := time.Now().UTC()
+	session := &clientSession{
+		client:    &model.Client{Send: make(chan []byte, 1)},
+		sessionID: "ws-byte-budget",
+		peerLabel: "peer-byte-budget",
+		drain: gossipv1.NewDrainSession("ws-byte-budget", now, gossipv1.DrainSessionLimits{
+			ByteBudget: 16,
+		}),
+	}
+
+	err := h.sendEnvelope(session, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{strings.Repeat("0a", 32)}))
+	stopErr := asSessionStop(err)
+	if stopErr == nil {
+		t.Fatalf("expected session stop error, got %v", err)
+	}
+	if stopErr.reason != gossipv1.DrainStopReasonSessionByteBudget {
+		t.Fatalf("unexpected stop reason: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonSessionByteBudget)
 	}
 }
 
@@ -670,7 +774,7 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 		t.Fatalf("persist non-digest envelope: %v", err)
 	}
 
-	summary, nextCursor, err := h.buildRecipientSummary(queueRecipient, "")
+	summary, nextCursor, err := h.buildRecipientSummary(queueRecipient, "", "")
 	if err != nil {
 		t.Fatalf("build first summary: %v", err)
 	}
@@ -699,7 +803,7 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 		}
 	}
 
-	nextSummary, secondCursor, err := h.buildRecipientSummary(queueRecipient, nextCursor)
+	nextSummary, secondCursor, err := h.buildRecipientSummary(queueRecipient, "", nextCursor)
 	if err != nil {
 		t.Fatalf("build second summary: %v", err)
 	}
@@ -716,6 +820,46 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 	}
 	if secondCursor != nextSummary.PreviewCursor {
 		t.Fatalf("unexpected second next cursor: got=%q want=%q", secondCursor, nextSummary.PreviewCursor)
+	}
+}
+
+func TestBuildRecipientSummaryFiltersAckedForDeliveryIdentity(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	queueRecipient := "wayfarer-summary-acked"
+	deliveryIdentity := "wayfarer-summary-acked\x00device-a"
+	now := time.Now().UTC()
+	ackedID := gossipv1.ComputeItemID("sender", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	openID := gossipv1.ComputeItemID("sender", queueRecipient, "Qg", now.Add(time.Second).Unix(), now.Add(time.Hour).Unix())
+
+	for _, id := range []string{ackedID, openID} {
+		if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+			ID:            id,
+			DestinationID: queueRecipient,
+			OpaquePayload: []byte("QQ"),
+			OriginRelayID: "relay-test",
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("persist envelope: %v", err)
+		}
+		st.messagesByID[id] = &model.Message{ID: id, To: queueRecipient, ExpiresAt: now.Add(time.Hour)}
+	}
+	if _, err := st.MarkAcked(context.Background(), ackedID, deliveryIdentity); err != nil {
+		t.Fatalf("mark acked: %v", err)
+	}
+
+	summary, _, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build summary: %v", err)
+	}
+	if summary.ItemCount != 1 {
+		t.Fatalf("expected one unacked item, got %d", summary.ItemCount)
+	}
+	if len(summary.PreviewItemIDs) != 1 || summary.PreviewItemIDs[0] != openID {
+		t.Fatalf("unexpected preview ids: %#v", summary.PreviewItemIDs)
 	}
 }
 

@@ -30,6 +30,8 @@ This relay targets canonical `aethos` protocol behavior with Option B federation
 - Canonical path is Gossip V1 binary HELLO/SUMMARY/REQUEST/TRANSFER/RECEIPT.
 - Canonical transfer object semantics are enforced (`item_id` content-address, canonical envelope bytes, strict parse gates).
 - Receipt semantics are canonical `received` accepted-ID list only.
+- Sessions support **multi-round drain behavior** on one authenticated connection: a single session may run multiple `SUMMARY -> REQUEST -> TRANSFER -> RECEIPT` rounds until drained or stopped/yielded by configured budgets.
+- **Wire schema is unchanged** by multi-round drain: no new frame types, and HELLO/SUMMARY/REQUEST/TRANSFER/RECEIPT payload field names and meanings remain canonical.
 
 Legacy JSON relay federation examples (`relay_forward.message` / `relay_ack`) are deprecated and non-authoritative for this repository.
 
