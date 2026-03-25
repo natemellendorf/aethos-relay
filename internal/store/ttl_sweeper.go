@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"github.com/natemellendorf/aethos-relay/internal/metrics"
 )
 
 // TTLSweeper periodically removes expired messages from the store.
@@ -57,6 +59,11 @@ func (s *TTLSweeper) Stop() {
 
 // sweep performs one sweep iteration.
 func (s *TTLSweeper) sweep(ctx context.Context) {
+	started := time.Now()
+	defer func() {
+		metrics.ObserveGossipDrainStorageLatency("store", "prune_messages", time.Since(started).Seconds())
+	}()
+
 	now := time.Now()
 	expired, err := s.store.GetExpiredMessages(ctx, now)
 	if err != nil {

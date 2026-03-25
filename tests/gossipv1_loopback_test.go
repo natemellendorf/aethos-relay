@@ -114,6 +114,56 @@ func TestGossipV1ClientEncounterFullFlow(t *testing.T) {
 	}
 }
 
+func TestGossipV1ClientEncounterMultiRoundDrainSingleSession(t *testing.T) {
+	relay, wsURL := startRelayForTest(t, "relay-client-multi-round", true, "", true)
+	defer relay.close()
+
+	conn := mustDial(t, wsURL)
+	defer conn.Close()
+
+	localHello := readEnvelope(t, conn)
+	assertFrameType(t, localHello, gossipv1.FrameTypeHello)
+
+	clientHello := gossipv1.BuildRelayHello("client-multi-round")
+	writeEnvelope(t, conn, gossipv1.FrameTypeHello, clientHello)
+
+	initialSummary := readEnvelope(t, conn)
+	assertFrameType(t, initialSummary, gossipv1.FrameTypeSummary)
+
+	now := time.Now().UTC()
+	createdAt := now.Unix()
+	expiresAt := now.Add(time.Hour).Unix()
+	firstID := testItemID("sender-multi-1", clientHello.NodeID, "QQ", createdAt, expiresAt)
+	secondID := testItemID("sender-multi-2", clientHello.NodeID, "Qg", createdAt+1, expiresAt)
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{firstID, secondID}))
+	requestOne := readEnvelope(t, conn)
+	assertFrameType(t, requestOne, gossipv1.FrameTypeRequest)
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
+		mustTransferObject(t, firstID, "sender-multi-1", clientHello.NodeID, "QQ", createdAt, expiresAt),
+	}})
+	receiptOne := readEnvelope(t, conn)
+	assertFrameType(t, receiptOne, gossipv1.FrameTypeReceipt)
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{secondID}))
+	requestTwo := readEnvelope(t, conn)
+	assertFrameType(t, requestTwo, gossipv1.FrameTypeRequest)
+
+	writeEnvelope(t, conn, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: []gossipv1.TransferObject{
+		mustTransferObject(t, secondID, "sender-multi-2", clientHello.NodeID, "Qg", createdAt+1, expiresAt),
+	}})
+	receiptTwo := readEnvelope(t, conn)
+	assertFrameType(t, receiptTwo, gossipv1.FrameTypeReceipt)
+
+	if _, err := relay.store.GetMessageByID(context.Background(), firstID); err != nil {
+		t.Fatalf("expected first persisted message: %v", err)
+	}
+	if _, err := relay.store.GetMessageByID(context.Background(), secondID); err != nil {
+		t.Fatalf("expected second persisted message: %v", err)
+	}
+}
+
 type helloObserver struct {
 	mu     sync.Mutex
 	counts map[string]int

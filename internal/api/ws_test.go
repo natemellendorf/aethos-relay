@@ -94,6 +94,27 @@ func (s *wsStoreSpy) MarkAcked(ctx context.Context, msgID string, recipientID st
 	return true, nil
 }
 
+func (s *wsStoreSpy) MarkAckedBatch(ctx context.Context, msgIDs []string, recipientID string) (map[string]bool, error) {
+	if s.ackErr != nil {
+		return nil, s.ackErr
+	}
+	transitioned := make(map[string]bool, len(msgIDs))
+	for _, msgID := range msgIDs {
+		if msgID == "" {
+			continue
+		}
+		if s.ackedByMsg[msgID] == nil {
+			s.ackedByMsg[msgID] = make(map[string]bool)
+		}
+		if s.ackedByMsg[msgID][recipientID] {
+			continue
+		}
+		s.ackedByMsg[msgID][recipientID] = true
+		transitioned[msgID] = true
+	}
+	return transitioned, nil
+}
+
 func (s *wsStoreSpy) IsDeliveredTo(ctx context.Context, msgID string, recipientID string) (bool, error) {
 	return false, nil
 }
@@ -138,6 +159,46 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 	h := NewWSHandler(st, clients, 24*time.Hour, "", true, "relay-test")
 	h.SetAutoDeliverQueued(false)
 	return h, st
+}
+
+func newWSHandlerWithBoltStore(t *testing.T) (*WSHandler, *store.BBoltStore, *store.BBoltEnvelopeStore) {
+	t.Helper()
+
+	baseDir := t.TempDir()
+	messageStore := store.NewBBoltStore(filepath.Join(baseDir, "relay.db"))
+	if err := messageStore.Open(); err != nil {
+		t.Fatalf("open message store: %v", err)
+	}
+	envelopeStore := store.NewBBoltEnvelopeStore(filepath.Join(baseDir, "relay.db.envelopes"))
+	if err := envelopeStore.Open(); err != nil {
+		t.Fatalf("open envelope store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = envelopeStore.Close()
+		_ = messageStore.Close()
+	})
+
+	clients := model.NewClientRegistry()
+	go clients.Run()
+	h := NewWSHandler(messageStore, clients, 24*time.Hour, "", true, "relay-test")
+	h.SetAutoDeliverQueued(false)
+	h.SetEnvelopeStore(envelopeStore)
+
+	return h, messageStore, envelopeStore
+}
+
+func TestSetLoadBalancerModeNormalizesDeploymentAssumption(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+
+	h.SetLoadBalancerMode("shared")
+	if h.lbMode != "shared" {
+		t.Fatalf("expected shared lb mode, got %q", h.lbMode)
+	}
+
+	h.SetLoadBalancerMode("invalid-mode")
+	if h.lbMode != "sticky" {
+		t.Fatalf("invalid mode should default to sticky, got %q", h.lbMode)
+	}
 }
 
 func newEnvelopeStoreForTest(t *testing.T) *store.BBoltEnvelopeStore {
@@ -324,13 +385,16 @@ func TestHandleTransferRejectsItemIDHashMismatch(t *testing.T) {
 
 func TestHandleReceiptAcksAcceptedOnly(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
-	session := &clientSession{client: &model.Client{DeliveryID: "wayfarer\x00device"}}
+	session := &clientSession{client: &model.Client{DeliveryID: "wayfarer\x00device"}, queueRecipient: "", summaryCursor: ""}
 
 	receipt := gossipv1.ReceiptPayload{
 		Accepted: []string{"msg-a", "msg-b"},
 	}
+	now := time.Now().UTC()
+	session.drain = gossipv1.NewDrainSession("ws-test", now, gossipv1.DrainSessionLimits{})
 
-	if err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &receipt}); err != nil {
+	err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &receipt})
+	if err != nil {
 		t.Fatalf("handleReceipt failed: %v", err)
 	}
 
@@ -340,6 +404,244 @@ func TestHandleReceiptAcksAcceptedOnly(t *testing.T) {
 
 	if !ackedA || !ackedB || ackedC {
 		t.Fatalf("unexpected ack states: a=%t b=%t c=%t", ackedA, ackedB, ackedC)
+	}
+}
+
+func TestHandleReceiptStopsWhenAckRoundHasNoProgress(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	now := time.Now().UTC()
+	session := &clientSession{
+		client:         &model.Client{DeliveryID: "wayfarer\x00device"},
+		queueRecipient: "wayfarer",
+		drain: gossipv1.NewDrainSession("ws-test-no-progress", now, gossipv1.DrainSessionLimits{
+			NoProgressRoundCap: 1,
+		}),
+	}
+	st.ackedByMsg["msg-noop"] = map[string]bool{"wayfarer\x00device": true}
+
+	err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &gossipv1.ReceiptPayload{Accepted: []string{"msg-noop"}}})
+	stopErr := asSessionStop(err)
+	if stopErr == nil {
+		t.Fatalf("expected session stop error, got %v", err)
+	}
+	if stopErr.reason != gossipv1.DrainStopReasonRepeatedNoProgress {
+		t.Fatalf("unexpected stop reason: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonRepeatedNoProgress)
+	}
+}
+
+func TestHandleReceiptNoProgressResendsSummaryWhenInventoryExists(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	clientHello := gossipv1.BuildRelayHello("client-receipt-no-progress")
+	deliveryIdentity := storeforward.DeliveryIdentity(clientHello.NodeID, clientHello.NodePubKey)
+	queueRecipient := storeforward.QueueRecipient(deliveryIdentity)
+	now := time.Now().UTC()
+	eligibleID := gossipv1.ComputeItemID("sender-eligible", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            eligibleID,
+		DestinationID: queueRecipient,
+		OpaquePayload: []byte("QQ"),
+		OriginRelayID: "relay-test",
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("persist eligible envelope: %v", err)
+	}
+
+	noopAckedID := strings.Repeat("3f", 32)
+	st.ackedByMsg[noopAckedID] = map[string]bool{deliveryIdentity: true}
+
+	session := &clientSession{
+		client:         &model.Client{DeliveryID: deliveryIdentity, Send: make(chan []byte, 2)},
+		queueRecipient: queueRecipient,
+		sessionID:      "ws-receipt-no-progress",
+		peerLabel:      "peer-receipt-no-progress",
+		drain: gossipv1.NewDrainSession("ws-receipt-no-progress", now, gossipv1.DrainSessionLimits{
+			NoProgressRoundCap: 2,
+		}),
+	}
+
+	err := h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &gossipv1.ReceiptPayload{Accepted: []string{noopAckedID}}})
+	if err != nil {
+		t.Fatalf("expected no stop on first no-progress receipt, got %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeSummary {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		summary, parseErr := gossipv1.ParseSummaryPayload(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse summary payload: %v", parseErr)
+		}
+		if summary.ItemCount != 1 || len(summary.PreviewItemIDs) != 1 || summary.PreviewItemIDs[0] != eligibleID {
+			t.Fatalf("unexpected summary from no-progress receipt path: %#v", summary.PreviewItemIDs)
+		}
+	default:
+		t.Fatal("expected SUMMARY frame after no-progress receipt")
+	}
+}
+
+func TestHandleRequestStopsWhenRoundBudgetExceeded(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	now := time.Now().UTC()
+	session := &clientSession{
+		client:         &model.Client{DeliveryID: "wayfarer\x00device"},
+		queueRecipient: "wayfarer",
+		drain: gossipv1.NewDrainSession("ws-test-budget", now, gossipv1.DrainSessionLimits{
+			RoundBudget: 1,
+		}),
+	}
+	session.drain.CompleteRound(true)
+
+	err := h.handleRequest(session, gossipv1.Event{Type: gossipv1.EventTypeRequest, Request: &gossipv1.RequestPayload{Want: []string{strings.Repeat("0a", 32)}}})
+	stopErr := asSessionStop(err)
+	if stopErr == nil {
+		t.Fatalf("expected stop error, got %v", err)
+	}
+	if stopErr.reason != gossipv1.DrainStopReasonSessionRoundBudget {
+		t.Fatalf("unexpected stop reason: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonSessionRoundBudget)
+	}
+}
+
+func TestSendEnvelopeStopsOnByteBudgetExceeded(t *testing.T) {
+	h, _ := newWSHandlerWithSpyStore(t)
+	now := time.Now().UTC()
+	session := &clientSession{
+		client:    &model.Client{Send: make(chan []byte, 1)},
+		sessionID: "ws-byte-budget",
+		peerLabel: "peer-byte-budget",
+		drain: gossipv1.NewDrainSession("ws-byte-budget", now, gossipv1.DrainSessionLimits{
+			ByteBudget: 16,
+		}),
+	}
+
+	err := h.sendEnvelope(session, gossipv1.FrameTypeSummary, gossipv1.BuildSummaryPayload([]string{strings.Repeat("0a", 32)}))
+	stopErr := asSessionStop(err)
+	if stopErr == nil {
+		t.Fatalf("expected session stop error, got %v", err)
+	}
+	if stopErr.reason != gossipv1.DrainStopReasonSessionByteBudget {
+		t.Fatalf("unexpected stop reason: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonSessionByteBudget)
+	}
+
+	select {
+	case <-session.client.Send:
+		t.Fatal("expected no queued frame when byte budget pre-check fails")
+	default:
+	}
+}
+
+func TestEnvelopeOnlyAckFlowSummaryTransferReceiptAndSuppression(t *testing.T) {
+	h, messageStore, envelopeStore := newWSHandlerWithBoltStore(t)
+	clientHello := gossipv1.BuildRelayHello("client-envelope-only-ack")
+	deliveryIdentity := storeforward.DeliveryIdentity(clientHello.NodeID, clientHello.NodePubKey)
+	queueRecipient := storeforward.QueueRecipient(deliveryIdentity)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	createdAt := now.Add(-time.Minute)
+	expiresAt := now.Add(time.Hour)
+	transferObject := mustTransferObject(t, strings.Repeat("bb", 32), queueRecipient, "QQ", createdAt.Unix(), expiresAt.Unix())
+	opaquePayload, decodeErr := base64.RawURLEncoding.DecodeString(transferObject.EnvelopeB64)
+	if decodeErr != nil {
+		t.Fatalf("decode envelope payload: %v", decodeErr)
+	}
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            transferObject.ItemID,
+		DestinationID: queueRecipient,
+		OpaquePayload: opaquePayload,
+		OriginRelayID: "relay-test",
+		CreatedAt:     createdAt,
+		ExpiresAt:     expiresAt,
+	}); err != nil {
+		t.Fatalf("persist envelope: %v", err)
+	}
+
+	if _, err := messageStore.GetMessageByID(context.Background(), transferObject.ItemID); err == nil {
+		t.Fatal("expected no message record for envelope-only item")
+	}
+
+	initialSummary, _, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build initial summary: %v", err)
+	}
+	if initialSummary.ItemCount != 1 || len(initialSummary.PreviewItemIDs) != 1 || initialSummary.PreviewItemIDs[0] != transferObject.ItemID {
+		t.Fatalf("unexpected initial envelope-only summary: %#v", initialSummary.PreviewItemIDs)
+	}
+
+	session := &clientSession{
+		client: &model.Client{
+			DeliveryID: deliveryIdentity,
+			Send:       make(chan []byte, 4),
+		},
+		adapter:        gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello("relay-test"), false),
+		sessionID:      "ws-envelope-only-ack",
+		peerLabel:      "peer-envelope-only-ack",
+		queueRecipient: queueRecipient,
+		drain:          gossipv1.NewDrainSession("ws-envelope-only-ack", now, gossipv1.DrainSessionLimits{}),
+	}
+
+	if err := h.handleRequest(session, gossipv1.Event{Type: gossipv1.EventTypeRequest, Request: &gossipv1.RequestPayload{Want: []string{transferObject.ItemID}}}); err != nil {
+		t.Fatalf("handleRequest for envelope-only item failed: %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeTransfer {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		transferPayload, parseErr := gossipv1.ParseTransferPayloadMixed(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse transfer payload: %v", parseErr)
+		}
+		if len(transferPayload.Objects) != 1 || transferPayload.Objects[0].Object.ItemID != transferObject.ItemID {
+			t.Fatalf("unexpected transfer payload: %#v", transferPayload.Objects)
+		}
+	default:
+		t.Fatal("expected outbound TRANSFER frame")
+	}
+
+	err = h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &gossipv1.ReceiptPayload{Accepted: []string{transferObject.ItemID}}})
+	if err != nil {
+		t.Fatalf("handleReceipt should continue session after convergence, got %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeSummary {
+			t.Fatalf("unexpected outbound frame type after receipt: %s", decoded.Type)
+		}
+		summary, parseErr := gossipv1.ParseSummaryPayload(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse summary payload: %v", parseErr)
+		}
+		if summary.ItemCount != 0 || len(summary.PreviewItemIDs) != 0 {
+			t.Fatalf("expected empty convergence summary, got item_count=%d preview=%#v", summary.ItemCount, summary.PreviewItemIDs)
+		}
+	default:
+		t.Fatal("expected outbound SUMMARY frame after receipt")
+	}
+
+	acked, ackErr := messageStore.IsAckedBy(context.Background(), transferObject.ItemID, deliveryIdentity)
+	if ackErr != nil {
+		t.Fatalf("check ack marker for envelope-only item: %v", ackErr)
+	}
+	if !acked {
+		t.Fatal("expected ack marker for envelope-only item")
+	}
+
+	filteredSummary, _, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build filtered summary: %v", err)
+	}
+	if filteredSummary.ItemCount != 0 || len(filteredSummary.PreviewItemIDs) != 0 {
+		t.Fatalf("expected acked envelope-only item to be filtered, got item_count=%d preview=%#v", filteredSummary.ItemCount, filteredSummary.PreviewItemIDs)
 	}
 }
 
@@ -579,6 +881,74 @@ func TestHandleSummaryRequestsUnknownPreviewIDs(t *testing.T) {
 	}
 }
 
+func TestHandleSummaryNoWantSendsEmptyRequestAndContinues(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 1)}}
+
+	knownID := strings.Repeat("2a", 32)
+	st.messagesByID[knownID] = &model.Message{ID: knownID, ExpiresAt: time.Now().Add(time.Hour)}
+	bloom := gossipv1.BuildSummaryPayload([]string{knownID}).BloomFilter
+	event := gossipv1.Event{Type: gossipv1.EventTypeSummary, Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{knownID}, PreviewCursor: knownID}}
+
+	if err := h.handleSummary(session, event); err != nil {
+		t.Fatalf("handleSummary should not fail when converged, got %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeRequest {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		request, err := gossipv1.ParseRequestPayload(decoded.Payload)
+		if err != nil {
+			t.Fatalf("parse request payload: %v", err)
+		}
+		if len(request.Want) != 0 {
+			t.Fatalf("expected empty convergence request, got %#v", request.Want)
+		}
+	default:
+		t.Fatal("expected outbound REQUEST frame")
+	}
+}
+
+func TestHandleSummaryNoWantWithNoProgressCapStaysOpen(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{
+		client: &model.Client{Send: make(chan []byte, 1)},
+		drain: gossipv1.NewDrainSession("ws-no-want-stop", time.Now().UTC(), gossipv1.DrainSessionLimits{
+			NoProgressRoundCap: 1,
+		}),
+	}
+
+	knownID := strings.Repeat("2b", 32)
+	st.messagesByID[knownID] = &model.Message{ID: knownID, ExpiresAt: time.Now().Add(time.Hour)}
+	bloom := gossipv1.BuildSummaryPayload([]string{knownID}).BloomFilter
+	event := gossipv1.Event{Type: gossipv1.EventTypeSummary, Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{knownID}, PreviewCursor: knownID}}
+
+	err := h.handleSummary(session, event)
+	if err != nil {
+		t.Fatalf("handleSummary should remain open on convergence, got %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeRequest {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		request, parseErr := gossipv1.ParseRequestPayload(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse request payload: %v", parseErr)
+		}
+		if len(request.Want) != 0 {
+			t.Fatalf("expected empty convergence request, got %#v", request.Want)
+		}
+	default:
+		t.Fatal("expected outbound REQUEST frame")
+	}
+}
+
 func TestComputeMissingWantUsesEnvelopeStoreAndMessageStoreForKnownObjects(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	envelopeStore := newEnvelopeStoreForTest(t)
@@ -670,7 +1040,7 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 		t.Fatalf("persist non-digest envelope: %v", err)
 	}
 
-	summary, nextCursor, err := h.buildRecipientSummary(queueRecipient, "")
+	summary, nextCursor, err := h.buildRecipientSummary(queueRecipient, "", "")
 	if err != nil {
 		t.Fatalf("build first summary: %v", err)
 	}
@@ -699,7 +1069,7 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 		}
 	}
 
-	nextSummary, secondCursor, err := h.buildRecipientSummary(queueRecipient, nextCursor)
+	nextSummary, secondCursor, err := h.buildRecipientSummary(queueRecipient, "", nextCursor)
 	if err != nil {
 		t.Fatalf("build second summary: %v", err)
 	}
@@ -716,6 +1086,89 @@ func TestBuildRecipientSummaryUsesContentAddressedInventoryPaging(t *testing.T) 
 	}
 	if secondCursor != nextSummary.PreviewCursor {
 		t.Fatalf("unexpected second next cursor: got=%q want=%q", secondCursor, nextSummary.PreviewCursor)
+	}
+}
+
+func TestBuildRecipientSummaryFiltersAckedForDeliveryIdentity(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	queueRecipient := "wayfarer-summary-acked"
+	deliveryIdentity := "wayfarer-summary-acked\x00device-a"
+	now := time.Now().UTC()
+	ackedID := gossipv1.ComputeItemID("sender", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	openID := gossipv1.ComputeItemID("sender", queueRecipient, "Qg", now.Add(time.Second).Unix(), now.Add(time.Hour).Unix())
+
+	for _, id := range []string{ackedID, openID} {
+		if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+			ID:            id,
+			DestinationID: queueRecipient,
+			OpaquePayload: []byte("QQ"),
+			OriginRelayID: "relay-test",
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("persist envelope: %v", err)
+		}
+		st.messagesByID[id] = &model.Message{ID: id, To: queueRecipient, ExpiresAt: now.Add(time.Hour)}
+	}
+	if _, err := st.MarkAcked(context.Background(), ackedID, deliveryIdentity); err != nil {
+		t.Fatalf("mark acked: %v", err)
+	}
+
+	summary, _, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build summary: %v", err)
+	}
+	if summary.ItemCount != 1 {
+		t.Fatalf("expected one unacked item, got %d", summary.ItemCount)
+	}
+	if len(summary.PreviewItemIDs) != 1 || summary.PreviewItemIDs[0] != openID {
+		t.Fatalf("unexpected preview ids: %#v", summary.PreviewItemIDs)
+	}
+}
+
+func TestBuildRecipientSummaryClearsCursorWhenFilteredPreviewEmpty(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	queueRecipient := "wayfarer-summary-empty-filter"
+	deliveryIdentity := "wayfarer-summary-empty-filter\x00device-a"
+	now := time.Now().UTC()
+	idA := gossipv1.ComputeItemID("sender", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	idB := gossipv1.ComputeItemID("sender", queueRecipient, "Qg", now.Add(time.Second).Unix(), now.Add(time.Hour).Unix())
+
+	for _, id := range []string{idA, idB} {
+		if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+			ID:            id,
+			DestinationID: queueRecipient,
+			OpaquePayload: []byte("QQ"),
+			OriginRelayID: "relay-test",
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("persist envelope: %v", err)
+		}
+		st.messagesByID[id] = &model.Message{ID: id, To: queueRecipient, ExpiresAt: now.Add(time.Hour)}
+		if _, err := st.MarkAcked(context.Background(), id, deliveryIdentity); err != nil {
+			t.Fatalf("mark acked: %v", err)
+		}
+	}
+
+	summary, nextCursor, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build summary: %v", err)
+	}
+	if summary.ItemCount != 0 || len(summary.PreviewItemIDs) != 0 {
+		t.Fatalf("expected fully filtered summary, got item_count=%d preview=%#v", summary.ItemCount, summary.PreviewItemIDs)
+	}
+	if summary.PreviewCursor != "" {
+		t.Fatalf("expected empty preview cursor, got %q", summary.PreviewCursor)
+	}
+	if nextCursor != "" {
+		t.Fatalf("expected empty next cursor, got %q", nextCursor)
 	}
 }
 

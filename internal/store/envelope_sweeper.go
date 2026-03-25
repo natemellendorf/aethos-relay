@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"github.com/natemellendorf/aethos-relay/internal/metrics"
 )
 
 // EnvelopeTTLConfig holds configuration for envelope TTL sweeping.
@@ -62,6 +64,11 @@ func (s *EnvelopeSweeper) Start(ctx context.Context) {
 
 // sweep removes expired envelopes.
 func (s *EnvelopeSweeper) sweep() {
+	started := time.Now()
+	defer func() {
+		metrics.ObserveGossipDrainStorageLatency("store", "prune_envelopes", time.Since(started).Seconds())
+	}()
+
 	ctx := context.Background()
 	now := time.Now()
 

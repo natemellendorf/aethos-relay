@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -65,17 +67,57 @@ func (oc *OriginChecker) Check(r *http.Request) bool {
 }
 
 type clientSession struct {
-	client            *model.Client
-	adapter           *gossipv1.SessionAdapter
-	sessionID         string
-	peerLabel         string
-	handshakeComplete bool
-	queueRecipient    string
-	summaryCursor     string
-	peerMaxWant       uint64
+	client               *model.Client
+	adapter              *gossipv1.SessionAdapter
+	drain                *gossipv1.DrainSession
+	sessionID            string
+	peerLabel            string
+	handshakeComplete    bool
+	queueRecipient       string
+	summaryCursor        string
+	peerMaxWant          uint64
+	lastRoundRequested   int
+	lastRoundTransferred int
 }
 
 const wsDebugItemSampleLimit = 4
+
+type sessionStopError struct {
+	reason gossipv1.DrainStopReason
+	detail string
+}
+
+type readDeadlineConn interface {
+	SetReadDeadline(time.Time) error
+}
+
+func (e *sessionStopError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.detail != "" {
+		return e.detail
+	}
+	return string(e.reason)
+}
+
+func stopSession(reason gossipv1.DrainStopReason, detail string) error {
+	if reason == gossipv1.DrainStopReasonNone {
+		reason = gossipv1.DrainStopReasonClientDisconnect
+	}
+	return &sessionStopError{reason: reason, detail: detail}
+}
+
+func setClientReadDeadline(client *model.Client, deadline time.Time) error {
+	if client == nil || client.Conn == nil {
+		return nil
+	}
+	connWithDeadline, ok := client.Conn.(readDeadlineConn)
+	if !ok {
+		return nil
+	}
+	return connWithDeadline.SetReadDeadline(deadline)
+}
 
 // WSHandler handles WebSocket connections.
 type WSHandler struct {
@@ -88,6 +130,8 @@ type WSHandler struct {
 	originChecker     *OriginChecker
 	federationManager *federation.PeerManager
 	autoDeliverQueued bool
+	drainLimits       gossipv1.DrainSessionLimits
+	lbMode            string
 }
 
 // NewWSHandler creates a new WebSocket handler.
@@ -97,6 +141,14 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 	originChecker := NewOriginChecker(allowedOrigins, devMode)
 	engine := storeforward.New(store, maxTTL)
 	engine.SetAckDrivenSuppression(true)
+	limits := gossipv1.DefaultDrainSessionLimits()
+	limits.RoundBudget = 0
+	limits.ByteBudget = 0
+	limits.WallClockBudget = 0
+	limits.NoProgressRoundCap = 0
+	limits.YieldEveryNRounds = 0
+	limits.SilenceTimeout = 0
+	limits.FairnessYieldEnable = false
 
 	return &WSHandler{
 		store:             store,
@@ -106,6 +158,8 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 		maxTTL:            maxTTL,
 		originChecker:     originChecker,
 		autoDeliverQueued: true,
+		drainLimits:       limits.Normalize(),
+		lbMode:            "sticky",
 	}
 }
 
@@ -135,6 +189,68 @@ func (h *WSHandler) SetEnvelopeStore(envelopeStore store.EnvelopeStore) {
 // SetAutoDeliverQueued remains for backwards-compatible test wiring.
 func (h *WSHandler) SetAutoDeliverQueued(enabled bool) {
 	h.autoDeliverQueued = enabled
+}
+
+func (h *WSHandler) SetDrainSessionLimits(limits gossipv1.DrainSessionLimits) {
+	h.drainLimits = limits.Normalize()
+}
+
+func (h *WSHandler) SetLoadBalancerMode(mode string) {
+	normalized := strings.ToLower(strings.TrimSpace(mode))
+	switch normalized {
+	case "", "sticky", "shared":
+		if normalized == "" {
+			normalized = "sticky"
+		}
+		h.lbMode = normalized
+	default:
+		h.lbMode = "sticky"
+	}
+}
+
+func (h *WSHandler) ensureDrainSession(session *clientSession) *gossipv1.DrainSession {
+	if session == nil {
+		return gossipv1.NewDrainSession("ws-unknown", time.Now().UTC(), h.drainLimits)
+	}
+	if session.drain != nil {
+		return session.drain
+	}
+	session.drain = gossipv1.NewDrainSession(session.sessionID, time.Now().UTC(), h.drainLimits)
+	return session.drain
+}
+
+func (h *WSHandler) finalizeDrainSession(session *clientSession, fallbackReason gossipv1.DrainStopReason) {
+	if session == nil {
+		return
+	}
+	drain := h.ensureDrainSession(session)
+	if fallbackReason != gossipv1.DrainStopReasonNone {
+		drain.Stop(fallbackReason)
+	}
+	snapshot := drain.Snapshot()
+	stopReason := snapshot.StopReason
+	if stopReason == gossipv1.DrainStopReasonNone {
+		stopReason = gossipv1.DrainStopReasonClientDisconnect
+	}
+	if stopReason == gossipv1.DrainStopReasonFairnessYield {
+		metrics.IncrementGossipDrainFairnessEvent("ws", "yield")
+	}
+	metrics.IncrementGossipDrainSessionEnded("ws", string(stopReason))
+	metrics.AddGossipDrainRoundsCompleted(snapshot.RoundsCompleted)
+
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	debug.Log("local", "SESSION", "drain_session_end", "wayfarer_id", snapshot.AuthenticatedWayfarerID, "rounds_completed", snapshot.RoundsCompleted, "items_requested", snapshot.ItemsRequested, "items_transferred", snapshot.ItemsTransferred, "items_acknowledged", snapshot.ItemsAcknowledged, "bytes_sent", snapshot.BytesSent, "bytes_received", snapshot.BytesReceived, "no_progress_streak", snapshot.NoProgressStreak, "stop_reason", stopReason)
+}
+
+func asSessionStop(err error) *sessionStopError {
+	if err == nil {
+		return nil
+	}
+	var stopErr *sessionStopError
+	if !errors.As(err, &stopErr) {
+		return nil
+	}
+	return stopErr
 }
 
 // HandleWebSocket upgrades the connection and handles WebSocket messaging.
@@ -170,13 +286,18 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionID := gossipv1.NewDebugSessionID("ws")
 	peerLabel := r.RemoteAddr
 	debug := gossipv1.NewDebugSessionLogger(sessionID, peerLabel)
+	startedAt := time.Now().UTC()
+	drain := gossipv1.NewDrainSession(sessionID, startedAt, h.drainLimits)
+	metrics.IncrementGossipDrainSessionStarted("ws")
 	debug.Log("in", "CONNECTION", "session_state", "state", "accepted_upgrade", "http_remote_addr", r.RemoteAddr)
 	session := &clientSession{
 		client:    client,
 		adapter:   gossipv1.NewSessionAdapter(gossipv1.BuildRelayHello(h.relayID), false),
+		drain:     drain,
 		sessionID: sessionID,
 		peerLabel: peerLabel,
 	}
+	debug.Log("local", "SESSION", "drain_session_started", "lb_mode", h.lbMode, "started_at", startedAt.Format(time.RFC3339Nano), "round_budget", drain.Limits().RoundBudget, "byte_budget", drain.Limits().ByteBudget, "wall_clock_budget_ms", drain.Limits().WallClockBudget.Milliseconds(), "no_progress_cap", drain.Limits().NoProgressRoundCap, "yield_every_rounds", drain.Limits().YieldEveryNRounds)
 
 	go h.writePump(session)
 	h.readPump(session)
@@ -185,40 +306,81 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (h *WSHandler) readPump(session *clientSession) {
 	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
 	debug.Log("local", "SESSION", "session_state", "state", "read_pump_started")
+	stopReason := gossipv1.DrainStopReasonClientDisconnect
 
 	defer func() {
+		h.finalizeDrainSession(session, stopReason)
 		debug.Log("local", "SESSION", "session_state", "state", "read_pump_stopped")
 		if session.client.WayfarerID != "" {
 			h.clients.Unregister(session.client)
+		} else {
+			closeClientSend(session.client)
 		}
-		session.client.Conn.Close()
 	}()
+
+	if timeout := session.drain.Limits().SilenceTimeout; timeout > 0 {
+		if err := setClientReadDeadline(session.client, time.Now().Add(timeout)); err != nil {
+			stopReason = gossipv1.DrainStopReasonClientDisconnect
+			return
+		}
+	}
 
 	if err := h.sendLocalHello(session, session.adapter); err != nil {
 		log.Printf("ws: send local hello failed: %v", err)
 		debug.Log("out", gossipv1.FrameTypeHello, "send_failed", "transport_ok", false, "protocol_ok", false, "err", err)
+		if stopErr := asSessionStop(err); stopErr != nil {
+			stopReason = stopErr.reason
+		}
 		return
 	}
 
 	for {
+		if timeout := session.drain.Limits().SilenceTimeout; timeout > 0 {
+			if err := setClientReadDeadline(session.client, time.Now().Add(timeout)); err != nil {
+				stopReason = gossipv1.DrainStopReasonClientDisconnect
+				return
+			}
+		}
+
 		msgType, data, err := session.client.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("ws: read error: %v", err)
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				stopReason = gossipv1.DrainStopReasonClientSilence
+				session.drain.Stop(stopReason)
+			} else {
+				stopReason = gossipv1.DrainStopReasonClientDisconnect
+				session.drain.Stop(stopReason)
 			}
 			debug.Log("in", "CONNECTION", "recv_failed", "transport_ok", false, "protocol_ok", false, "close_reason", err, "err", err)
 			return
 		}
 		if msgType != websocket.BinaryMessage {
 			log.Printf("ws: rejected non-binary frame type=%d", msgType)
+			stopReason = gossipv1.DrainStopReasonClientDisconnect
+			session.drain.Stop(stopReason)
 			debug.Log("in", "NON_BINARY", "recv_rejected", "msg_type_raw", msgType, "bytes_in", len(data), "transport_ok", true, "protocol_ok", false)
 			return
 		}
+		if reason := session.drain.RecordBytesReceived(len(data)); reason != gossipv1.DrainStopReasonNone {
+			stopReason = reason
+			metrics.AddGossipDrainBytesReceived(int64(len(data)))
+			return
+		}
+		metrics.AddGossipDrainBytesReceived(int64(len(data)))
 		debug.Log("in", gossipv1.FrameTypeFromPrefixedBinaryFrame(data), "received", "bytes_in", len(data), "transport_ok", true)
 
 		metrics.IncrementReceived()
 		events := session.adapter.PushInbound(data)
 		if err := h.processEvents(session, events); err != nil {
+			if stopErr := asSessionStop(err); stopErr != nil {
+				stopReason = stopErr.reason
+				debug.Log("local", "SESSION", "drain_session_stop", "stop_reason", stopErr.reason, "detail", stopErr.detail)
+				return
+			}
+			stopReason = gossipv1.DrainStopReasonProtocolFatal
 			log.Printf("ws: protocol event failed: %v", err)
 			debug.Log("in", session.adapter.LastFrameType(), "process_failed", "transport_ok", true, "protocol_ok", false, "store_ok", false, "err", err)
 			return
@@ -242,6 +404,9 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 				session.peerMaxWant = event.Hello.MaxWant
 			}
 			if err := h.handleHelloValidated(session, event); err != nil {
+				if stopErr := asSessionStop(err); stopErr != nil {
+					return err
+				}
 				debug.Log("in", gossipv1.FrameTypeHello, "hello_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
@@ -255,6 +420,9 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 				debug.Log("in", gossipv1.FrameTypeSummary, "summary_received", "transport_ok", true, "protocol_ok", true, "item_count", event.Summary.ItemCount, "bloom_bytes", len(event.Summary.BloomFilter), "preview_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "preview_cursor", event.Summary.PreviewCursor)
 			}
 			if err := h.handleSummary(session, event); err != nil {
+				if stopErr := asSessionStop(err); stopErr != nil {
+					return err
+				}
 				debug.Log("in", gossipv1.FrameTypeSummary, "summary_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
@@ -267,6 +435,9 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 				debug.Log("in", gossipv1.FrameTypeRequest, "request_received", "transport_ok", true, "protocol_ok", true, "requested_count", count, "item_ids_sample", sample, "item_ids_hash", hash)
 			}
 			if err := h.handleRequest(session, event); err != nil {
+				if stopErr := asSessionStop(err); stopErr != nil {
+					return err
+				}
 				debug.Log("in", gossipv1.FrameTypeRequest, "request_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
@@ -283,6 +454,9 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_received", "transport_ok", true, "protocol_ok", true, "object_count", count, "item_ids_sample", sample, "item_ids_hash", hash, "parse_rejected_count", len(event.Transfer.Rejected))
 			}
 			if err := h.handleTransfer(session, event); err != nil {
+				if stopErr := asSessionStop(err); stopErr != nil {
+					return err
+				}
 				debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
@@ -295,6 +469,9 @@ func (h *WSHandler) processEvents(session *clientSession, events []gossipv1.Even
 				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_received", "transport_ok", true, "protocol_ok", true, "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
 			}
 			if err := h.handleReceipt(session, event); err != nil {
+				if stopErr := asSessionStop(err); stopErr != nil {
+					return err
+				}
 				debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_handle_failed", "protocol_ok", false, "store_ok", false, "err", err)
 				return err
 			}
@@ -320,6 +497,7 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 	session.client.DeviceID = event.Hello.NodePubKey
 	session.client.DeliveryID = storeforward.DeliveryIdentity(session.client.WayfarerID, session.client.DeviceID)
 	h.clients.Register(session.client)
+	h.ensureDrainSession(session).BindAuthenticatedWayfarerID(session.client.WayfarerID)
 	session.peerLabel = session.client.WayfarerID
 	debug = gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
 	debug.Log("local", gossipv1.FrameTypeHello, "identity_bound", "wayfarer_id", session.client.WayfarerID, "device_id", session.client.DeviceID)
@@ -328,18 +506,48 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 	session.handshakeComplete = true
 	debug.Log("local", "SESSION", "session_state", "state", "handshake_complete", "queue_recipient", session.queueRecipient)
 
-	summary, nextCursor, err := h.buildRecipientSummary(session.queueRecipient, session.summaryCursor)
+	return h.sendDrainSummary(session, "ws.handleHelloValidated:envelope_store_by_destination->summary_preview", false)
+}
+
+func (h *WSHandler) sendDrainSummary(session *clientSession, summaryPath string, stopWhenEmpty bool) error {
+	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	drain := h.ensureDrainSession(session)
+
+	if canContinue, stopReason := drain.CanStartAnotherRound(time.Now().UTC()); !canContinue {
+		if stopReason == gossipv1.DrainStopReasonFairnessYield {
+			debug.Log("local", "SESSION", "drain_session_yield_terminal", "reason", stopReason, "note", "yield ends drain session")
+			metrics.IncrementGossipDrainFairnessEvent("ws", "yield")
+			return stopSession(stopReason, "fairness yield ends drain session")
+		}
+		return stopSession(stopReason, "drain summary pre-check stopped session")
+	}
+
+	summaryStart := time.Now()
+	summary, nextCursor, err := h.buildRecipientSummary(session.queueRecipient, session.client.DeliveryID, session.summaryCursor)
 	if err != nil {
 		debug.Log("local", gossipv1.FrameTypeSummary, "summary_inventory_failed", "store_ok", false, "err", err)
-		return err
+		return stopSession(gossipv1.DrainStopReasonStorageError, err.Error())
 	}
+	metrics.ObserveGossipDrainStorageLatency("ws", "summary_query", time.Since(summaryStart).Seconds())
 	session.summaryCursor = nextCursor
+	progressed := summary.ItemCount > 0
+	session.lastRoundRequested = 0
+	session.lastRoundTransferred = 0
+	if !progressed {
+		drain.CompleteRound(false)
+		metrics.IncrementGossipDrainNoProgressRound()
+		if stopWhenEmpty {
+			drain.Stop(gossipv1.DrainStopReasonNoEligibleItems)
+			return stopSession(gossipv1.DrainStopReasonNoEligibleItems, "session stopped after no-progress summary round")
+		}
+	}
+
 	previewCount, previewSample, previewHash := gossipv1.ItemIDSample(summary.PreviewItemIDs, wsDebugItemSampleLimit)
 	debug.Log(
 		"out",
 		gossipv1.FrameTypeSummary,
 		"summary_constructed",
-		"summary_path", "ws.handleHelloValidated:envelope_store_by_destination->summary_preview",
+		"summary_path", summaryPath,
 		"item_count", summary.ItemCount,
 		"bloom_bytes", len(summary.BloomFilter),
 		"preview_count", previewCount,
@@ -347,6 +555,7 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 		"item_ids_hash", previewHash,
 		"preview_cursor", summary.PreviewCursor,
 		"next_preview_cursor", nextCursor,
+		"rounds_completed", drain.Snapshot().RoundsCompleted,
 	)
 
 	return h.sendEnvelope(session, gossipv1.FrameTypeSummary, summary)
@@ -354,6 +563,7 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 
 func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) error {
 	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	drain := h.ensureDrainSession(session)
 
 	if event.Summary == nil {
 		return fmt.Errorf("gossipv1: summary event missing payload")
@@ -365,23 +575,54 @@ func (h *WSHandler) handleSummary(session *clientSession, event gossipv1.Event) 
 	want, err := h.computeMissingWant(event.Summary, nil, session.peerMaxWant, debug)
 	if err != nil {
 		debug.Log("local", gossipv1.FrameTypeSummary, "summary_compute_want_failed", "store_ok", false, "err", err)
-		return err
+		return stopSession(gossipv1.DrainStopReasonStorageError, err.Error())
 	}
 	wantCount, wantSample, wantHash := gossipv1.ItemIDSample(want, wsDebugItemSampleLimit)
 	debug.Log("local", gossipv1.FrameTypeSummary, "summary_computed_want", "requested_count", wantCount, "item_ids_sample", wantSample, "item_ids_hash", wantHash, "store_ok", true)
+	session.lastRoundRequested = len(want)
+	drain.RecordRequested(len(want))
+	metrics.AddGossipDrainItemsRequested(len(want))
+	if len(want) == 0 {
+		drain.CompleteRound(false)
+		metrics.IncrementGossipDrainNoProgressRound()
+		debug.Log("local", gossipv1.FrameTypeSummary, "summary_converged_no_want", "protocol_ok", true)
+		if err := h.sendEnvelope(session, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: []string{}}); err != nil {
+			return err
+		}
+		snapshot := drain.Snapshot()
+		debug.Log("local", "SESSION", "session_idle", "reason", "summary_converged_no_want", "keep_open", true, "rounds_completed", snapshot.RoundsCompleted, "no_progress_streak", snapshot.NoProgressStreak)
+		return nil
+	}
 
 	return h.sendEnvelope(session, gossipv1.FrameTypeRequest, gossipv1.RequestPayload{Want: want})
 }
 
 func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) error {
 	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	drain := h.ensureDrainSession(session)
 
 	if event.Request == nil {
 		return fmt.Errorf("gossipv1: request event missing payload")
 	}
+	session.lastRoundRequested = len(event.Request.Want)
+	drain.RecordRequested(len(event.Request.Want))
+	metrics.AddGossipDrainItemsRequested(len(event.Request.Want))
 	if len(event.Request.Want) == 0 {
 		debug.Log("in", gossipv1.FrameTypeRequest, "request_empty", "requested_count", 0, "protocol_ok", true)
+		drain.CompleteRound(false)
+		metrics.IncrementGossipDrainNoProgressRound()
+		snapshot := drain.Snapshot()
+		debug.Log("local", "SESSION", "session_idle", "reason", "request_empty", "keep_open", true, "rounds_completed", snapshot.RoundsCompleted, "no_progress_streak", snapshot.NoProgressStreak)
 		return nil
+	}
+
+	if canContinue, stopReason := drain.CanStartAnotherRound(time.Now().UTC()); !canContinue {
+		if stopReason == gossipv1.DrainStopReasonFairnessYield {
+			debug.Log("local", "SESSION", "drain_session_yield_terminal", "reason", stopReason, "note", "yield ends drain session")
+			metrics.IncrementGossipDrainFairnessEvent("ws", "yield")
+			return stopSession(stopReason, "fairness yield ends drain session")
+		}
+		return stopSession(stopReason, "request blocked by fairness/budget controls")
 	}
 
 	objects := make([]gossipv1.TransferObject, 0, len(event.Request.Want))
@@ -418,6 +659,16 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 	}
 	transferCount, transferSample, transferHash := gossipv1.ItemIDSample(expectedReceiptIDs, wsDebugItemSampleLimit)
 	debug.Log("out", gossipv1.FrameTypeTransfer, "request_serviced", "object_count", len(objects), "expected_receipt_count", transferCount, "item_ids_sample", transferSample, "item_ids_hash", transferHash, "store_ok", true)
+	session.lastRoundTransferred = len(expectedReceiptIDs)
+	drain.RecordTransferred(len(expectedReceiptIDs))
+	metrics.AddGossipDrainItemsTransferred(len(expectedReceiptIDs))
+	if len(expectedReceiptIDs) == 0 {
+		drain.CompleteRound(false)
+		metrics.IncrementGossipDrainNoProgressRound()
+		snapshot := drain.Snapshot()
+		debug.Log("local", "SESSION", "session_idle", "reason", "request_serviced_no_objects", "keep_open", true, "rounds_completed", snapshot.RoundsCompleted, "no_progress_streak", snapshot.NoProgressStreak)
+		return nil
+	}
 
 	session.adapter.SetExpectedReceipt(expectedReceiptIDs)
 	return h.sendEnvelope(session, gossipv1.FrameTypeTransfer, gossipv1.TransferPayload{Objects: objects})
@@ -426,10 +677,13 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event) error {
 	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
 	traceCtx := gossipv1.WithDebugTrace(context.Background(), session.sessionID, session.peerLabel)
+	drain := h.ensureDrainSession(session)
 
 	if event.Transfer == nil {
 		return fmt.Errorf("gossipv1: transfer event missing payload")
 	}
+
+	importStart := time.Now()
 
 	receipt := gossipv1.ReceiptPayload{
 		Accepted: make([]string, 0, len(event.Transfer.Objects)),
@@ -490,38 +744,72 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 	if len(receipt.Accepted) > 1 {
 		gossipv1.SortDigestHexIDs(receipt.Accepted)
 	}
+	metrics.ObserveGossipDrainStorageLatency("ws", "transfer_import", time.Since(importStart).Seconds())
+	session.lastRoundTransferred = len(receipt.Accepted)
+	drain.RecordTransferred(len(receipt.Accepted))
+	metrics.AddGossipDrainItemsTransferred(len(receipt.Accepted))
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, wsDebugItemSampleLimit)
 	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
 	debug.Log("out", gossipv1.FrameTypeReceipt, "receipt_constructed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
+	if len(receipt.Accepted) == 0 {
+		drain.CompleteRound(false)
+		metrics.IncrementGossipDrainNoProgressRound()
+		snapshot := drain.Snapshot()
+		debug.Log("local", "SESSION", "session_idle", "reason", "transfer_empty_receipt", "keep_open", true, "rounds_completed", snapshot.RoundsCompleted, "no_progress_streak", snapshot.NoProgressStreak)
+	} else {
+		drain.CompleteRound(true)
+	}
 
 	return h.sendEnvelope(session, gossipv1.FrameTypeReceipt, receipt)
 }
 
 func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) error {
 	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	drain := h.ensureDrainSession(session)
 
 	if event.Receipt == nil {
 		return fmt.Errorf("gossipv1: receipt event missing payload")
 	}
 
+	ackStart := time.Now()
+	transitionedIDs, err := h.store.MarkAckedBatch(context.Background(), event.Receipt.Accepted, session.client.DeliveryID)
+	if err != nil {
+		metrics.IncrementStoreErrors()
+		return stopSession(gossipv1.DrainStopReasonStorageError, err.Error())
+	}
+	metrics.ObserveGossipDrainStorageLatency("ws", "receipt_ack", time.Since(ackStart).Seconds())
+	transitionedCount := 0
 	for _, acceptedID := range event.Receipt.Accepted {
-		transitioned, err := h.engine.AckClientDelivery(context.Background(), acceptedID, session.client.DeliveryID)
-		if err != nil {
-			metrics.IncrementStoreErrors()
-			debug.LogItem("in", gossipv1.FrameTypeReceipt, acceptedID, "receipt_ack_failed", "store_ok", false, "err", err)
-			return err
-		}
+		transitioned := transitionedIDs[acceptedID]
 		if transitioned {
+			transitionedCount++
 			metrics.IncrementDelivered()
 			debug.LogItem("in", gossipv1.FrameTypeReceipt, acceptedID, "receipt_ack_applied", "store_ok", true)
 			continue
 		}
 		debug.LogItem("in", gossipv1.FrameTypeReceipt, acceptedID, "receipt_ack_noop", "store_ok", true)
 	}
+	drain.RecordAcknowledged(transitionedCount)
+	metrics.AddGossipDrainItemsAcknowledged(transitionedCount)
+	if transitionedCount == 0 {
+		drain.CompleteRound(false)
+		metrics.IncrementGossipDrainNoProgressRound()
+		snapshot := drain.Snapshot()
+		debug.Log("local", "SESSION", "session_idle", "reason", "receipt_ack_noop", "keep_open", true, "rounds_completed", snapshot.RoundsCompleted, "no_progress_streak", snapshot.NoProgressStreak)
+	} else {
+		drain.CompleteRound(true)
+	}
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, wsDebugItemSampleLimit)
-	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
+	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "acked_count", transitionedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
 
-	return nil
+	if session.queueRecipient == "" {
+		return nil
+	}
+	if transitionedCount == 0 {
+		return h.sendDrainSummary(session, "ws.handleReceipt:no_progress_round_reconcile", false)
+	}
+
+	return h.sendDrainSummary(session, "ws.handleReceipt:post_ack_drain", false)
 }
 
 func (h *WSHandler) computeMissingWant(summary *gossipv1.SummaryPayload, candidateIDs []string, peerMaxWant uint64, debugLoggers ...gossipv1.DebugSessionLogger) ([]string, error) {
@@ -804,7 +1092,7 @@ func summaryPreviewFromPayload(payload any) []string {
 	}
 }
 
-func (h *WSHandler) buildRecipientSummary(queueRecipient string, afterCursor string) (gossipv1.SummaryPayload, string, error) {
+func (h *WSHandler) buildRecipientSummary(queueRecipient string, deliveryIdentity string, afterCursor string) (gossipv1.SummaryPayload, string, error) {
 	if queueRecipient == "" {
 		return gossipv1.BuildSummaryPreviewPayload(nil, nil, ""), "", nil
 	}
@@ -815,6 +1103,36 @@ func (h *WSHandler) buildRecipientSummary(queueRecipient string, afterCursor str
 	previewIDs, nextCursor, totalCount, eligibleIDs, err := h.envelopeStore.GetEnvelopeIDsByDestinationPage(context.Background(), queueRecipient, afterCursor, int(gossipv1.MaxSummaryPreviewItems))
 	if err != nil {
 		return gossipv1.SummaryPayload{}, "", err
+	}
+	if deliveryIdentity != "" {
+		filteredEligible := make([]string, 0, len(eligibleIDs))
+		for _, id := range eligibleIDs {
+			acked, ackErr := h.store.IsAckedBy(context.Background(), id, deliveryIdentity)
+			if ackErr != nil {
+				return gossipv1.SummaryPayload{}, "", ackErr
+			}
+			if acked {
+				continue
+			}
+			filteredEligible = append(filteredEligible, id)
+		}
+		totalCount = len(filteredEligible)
+		eligibleIDs = filteredEligible
+
+		previewIDs = make([]string, 0, int(gossipv1.MaxSummaryPreviewItems))
+		nextCursor = ""
+		for _, id := range filteredEligible {
+			if afterCursor != "" && gossipv1.CompareDigestHexIDs(id, afterCursor) <= 0 {
+				continue
+			}
+			previewIDs = append(previewIDs, id)
+			if len(previewIDs) >= int(gossipv1.MaxSummaryPreviewItems) {
+				break
+			}
+		}
+		if len(previewIDs) > 0 {
+			nextCursor = previewIDs[len(previewIDs)-1]
+		}
 	}
 
 	normalizedPreview, err := gossipv1.NormalizeDigestHexIDs(previewIDs)
@@ -886,14 +1204,24 @@ func (h *WSHandler) loadTransferObjectByItemID(itemID string) (gossipv1.Transfer
 
 func (h *WSHandler) sendLocalHello(session *clientSession, adapter *gossipv1.SessionAdapter) error {
 	debug := gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
+	drain := h.ensureDrainSession(session)
 
 	helloBytes, err := adapter.InitialHelloBytes()
 	if err != nil {
 		debug.Log("out", gossipv1.FrameTypeHello, "encode_failed", "transport_ok", false, "protocol_ok", false, "store_ok", false, "err", err)
 		return err
 	}
+	if reason := drain.RecordBytesSent(len(helloBytes)); reason != gossipv1.DrainStopReasonNone {
+		metrics.AddGossipDrainBytesSent(int64(len(helloBytes)))
+		return stopSession(reason, "byte budget exceeded while sending HELLO")
+	}
+	metrics.AddGossipDrainBytesSent(int64(len(helloBytes)))
 	queued := h.sendBinary(session.client, helloBytes)
 	debug.Log("out", gossipv1.FrameTypeHello, "sent", "bytes_out", len(helloBytes), "transport_ok", queued, "protocol_ok", true, "store_ok", true)
+	if !queued {
+		drain.Stop(gossipv1.DrainStopReasonSessionTransportBackoff)
+		return stopSession(gossipv1.DrainStopReasonSessionTransportBackoff, "send channel backpressure")
+	}
 	return nil
 }
 
@@ -972,7 +1300,22 @@ func (h *WSHandler) sendEnvelope(session *clientSession, frameType string, paylo
 		}
 	}
 
+	drain := h.ensureDrainSession(session)
+	if canSend, reason := drain.CanSendBytes(len(prefixed)); !canSend {
+		return stopSession(reason, "byte budget exceeded before queueing frame")
+	}
+
 	queued := h.sendBinary(session.client, prefixed)
+	if !queued {
+		drain.Stop(gossipv1.DrainStopReasonSessionTransportBackoff)
+		return stopSession(gossipv1.DrainStopReasonSessionTransportBackoff, "send channel backpressure")
+	}
+
+	if reason := drain.RecordBytesSent(len(prefixed)); reason != gossipv1.DrainStopReasonNone {
+		metrics.AddGossipDrainBytesSent(int64(len(prefixed)))
+		return stopSession(reason, "byte budget exceeded after queueing frame")
+	}
+	metrics.AddGossipDrainBytesSent(int64(len(prefixed)))
 	logFields := make([]any, 0, len(metadata)+6)
 	logFields = append(logFields, metadata...)
 	logFields = append(logFields, "bytes_out", len(prefixed), "transport_ok", queued, "protocol_ok", true, "store_ok", true)
@@ -1003,4 +1346,14 @@ func (h *WSHandler) sendBinary(client *model.Client, data []byte) bool {
 	}
 
 	return queued
+}
+
+func closeClientSend(client *model.Client) {
+	if client == nil || client.Send == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	close(client.Send)
 }
