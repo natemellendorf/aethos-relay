@@ -607,12 +607,25 @@ func TestEnvelopeOnlyAckFlowSummaryTransferReceiptAndSuppression(t *testing.T) {
 	}
 
 	err = h.handleReceipt(session, gossipv1.Event{Type: gossipv1.EventTypeReceipt, Receipt: &gossipv1.ReceiptPayload{Accepted: []string{transferObject.ItemID}}})
-	stopErr := asSessionStop(err)
-	if stopErr == nil {
-		t.Fatalf("expected drain stop after post-ack empty summary, got %v", err)
+	if err != nil {
+		t.Fatalf("handleReceipt should continue session after convergence, got %v", err)
 	}
-	if stopErr.reason != gossipv1.DrainStopReasonNoEligibleItems {
-		t.Fatalf("unexpected stop reason after envelope-only ack: got=%s want=%s", stopErr.reason, gossipv1.DrainStopReasonNoEligibleItems)
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeSummary {
+			t.Fatalf("unexpected outbound frame type after receipt: %s", decoded.Type)
+		}
+		summary, parseErr := gossipv1.ParseSummaryPayload(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse summary payload: %v", parseErr)
+		}
+		if summary.ItemCount != 0 || len(summary.PreviewItemIDs) != 0 {
+			t.Fatalf("expected empty convergence summary, got item_count=%d preview=%#v", summary.ItemCount, summary.PreviewItemIDs)
+		}
+	default:
+		t.Fatal("expected outbound SUMMARY frame after receipt")
 	}
 
 	acked, ackErr := messageStore.IsAckedBy(context.Background(), transferObject.ItemID, deliveryIdentity)
@@ -868,6 +881,74 @@ func TestHandleSummaryRequestsUnknownPreviewIDs(t *testing.T) {
 	}
 }
 
+func TestHandleSummaryNoWantSendsEmptyRequestAndContinues(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{client: &model.Client{Send: make(chan []byte, 1)}}
+
+	knownID := strings.Repeat("2a", 32)
+	st.messagesByID[knownID] = &model.Message{ID: knownID, ExpiresAt: time.Now().Add(time.Hour)}
+	bloom := gossipv1.BuildSummaryPayload([]string{knownID}).BloomFilter
+	event := gossipv1.Event{Type: gossipv1.EventTypeSummary, Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{knownID}, PreviewCursor: knownID}}
+
+	if err := h.handleSummary(session, event); err != nil {
+		t.Fatalf("handleSummary should not fail when converged, got %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeRequest {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		request, err := gossipv1.ParseRequestPayload(decoded.Payload)
+		if err != nil {
+			t.Fatalf("parse request payload: %v", err)
+		}
+		if len(request.Want) != 0 {
+			t.Fatalf("expected empty convergence request, got %#v", request.Want)
+		}
+	default:
+		t.Fatal("expected outbound REQUEST frame")
+	}
+}
+
+func TestHandleSummaryNoWantWithNoProgressCapStaysOpen(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	session := &clientSession{
+		client: &model.Client{Send: make(chan []byte, 1)},
+		drain: gossipv1.NewDrainSession("ws-no-want-stop", time.Now().UTC(), gossipv1.DrainSessionLimits{
+			NoProgressRoundCap: 1,
+		}),
+	}
+
+	knownID := strings.Repeat("2b", 32)
+	st.messagesByID[knownID] = &model.Message{ID: knownID, ExpiresAt: time.Now().Add(time.Hour)}
+	bloom := gossipv1.BuildSummaryPayload([]string{knownID}).BloomFilter
+	event := gossipv1.Event{Type: gossipv1.EventTypeSummary, Summary: &gossipv1.SummaryPayload{BloomFilter: bloom, PreviewItemIDs: []string{knownID}, PreviewCursor: knownID}}
+
+	err := h.handleSummary(session, event)
+	if err != nil {
+		t.Fatalf("handleSummary should remain open on convergence, got %v", err)
+	}
+
+	select {
+	case outbound := <-session.client.Send:
+		decoded := decodeEnvelope(t, outbound)
+		if decoded.Type != gossipv1.FrameTypeRequest {
+			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
+		}
+		request, parseErr := gossipv1.ParseRequestPayload(decoded.Payload)
+		if parseErr != nil {
+			t.Fatalf("parse request payload: %v", parseErr)
+		}
+		if len(request.Want) != 0 {
+			t.Fatalf("expected empty convergence request, got %#v", request.Want)
+		}
+	default:
+		t.Fatal("expected outbound REQUEST frame")
+	}
+}
+
 func TestComputeMissingWantUsesEnvelopeStoreAndMessageStoreForKnownObjects(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	envelopeStore := newEnvelopeStoreForTest(t)
@@ -1045,6 +1126,49 @@ func TestBuildRecipientSummaryFiltersAckedForDeliveryIdentity(t *testing.T) {
 	}
 	if len(summary.PreviewItemIDs) != 1 || summary.PreviewItemIDs[0] != openID {
 		t.Fatalf("unexpected preview ids: %#v", summary.PreviewItemIDs)
+	}
+}
+
+func TestBuildRecipientSummaryClearsCursorWhenFilteredPreviewEmpty(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	queueRecipient := "wayfarer-summary-empty-filter"
+	deliveryIdentity := "wayfarer-summary-empty-filter\x00device-a"
+	now := time.Now().UTC()
+	idA := gossipv1.ComputeItemID("sender", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+	idB := gossipv1.ComputeItemID("sender", queueRecipient, "Qg", now.Add(time.Second).Unix(), now.Add(time.Hour).Unix())
+
+	for _, id := range []string{idA, idB} {
+		if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+			ID:            id,
+			DestinationID: queueRecipient,
+			OpaquePayload: []byte("QQ"),
+			OriginRelayID: "relay-test",
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("persist envelope: %v", err)
+		}
+		st.messagesByID[id] = &model.Message{ID: id, To: queueRecipient, ExpiresAt: now.Add(time.Hour)}
+		if _, err := st.MarkAcked(context.Background(), id, deliveryIdentity); err != nil {
+			t.Fatalf("mark acked: %v", err)
+		}
+	}
+
+	summary, nextCursor, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build summary: %v", err)
+	}
+	if summary.ItemCount != 0 || len(summary.PreviewItemIDs) != 0 {
+		t.Fatalf("expected fully filtered summary, got item_count=%d preview=%#v", summary.ItemCount, summary.PreviewItemIDs)
+	}
+	if summary.PreviewCursor != "" {
+		t.Fatalf("expected empty preview cursor, got %q", summary.PreviewCursor)
+	}
+	if nextCursor != "" {
+		t.Fatalf("expected empty next cursor, got %q", nextCursor)
 	}
 }
 

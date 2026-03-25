@@ -9,6 +9,7 @@ type DrainStopReason string
 
 const (
 	DrainStopReasonNone                    DrainStopReason = ""
+	DrainStopReasonConvergedNoWant         DrainStopReason = "converged_no_want"
 	DrainStopReasonNoEligibleItems         DrainStopReason = "no_eligible_items"
 	DrainStopReasonRepeatedNoProgress      DrainStopReason = "repeated_no_progress_rounds"
 	DrainStopReasonSessionTimeBudget       DrainStopReason = "session_time_budget_exceeded"
