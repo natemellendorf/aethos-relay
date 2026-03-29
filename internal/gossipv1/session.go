@@ -21,15 +21,16 @@ const (
 )
 
 type Event struct {
-	Type      EventType
-	FrameType string
-	Hello     *HelloPayload
-	Summary   *SummaryPayload
-	Request   *RequestPayload
-	Transfer  *ParsedTransferPayload
-	Receipt   *ReceiptPayload
-	ItemIDs   []string
-	Err       error
+	Type            EventType
+	FrameType       string
+	Hello           *HelloPayload
+	Summary         *SummaryPayload
+	Request         *RequestPayload
+	Transfer        *ParsedTransferPayload
+	Receipt         *ReceiptPayload
+	ReceiptExpected []string
+	ItemIDs         []string
+	Err             error
 }
 
 type SessionAdapter struct {
@@ -169,6 +170,8 @@ func (s *SessionAdapter) PushInbound(chunk []byte) []Event {
 				s.terminated = true
 				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
 			}
+			expectedForEvent := make([]string, len(s.expectedReceiptOrder))
+			copy(expectedForEvent, s.expectedReceiptOrder)
 			if err := s.validateExpectedReceipt(receipt); err != nil {
 				s.terminated = true
 				return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: err})
@@ -176,7 +179,7 @@ func (s *SessionAdapter) PushInbound(chunk []byte) []Event {
 			s.awaitingReceipt = false
 			s.expectedReceiptOrder = nil
 			s.expectedReceiptIndex = make(map[string]uint64)
-			events = append(events, Event{Type: EventTypeReceipt, FrameType: envelope.Type, Receipt: &receipt})
+			events = append(events, Event{Type: EventTypeReceipt, FrameType: envelope.Type, Receipt: &receipt, ReceiptExpected: expectedForEvent})
 		default:
 			s.terminated = true
 			return append(events, Event{Type: EventTypeFatal, FrameType: envelope.Type, Err: fmt.Errorf("gossipv1: unknown frame type %q", envelope.Type)})
@@ -228,6 +231,15 @@ func (s *SessionAdapter) Terminated() bool {
 
 func (s *SessionAdapter) LastFrameType() string {
 	return s.lastFrameType
+}
+
+func (s *SessionAdapter) PendingReceiptIDs() []string {
+	if len(s.expectedReceiptOrder) == 0 {
+		return nil
+	}
+	out := make([]string, len(s.expectedReceiptOrder))
+	copy(out, s.expectedReceiptOrder)
+	return out
 }
 
 func (s *SessionAdapter) LastObserverError() error {

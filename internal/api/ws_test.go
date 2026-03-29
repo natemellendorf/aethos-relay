@@ -429,7 +429,7 @@ func TestHandleReceiptStopsWhenAckRoundHasNoProgress(t *testing.T) {
 	}
 }
 
-func TestHandleReceiptNoProgressResendsSummaryWhenInventoryExists(t *testing.T) {
+func TestHandleReceiptNoProgressDoesNotTriggerImmediateSummary(t *testing.T) {
 	h, st := newWSHandlerWithSpyStore(t)
 	envelopeStore := newEnvelopeStoreForTest(t)
 	h.SetEnvelopeStore(envelopeStore)
@@ -471,18 +471,16 @@ func TestHandleReceiptNoProgressResendsSummaryWhenInventoryExists(t *testing.T) 
 	select {
 	case outbound := <-session.client.Send:
 		decoded := decodeEnvelope(t, outbound)
-		if decoded.Type != gossipv1.FrameTypeSummary {
-			t.Fatalf("unexpected outbound frame type: %s", decoded.Type)
-		}
-		summary, parseErr := gossipv1.ParseSummaryPayload(decoded.Payload)
-		if parseErr != nil {
-			t.Fatalf("parse summary payload: %v", parseErr)
-		}
-		if summary.ItemCount != 1 || len(summary.PreviewItemIDs) != 1 || summary.PreviewItemIDs[0] != eligibleID {
-			t.Fatalf("unexpected summary from no-progress receipt path: %#v", summary.PreviewItemIDs)
-		}
+		t.Fatalf("expected no immediate outbound frame after no-progress receipt, got %s", decoded.Type)
 	default:
-		t.Fatal("expected SUMMARY frame after no-progress receipt")
+	}
+
+	verifySummary, _, verifyErr := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if verifyErr != nil {
+		t.Fatalf("build verification summary: %v", verifyErr)
+	}
+	if verifySummary.ItemCount != 1 || len(verifySummary.PreviewItemIDs) != 1 || verifySummary.PreviewItemIDs[0] != eligibleID {
+		t.Fatalf("expected inventory to remain available after no-progress receipt, got %#v", verifySummary.PreviewItemIDs)
 	}
 }
 
@@ -706,6 +704,77 @@ func TestHandleTransferDuplicateIsIdempotent(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected receipt frame")
+	}
+}
+
+func TestHandleTransferPushesSummaryToOnlineRecipient(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	queueRecipient := strings.Repeat("aa", 32)
+	recipientDelivery := storeforward.DeliveryIdentity(queueRecipient, "device-online")
+	recipientClient := &model.Client{
+		WayfarerID: queueRecipient,
+		DeliveryID: recipientDelivery,
+		Send:       make(chan []byte, 2),
+	}
+	h.clients.Register(recipientClient)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !h.clients.IsOnline(queueRecipient) {
+		if time.Now().After(deadline) {
+			t.Fatal("recipient client was not registered in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	now := time.Now().UTC()
+	createdAt := now.Add(-time.Minute)
+	expiresAt := now.Add(time.Hour)
+	object := mustTransferObject(t, strings.Repeat("cc", 32), queueRecipient, "QQ", createdAt.Unix(), expiresAt.Unix())
+
+	session := &clientSession{
+		client: &model.Client{Send: make(chan []byte, 2), DeliveryID: "sender\x00device"},
+	}
+	event := gossipv1.Event{
+		Type: gossipv1.EventTypeTransfer,
+		Transfer: &gossipv1.ParsedTransferPayload{Objects: []gossipv1.IndexedTransferObject{{
+			Index:  0,
+			Object: object,
+		}}},
+	}
+
+	if err := h.handleTransfer(session, event); err != nil {
+		t.Fatalf("handleTransfer failed: %v", err)
+	}
+	if len(st.persistedIDs) != 1 || st.persistedIDs[0] != object.ItemID {
+		t.Fatalf("expected transfer to persist once, got %#v", st.persistedIDs)
+	}
+
+	var pushedSummary bool
+	for i := 0; i < 2; i++ {
+		select {
+		case outbound := <-recipientClient.Send:
+			decoded := decodeEnvelope(t, outbound)
+			if decoded.Type != gossipv1.FrameTypeSummary {
+				continue
+			}
+			summary, err := gossipv1.ParseSummaryPayload(decoded.Payload)
+			if err != nil {
+				t.Fatalf("parse summary payload: %v", err)
+			}
+			if summary.ItemCount == 0 || len(summary.PreviewItemIDs) == 0 {
+				t.Fatalf("expected pushed summary with queued items, got item_count=%d preview=%#v", summary.ItemCount, summary.PreviewItemIDs)
+			}
+			if summary.PreviewItemIDs[0] != object.ItemID {
+				t.Fatalf("expected pushed summary to include transferred item, got %#v", summary.PreviewItemIDs)
+			}
+			pushedSummary = true
+		default:
+		}
+	}
+	if !pushedSummary {
+		t.Fatal("expected pushed summary for online recipient")
 	}
 }
 
@@ -1169,6 +1238,51 @@ func TestBuildRecipientSummaryClearsCursorWhenFilteredPreviewEmpty(t *testing.T)
 	}
 	if nextCursor != "" {
 		t.Fatalf("expected empty next cursor, got %q", nextCursor)
+	}
+}
+
+func TestBuildRecipientSummaryWrapsFilteredPreviewAfterCursorEnd(t *testing.T) {
+	h, st := newWSHandlerWithSpyStore(t)
+	envelopeStore := newEnvelopeStoreForTest(t)
+	h.SetEnvelopeStore(envelopeStore)
+
+	queueRecipient := "wayfarer-summary-wrap-filter"
+	deliveryIdentity := "wayfarer-summary-wrap-filter\x00device-a"
+	now := time.Now().UTC()
+	openID := gossipv1.ComputeItemID("sender", queueRecipient, "QQ", now.Unix(), now.Add(time.Hour).Unix())
+
+	if err := envelopeStore.PersistEnvelope(context.Background(), &model.Envelope{
+		ID:            openID,
+		DestinationID: queueRecipient,
+		OpaquePayload: []byte("QQ"),
+		OriginRelayID: "relay-test",
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("persist envelope: %v", err)
+	}
+	st.messagesByID[openID] = &model.Message{ID: openID, To: queueRecipient, ExpiresAt: now.Add(time.Hour)}
+
+	first, firstCursor, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+	if err != nil {
+		t.Fatalf("build first summary: %v", err)
+	}
+	if first.ItemCount != 1 || len(first.PreviewItemIDs) != 1 || first.PreviewItemIDs[0] != openID {
+		t.Fatalf("unexpected first summary: item_count=%d preview=%#v", first.ItemCount, first.PreviewItemIDs)
+	}
+	if firstCursor == "" {
+		t.Fatal("expected first cursor")
+	}
+
+	wrapped, wrappedCursor, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, firstCursor)
+	if err != nil {
+		t.Fatalf("build wrapped summary: %v", err)
+	}
+	if wrapped.ItemCount != 1 || len(wrapped.PreviewItemIDs) != 1 || wrapped.PreviewItemIDs[0] != openID {
+		t.Fatalf("expected wrapped preview to include unacked item, got item_count=%d preview=%#v", wrapped.ItemCount, wrapped.PreviewItemIDs)
+	}
+	if wrappedCursor != openID {
+		t.Fatalf("unexpected wrapped cursor: got=%q want=%q", wrappedCursor, openID)
 	}
 }
 

@@ -500,7 +500,7 @@ func (h *WSHandler) handleHelloValidated(session *clientSession, event gossipv1.
 	h.ensureDrainSession(session).BindAuthenticatedWayfarerID(session.client.WayfarerID)
 	session.peerLabel = session.client.WayfarerID
 	debug = gossipv1.NewDebugSessionLogger(session.sessionID, session.peerLabel)
-	debug.Log("local", gossipv1.FrameTypeHello, "identity_bound", "wayfarer_id", session.client.WayfarerID, "device_id", session.client.DeviceID)
+	debug.Log("local", gossipv1.FrameTypeHello, "identity_bound", "wayfarer_id", session.client.WayfarerID, "device_id", session.client.DeviceID, "delivery_identity", session.client.DeliveryID)
 
 	session.queueRecipient = storeforward.QueueRecipient(session.client.DeliveryID)
 	session.handshakeComplete = true
@@ -523,7 +523,8 @@ func (h *WSHandler) sendDrainSummary(session *clientSession, summaryPath string,
 	}
 
 	summaryStart := time.Now()
-	summary, nextCursor, err := h.buildRecipientSummary(session.queueRecipient, session.client.DeliveryID, session.summaryCursor)
+	cursorIn := session.summaryCursor
+	summary, nextCursor, err := h.buildRecipientSummary(session.queueRecipient, session.client.DeliveryID, cursorIn)
 	if err != nil {
 		debug.Log("local", gossipv1.FrameTypeSummary, "summary_inventory_failed", "store_ok", false, "err", err)
 		return stopSession(gossipv1.DrainStopReasonStorageError, err.Error())
@@ -548,11 +549,14 @@ func (h *WSHandler) sendDrainSummary(session *clientSession, summaryPath string,
 		gossipv1.FrameTypeSummary,
 		"summary_constructed",
 		"summary_path", summaryPath,
+		"queue_recipient", session.queueRecipient,
+		"delivery_identity", session.client.DeliveryID,
 		"item_count", summary.ItemCount,
 		"bloom_bytes", len(summary.BloomFilter),
 		"preview_count", previewCount,
 		"item_ids_sample", previewSample,
 		"item_ids_hash", previewHash,
+		"cursor_in", cursorIn,
 		"preview_cursor", summary.PreviewCursor,
 		"next_preview_cursor", nextCursor,
 		"rounds_completed", drain.Snapshot().RoundsCompleted,
@@ -628,6 +632,9 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 	objects := make([]gossipv1.TransferObject, 0, len(event.Request.Want))
 	expectedReceiptIDs := make([]string, 0, len(event.Request.Want))
 	now := time.Now().UTC()
+	missingCount := 0
+	recipientMismatchCount := 0
+	expiredCount := 0
 
 	for _, requestedID := range event.Request.Want {
 		if uint64(len(objects)) >= gossipv1.MaxTransferItems {
@@ -642,14 +649,17 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 		}
 		if !found {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "missing", "reason", "nil_message", "store_ok", true)
+			missingCount++
 			continue
 		}
 		if object.Envelope.To != session.queueRecipient {
-			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "recipient_mismatch", "store_ok", true)
+			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "recipient_mismatch", "store_ok", true, "envelope_to", object.Envelope.To, "queue_recipient", session.queueRecipient)
+			recipientMismatchCount++
 			continue
 		}
 		if object.ExpiryUnixMS <= uint64(now.UnixMilli()) {
 			debug.LogItem("out", gossipv1.FrameTypeTransfer, requestedID, "request_service_decision", "decision", "skipped", "reason", "expired", "store_ok", true)
+			expiredCount++
 			continue
 		}
 
@@ -658,7 +668,7 @@ func (h *WSHandler) handleRequest(session *clientSession, event gossipv1.Event) 
 		debug.LogItem("out", gossipv1.FrameTypeTransfer, object.ItemID, "request_service_decision", "decision", "sent", "reason", "found", "store_ok", true)
 	}
 	transferCount, transferSample, transferHash := gossipv1.ItemIDSample(expectedReceiptIDs, wsDebugItemSampleLimit)
-	debug.Log("out", gossipv1.FrameTypeTransfer, "request_serviced", "object_count", len(objects), "expected_receipt_count", transferCount, "item_ids_sample", transferSample, "item_ids_hash", transferHash, "store_ok", true)
+	debug.Log("out", gossipv1.FrameTypeTransfer, "request_serviced", "object_count", len(objects), "expected_receipt_count", transferCount, "item_ids_sample", transferSample, "item_ids_hash", transferHash, "missing_count", missingCount, "recipient_mismatch_count", recipientMismatchCount, "expired_count", expiredCount, "store_ok", true)
 	session.lastRoundTransferred = len(expectedReceiptIDs)
 	drain.RecordTransferred(len(expectedReceiptIDs))
 	metrics.AddGossipDrainItemsTransferred(len(expectedReceiptIDs))
@@ -688,6 +698,7 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 	receipt := gossipv1.ReceiptPayload{
 		Accepted: make([]string, 0, len(event.Transfer.Objects)),
 	}
+	notifyRecipients := make(map[string]struct{})
 
 	for _, rejected := range event.Transfer.Rejected {
 		fields := []any{"object_index", rejected.Index, "item_id", rejected.ID, "reason", rejected.Reason, "detail", rejected.Detail}
@@ -721,6 +732,7 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 			}
 			debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "store_ok", true)
 			receipt.Accepted = append(receipt.Accepted, indexed.Object.ItemID)
+			notifyRecipients[msg.To] = struct{}{}
 			continue
 		}
 
@@ -739,6 +751,7 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 		}
 		debug.Log("in", gossipv1.FrameTypeTransfer, "transfer_object_accepted", "object_index", indexed.Index, "item_id", indexed.Object.ItemID, "store_ok", true)
 		receipt.Accepted = append(receipt.Accepted, indexed.Object.ItemID)
+		notifyRecipients[msg.To] = struct{}{}
 	}
 
 	if len(receipt.Accepted) > 1 {
@@ -751,6 +764,9 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(receipt.Accepted, wsDebugItemSampleLimit)
 	rejectedCount, rejectedSample, rejectedHash := gossipv1.ItemIDSample(rejectedIDs, wsDebugItemSampleLimit)
 	debug.Log("out", gossipv1.FrameTypeReceipt, "receipt_constructed", "accepted_count", acceptedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash, "rejected_count", rejectedCount, "rejected_item_ids_sample", rejectedSample, "rejected_item_ids_hash", rejectedHash)
+	if len(receipt.Accepted) > 0 {
+		h.pushSummariesToOnlineRecipients(session.sessionID, session.client, notifyRecipients)
+	}
 	if len(receipt.Accepted) == 0 {
 		drain.CompleteRound(false)
 		metrics.IncrementGossipDrainNoProgressRound()
@@ -761,6 +777,60 @@ func (h *WSHandler) handleTransfer(session *clientSession, event gossipv1.Event)
 	}
 
 	return h.sendEnvelope(session, gossipv1.FrameTypeReceipt, receipt)
+}
+
+func (h *WSHandler) pushSummariesToOnlineRecipients(sourceSessionID string, sourceClient *model.Client, recipients map[string]struct{}) {
+	if len(recipients) == 0 {
+		return
+	}
+	for queueRecipient := range recipients {
+		h.pushSummaryToOnlineRecipient(sourceSessionID, sourceClient, queueRecipient)
+	}
+}
+
+func (h *WSHandler) pushSummaryToOnlineRecipient(sourceSessionID string, sourceClient *model.Client, queueRecipient string) {
+	if queueRecipient == "" || h.clients == nil {
+		return
+	}
+	clients := h.clients.GetClients(queueRecipient)
+	if len(clients) == 0 {
+		return
+	}
+
+	debug := gossipv1.NewDebugSessionLogger(sourceSessionID, queueRecipient)
+	for _, client := range clients {
+		if client == nil {
+			continue
+		}
+		if sourceClient != nil && client == sourceClient {
+			continue
+		}
+		deliveryIdentity := client.DeliveryID
+		if deliveryIdentity == "" {
+			deliveryIdentity = queueRecipient
+		}
+		summary, _, err := h.buildRecipientSummary(queueRecipient, deliveryIdentity, "")
+		if err != nil {
+			debug.Log("out", gossipv1.FrameTypeSummary, "push_summary_build_failed", "queue_recipient", queueRecipient, "delivery_identity", deliveryIdentity, "store_ok", false, "err", err)
+			continue
+		}
+		if summary.ItemCount == 0 {
+			continue
+		}
+		frame, err := gossipv1.EncodeEnvelope(gossipv1.FrameTypeSummary, summary)
+		if err != nil {
+			debug.Log("out", gossipv1.FrameTypeSummary, "push_summary_encode_failed", "queue_recipient", queueRecipient, "delivery_identity", deliveryIdentity, "protocol_ok", false, "err", err)
+			continue
+		}
+		prefixed, err := gossipv1.EncodeLengthPrefixed(frame)
+		if err != nil {
+			debug.Log("out", gossipv1.FrameTypeSummary, "push_summary_prefix_failed", "queue_recipient", queueRecipient, "delivery_identity", deliveryIdentity, "protocol_ok", false, "err", err)
+			continue
+		}
+		previewCount, previewSample, previewHash := gossipv1.ItemIDSample(summary.PreviewItemIDs, wsDebugItemSampleLimit)
+		queued := h.sendBinary(client, prefixed)
+		debug.Log("out", gossipv1.FrameTypeSummary, "push_summary_sent", "queue_recipient", queueRecipient, "delivery_identity", deliveryIdentity, "item_count", summary.ItemCount, "preview_count", previewCount, "item_ids_sample", previewSample, "item_ids_hash", previewHash, "bytes_out", len(prefixed), "transport_ok", queued, "protocol_ok", true)
+	}
 }
 
 func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) error {
@@ -801,12 +871,42 @@ func (h *WSHandler) handleReceipt(session *clientSession, event gossipv1.Event) 
 	}
 	acceptedCount, acceptedSample, acceptedHash := gossipv1.ItemIDSample(event.Receipt.Accepted, wsDebugItemSampleLimit)
 	debug.Log("in", gossipv1.FrameTypeReceipt, "receipt_processed", "accepted_count", acceptedCount, "acked_count", transitionedCount, "accepted_item_ids_sample", acceptedSample, "accepted_item_ids_hash", acceptedHash)
+	if acceptedCount == 0 {
+		expectedReceipt := event.ReceiptExpected
+		if len(expectedReceipt) == 0 && session.adapter != nil {
+			expectedReceipt = session.adapter.PendingReceiptIDs()
+		}
+		expectedCount, expectedSample, expectedHash := gossipv1.ItemIDSample(expectedReceipt, wsDebugItemSampleLimit)
+		if expectedCount > 0 {
+			debug.Log(
+				"in",
+				gossipv1.FrameTypeReceipt,
+				"receipt_empty_with_pending_transfer",
+				"inferred_reason",
+				"peer_rejected_or_failed_import",
+				"expected_receipt_count",
+				expectedCount,
+				"expected_item_ids_sample",
+				expectedSample,
+				"expected_item_ids_hash",
+				expectedHash,
+			)
+		}
+	}
 
 	if session.queueRecipient == "" {
 		return nil
 	}
 	if transitionedCount == 0 {
-		return h.sendDrainSummary(session, "ws.handleReceipt:no_progress_round_reconcile", false)
+		if canContinue, stopReason := drain.CanStartAnotherRound(time.Now().UTC()); !canContinue {
+			if stopReason == gossipv1.DrainStopReasonFairnessYield {
+				debug.Log("local", "SESSION", "drain_session_yield_terminal", "reason", stopReason, "note", "yield ends drain session")
+				metrics.IncrementGossipDrainFairnessEvent("ws", "yield")
+				return stopSession(stopReason, "fairness yield ends drain session")
+			}
+			return stopSession(stopReason, "receipt no-progress blocked by fairness/budget controls")
+		}
+		return nil
 	}
 
 	return h.sendDrainSummary(session, "ws.handleReceipt:post_ack_drain", false)
@@ -1104,6 +1204,14 @@ func (h *WSHandler) buildRecipientSummary(queueRecipient string, deliveryIdentit
 	if err != nil {
 		return gossipv1.SummaryPayload{}, "", err
 	}
+	if len(previewIDs) == 0 && totalCount > 0 && afterCursor != "" {
+		wrappedPreview, wrappedCursor, _, _, wrappedErr := h.envelopeStore.GetEnvelopeIDsByDestinationPage(context.Background(), queueRecipient, "", int(gossipv1.MaxSummaryPreviewItems))
+		if wrappedErr != nil {
+			return gossipv1.SummaryPayload{}, "", wrappedErr
+		}
+		previewIDs = wrappedPreview
+		nextCursor = wrappedCursor
+	}
 	if deliveryIdentity != "" {
 		filteredEligible := make([]string, 0, len(eligibleIDs))
 		for _, id := range eligibleIDs {
@@ -1132,6 +1240,16 @@ func (h *WSHandler) buildRecipientSummary(queueRecipient string, deliveryIdentit
 		}
 		if len(previewIDs) > 0 {
 			nextCursor = previewIDs[len(previewIDs)-1]
+		} else if len(filteredEligible) > 0 && afterCursor != "" {
+			for _, id := range filteredEligible {
+				previewIDs = append(previewIDs, id)
+				if len(previewIDs) >= int(gossipv1.MaxSummaryPreviewItems) {
+					break
+				}
+			}
+			if len(previewIDs) > 0 {
+				nextCursor = previewIDs[len(previewIDs)-1]
+			}
 		}
 	}
 
