@@ -32,6 +32,7 @@ func main() {
 		"federation-pad-enabled":   {},
 		"federation-cover-enabled": {},
 		"gossipv1-debug":           {},
+		"ws-push-on-ingest":        {},
 	}
 	os.Args = normalizeBoolFlagArgs(os.Args, boolFlags)
 
@@ -55,6 +56,8 @@ func main() {
 	gossipDrainYieldEnabled := flag.Bool("gossip-drain-yield-enabled", false, "Enable fairness yield behavior for long gossip sessions")
 	gossipDrainSilenceTimeout := flag.Duration("gossip-drain-silence-timeout", 0, "Client silence timeout for gossip drain sessions (0 disables timeout)")
 	gossipFleetLBMode := flag.String("gossip-fleet-lb-mode", "sticky", "Fleet load balancer mode assumption: sticky or shared")
+	wsPushOnIngest := flag.Bool("ws-push-on-ingest", true, "Push unsolicited SUMMARY nudges to online destination clients on inbound message ingest")
+	wsPushDebounce := flag.Duration("ws-push-debounce", 250*time.Millisecond, "Debounce window for recipient SUMMARY nudges on inbound ingest (0 disables debounce)")
 
 	// Federation flags
 	relayID := flag.String("relay-id", "", "Unique relay ID (auto-generated if not provided)")
@@ -112,6 +115,7 @@ func main() {
 	log.Printf("Gossip V1 debug logging: %v", *gossipV1Debug)
 	log.Printf("Gossip drain limits: round_budget=%d byte_budget=%d wall_clock=%s no_progress_cap=%d yield_every_rounds=%d yield_enabled=%v silence_timeout=%s", *gossipDrainRoundBudget, *gossipDrainByteBudget, *gossipDrainWallClockBudget, *gossipDrainNoProgressCap, *gossipDrainYieldEveryRounds, *gossipDrainYieldEnabled, *gossipDrainSilenceTimeout)
 	log.Printf("Gossip fleet LB mode: %s", *gossipFleetLBMode)
+	log.Printf("WS push-on-ingest: enabled=%v debounce=%s", *wsPushOnIngest, *wsPushDebounce)
 	if *ackDrivenSuppression {
 		log.Printf("WARNING: ack-driven suppression enabled: queue suppression uses ack_state and legacy delivery_state during migration")
 	}
@@ -308,6 +312,8 @@ func main() {
 		FairnessYieldEnable: *gossipDrainYieldEnabled,
 	})
 	wsHandler.SetLoadBalancerMode(*gossipFleetLBMode)
+	wsHandler.SetPushOnIngest(*wsPushOnIngest)
+	wsHandler.SetPushSummaryDebounce(*wsPushDebounce)
 	wsHandler.SetEnvelopeStore(envelopeStore)
 	wsHandler.SetAckDrivenSuppression(*ackDrivenSuppression)
 	wsHandler.SetFederationManager(federationManager)

@@ -158,6 +158,7 @@ func newWSHandlerWithSpyStore(t *testing.T) (*WSHandler, *wsStoreSpy) {
 	go clients.Run()
 	h := NewWSHandler(st, clients, 24*time.Hour, "", true, "relay-test")
 	h.SetAutoDeliverQueued(false)
+	h.SetPushSummaryDebounce(0)
 	return h, st
 }
 
@@ -182,6 +183,7 @@ func newWSHandlerWithBoltStore(t *testing.T) (*WSHandler, *store.BBoltStore, *st
 	go clients.Run()
 	h := NewWSHandler(messageStore, clients, 24*time.Hour, "", true, "relay-test")
 	h.SetAutoDeliverQueued(false)
+	h.SetPushSummaryDebounce(0)
 	h.SetEnvelopeStore(envelopeStore)
 
 	return h, messageStore, envelopeStore

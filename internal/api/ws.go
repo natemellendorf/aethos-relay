@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -132,6 +133,12 @@ type WSHandler struct {
 	autoDeliverQueued bool
 	drainLimits       gossipv1.DrainSessionLimits
 	lbMode            string
+	pushOnIngest      bool
+	pushDebounce      time.Duration
+	pushMu            sync.Mutex
+	pushTimers        map[string]*time.Timer
+	pushExcluded      map[string]map[*model.Client]struct{}
+	pushSessionID     map[string]string
 }
 
 // NewWSHandler creates a new WebSocket handler.
@@ -160,6 +167,11 @@ func NewWSHandler(store store.Store, clients *model.ClientRegistry, maxTTL time.
 		autoDeliverQueued: true,
 		drainLimits:       limits.Normalize(),
 		lbMode:            "sticky",
+		pushOnIngest:      true,
+		pushDebounce:      250 * time.Millisecond,
+		pushTimers:        make(map[string]*time.Timer),
+		pushExcluded:      make(map[string]map[*model.Client]struct{}),
+		pushSessionID:     make(map[string]string),
 	}
 }
 
@@ -189,6 +201,21 @@ func (h *WSHandler) SetEnvelopeStore(envelopeStore store.EnvelopeStore) {
 // SetAutoDeliverQueued remains for backwards-compatible test wiring.
 func (h *WSHandler) SetAutoDeliverQueued(enabled bool) {
 	h.autoDeliverQueued = enabled
+}
+
+func (h *WSHandler) SetPushOnIngest(enabled bool) {
+	h.pushMu.Lock()
+	defer h.pushMu.Unlock()
+	h.pushOnIngest = enabled
+}
+
+func (h *WSHandler) SetPushSummaryDebounce(window time.Duration) {
+	if window < 0 {
+		window = 0
+	}
+	h.pushMu.Lock()
+	defer h.pushMu.Unlock()
+	h.pushDebounce = window
 }
 
 func (h *WSHandler) SetDrainSessionLimits(limits gossipv1.DrainSessionLimits) {
@@ -783,12 +810,65 @@ func (h *WSHandler) pushSummariesToOnlineRecipients(sourceSessionID string, sour
 	if len(recipients) == 0 {
 		return
 	}
+	h.pushMu.Lock()
+	pushEnabled := h.pushOnIngest
+	debounce := h.pushDebounce
+	h.pushMu.Unlock()
+	if !pushEnabled {
+		return
+	}
 	for queueRecipient := range recipients {
-		h.pushSummaryToOnlineRecipient(sourceSessionID, sourceClient, queueRecipient)
+		if queueRecipient == "" {
+			continue
+		}
+		if debounce <= 0 {
+			h.pushSummaryToOnlineRecipient(sourceSessionID, sourceClient, queueRecipient, nil)
+			continue
+		}
+		h.enqueueRecipientSummaryPush(sourceSessionID, sourceClient, queueRecipient, debounce)
 	}
 }
 
-func (h *WSHandler) pushSummaryToOnlineRecipient(sourceSessionID string, sourceClient *model.Client, queueRecipient string) {
+func (h *WSHandler) enqueueRecipientSummaryPush(sourceSessionID string, sourceClient *model.Client, queueRecipient string, debounce time.Duration) {
+	h.pushMu.Lock()
+	if sourceSessionID != "" {
+		h.pushSessionID[queueRecipient] = sourceSessionID
+	}
+	if sourceClient != nil {
+		excluded := h.pushExcluded[queueRecipient]
+		if excluded == nil {
+			excluded = make(map[*model.Client]struct{})
+			h.pushExcluded[queueRecipient] = excluded
+		}
+		excluded[sourceClient] = struct{}{}
+	}
+	if _, exists := h.pushTimers[queueRecipient]; exists {
+		h.pushMu.Unlock()
+		return
+	}
+	h.pushTimers[queueRecipient] = time.AfterFunc(debounce, func() {
+		h.flushRecipientSummaryPush(queueRecipient)
+	})
+	h.pushMu.Unlock()
+}
+
+func (h *WSHandler) flushRecipientSummaryPush(queueRecipient string) {
+	h.pushMu.Lock()
+	timer := h.pushTimers[queueRecipient]
+	delete(h.pushTimers, queueRecipient)
+	sourceSessionID := h.pushSessionID[queueRecipient]
+	delete(h.pushSessionID, queueRecipient)
+	excluded := h.pushExcluded[queueRecipient]
+	delete(h.pushExcluded, queueRecipient)
+	h.pushMu.Unlock()
+
+	if timer != nil {
+		timer.Stop()
+	}
+	h.pushSummaryToOnlineRecipient(sourceSessionID, nil, queueRecipient, excluded)
+}
+
+func (h *WSHandler) pushSummaryToOnlineRecipient(sourceSessionID string, sourceClient *model.Client, queueRecipient string, excluded map[*model.Client]struct{}) {
 	if queueRecipient == "" || h.clients == nil {
 		return
 	}
@@ -803,6 +883,9 @@ func (h *WSHandler) pushSummaryToOnlineRecipient(sourceSessionID string, sourceC
 			continue
 		}
 		if sourceClient != nil && client == sourceClient {
+			continue
+		}
+		if _, blocked := excluded[client]; blocked {
 			continue
 		}
 		deliveryIdentity := client.DeliveryID
